@@ -1,7 +1,8 @@
 {
   "name": "T.L-AutoDevelop-Pro",
   "version": "2.2.0",
-  "description": "Fully autonomous .NET dev pipeline — zero confirmations. Runs plan, implement, preflight, review, and commit end-to-end unattended.",
+  "description": "Autonomous addon for T.L-AutoDevelop — zero confirmations, auto-commit. Requires T.L-AutoDevelop.",
+  "dependencies": ["T.L-AutoDevelop"],
   "author": {
     "name": "TLeiott",
     "url": "https://github.com/TLeiott"

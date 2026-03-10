@@ -11,11 +11,16 @@ param(
 $CONST_MODEL_PLAN       = "claude-opus-4-6"
 $CONST_MODEL_IMPLEMENT  = "claude-opus-4-6"
 $CONST_MODEL_REVIEW     = "claude-opus-4-6"
-$CONST_MAX_RETRIES      = 10
+$CONST_MAX_RETRIES      = 6                    # Phase 4.2: reduziert von 10
 $CONST_MAX_TURNS_PLAN   = 30
 $CONST_MAX_TURNS_IMPL   = 30
 $CONST_MAX_TURNS_REVIEW = 10
 $CONST_TIMEOUT_SECONDS  = 900
+$CONST_REPLAN_THRESHOLD = 3                    # Phase 4.1: Replan nach N Fehlversuchen
+
+# Phase 6.3: Einfache-Task-Erkennung
+$CONST_SIMPLE_KEYWORDS  = @("umbenennen","rename","typo","string","text","label","titel","title","kommentar","comment")
+$CONST_MODEL_FAST       = "claude-sonnet-4-6"
 
 $ErrorActionPreference = 'Stop'
 $originalDir = Get-Location
@@ -45,7 +50,8 @@ function Write-ResultJson {
         [string]$verdict = "",
         [string]$feedback = "",
         [int]$attempts = 0,
-        [string]$error = ""
+        [string]$error = "",
+        [string]$severity = ""
     )
     $result = @{
         status   = $status
@@ -56,6 +62,7 @@ function Write-ResultJson {
         attempts = $attempts
         error    = $error
         taskName = $TaskName
+        severity = $severity
     } | ConvertTo-Json -Depth 5
 
     $resultDir = Split-Path $ResultFile -Parent
@@ -111,18 +118,18 @@ function Invoke-ClaudeWithTimeout {
 }
 
 function Invoke-ClaudePlan {
-    param([string]$prompt)
+    param([string]$prompt, [string]$model = $CONST_MODEL_PLAN)
     return Invoke-ClaudeWithTimeout -prompt $prompt -extraArgs @(
-        "--model", $CONST_MODEL_PLAN,
+        "--model", $model,
         "--permission-mode", "plan",
         "--max-turns", $CONST_MAX_TURNS_PLAN.ToString()
     )
 }
 
 function Invoke-ClaudeImplement {
-    param([string]$prompt)
+    param([string]$prompt, [string]$model = $CONST_MODEL_IMPLEMENT)
     return Invoke-ClaudeWithTimeout -prompt $prompt -extraArgs @(
-        "--model", $CONST_MODEL_IMPLEMENT,
+        "--model", $model,
         "--dangerously-skip-permissions",
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
         "--max-turns", $CONST_MAX_TURNS_IMPL.ToString()
@@ -138,20 +145,86 @@ function Invoke-ClaudeReview {
     )
 }
 
+# Phase 4.3: Reviewer-Schweregrade
 function Get-ReviewVerdict {
     param([string]$reviewOutput)
     $lines = $reviewOutput -split "`n" | Where-Object { $_.Trim() -ne "" }
-    if ($lines.Count -eq 0) { return @{ verdict = "DENIED"; feedback = "Leere Review-Antwort" } }
+    if ($lines.Count -eq 0) { return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = "Leere Review-Antwort" } }
 
     $firstLine = $lines[0].Trim().ToUpper()
+    $feedbackText = ($lines | Select-Object -Skip 1) -join "`n"
+
     if ($firstLine -match '^ACCEPTED\b') {
-        return @{ verdict = "ACCEPTED"; feedback = ($lines | Select-Object -Skip 1) -join "`n" }
+        return @{ verdict = "ACCEPTED"; severity = ""; feedback = $feedbackText }
+    }
+    # Phase 4.3: DENIED_MINOR, DENIED_MAJOR, DENIED_RETHINK parsen
+    if ($firstLine -match '^DENIED_(MINOR|MAJOR|RETHINK)\b') {
+        return @{ verdict = "DENIED"; severity = $Matches[1]; feedback = $feedbackText }
     }
     if ($firstLine -match '^DENIED\b') {
-        return @{ verdict = "DENIED"; feedback = ($lines | Select-Object -Skip 1) -join "`n" }
+        return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = $feedbackText }
     }
     # Unklare Antwort = DENIED
-    return @{ verdict = "DENIED"; feedback = "Reviewer-Antwort unklar (erste Zeile: '$($lines[0])')`n$reviewOutput" }
+    return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = "Reviewer-Antwort unklar (erste Zeile: '$($lines[0])')`n$reviewOutput" }
+}
+
+# Phase 3.1: Feedback-History formatieren
+function Format-FeedbackHistory {
+    param([System.Collections.ArrayList]$history, [int]$maxEntries = 0)
+    if ($history.Count -eq 0) { return "" }
+    $entries = if ($maxEntries -gt 0 -and $history.Count -gt $maxEntries) {
+        $history | Select-Object -Last $maxEntries
+    } else { $history }
+    $parts = foreach ($entry in $entries) {
+        "--- Versuch $($entry.attempt) [$($entry.source)] ---`n$($entry.feedback)"
+    }
+    return ($parts -join "`n`n")
+}
+
+# Phase 3.5: Progressive Strategie-Hinweise
+function Get-StrategyHint {
+    param([int]$attempt, [int]$max)
+    switch ($attempt) {
+        { $_ -le 3 } { return "Fokussiere auf die spezifischen Fehler aus dem Feedback." }
+        { $_ -le 5 } { return "Vereinfache die Implementierung wenn moeglich. Weniger ist mehr." }
+        default       { return "KRITISCH: Letzter Versuch. Implementiere nur das absolute Minimum." }
+    }
+}
+
+# Phase 6.3: Einfache Tasks erkennen
+function Test-SimpleTask {
+    param([string]$taskText)
+    $words = ($taskText -split '\s+').Count
+    if ($words -gt 25) { return $false }
+    foreach ($kw in $CONST_SIMPLE_KEYWORDS) {
+        if ($taskText -imatch [regex]::Escape($kw)) { return $true }
+    }
+    return $false
+}
+
+# Phase 6.1: Pipeline-Log schreiben
+function Write-PipelineLog {
+    param(
+        [string]$repoRoot,
+        [string]$task,
+        [string]$status,
+        [int]$attempts,
+        [string[]]$failureReasons,
+        [string[]]$files
+    )
+    $logDir = Join-Path $repoRoot ".claude-develop-logs"
+    $logFile = Join-Path $logDir "pipeline-history.jsonl"
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    $entry = @{
+        timestamp      = (Get-Date -Format "o")
+        taskName       = $TaskName
+        task           = $task
+        status         = $status
+        attempts       = $attempts
+        failureReasons = @($failureReasons)
+        changedFiles   = @($files)
+    } | ConvertTo-Json -Compress -Depth 3
+    Add-Content -Path $logFile -Value $entry -Encoding UTF8
 }
 
 # --- Hauptpipeline ---
@@ -184,13 +257,30 @@ try {
         New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
     }
 
+    # Phase 2.1: Codebase-Kontext sammeln (vor Worktree-Wechsel, aus Hauptrepo)
+    Write-Host "[CONTEXT] Sammle Codebase-Kontext..."
+    $codebaseContext = ""
+    $claudeMdPath = Join-Path $repoRoot "CLAUDE.md"
+    if (Test-Path $claudeMdPath) {
+        $claudeMdContent = [System.IO.File]::ReadAllText($claudeMdPath, [System.Text.Encoding]::UTF8)
+        $codebaseContext += "### CLAUDE.md:`n$claudeMdContent`n`n"
+    }
+    $slnListResult = Invoke-NativeCommand dotnet @("sln",$SolutionPath,"list")
+    if ($slnListResult.exitCode -eq 0) {
+        $codebaseContext += "### Projekte in Solution:`n$($slnListResult.output)`n`n"
+    }
+    $slnDir = Split-Path $SolutionPath -Parent
+    $treeDirs = (Get-ChildItem -Path $slnDir -Directory -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+        Select-Object -First 50 | ForEach-Object { $_.FullName }) -join "`n"
+    if ($treeDirs) {
+        $codebaseContext += "### Verzeichnisstruktur (2 Ebenen):`n$treeDirs`n"
+    }
+
     $r = Invoke-NativeCommand git @("worktree","add",$worktreePath,"-b",$branchName)
     if ($r.exitCode -ne 0) {
         Write-ResultJson -status "ERROR" -error "Worktree konnte nicht erstellt werden: $($r.output)"
         exit 1
     }
-    Set-Location $worktreePath
-    Write-Host "[WORKTREE] OK: $worktreePath"
 
     # Solution-Pfad im Worktree berechnen (PS 5.1 kompatibel, kein GetRelativePath)
     $baseUri = [System.Uri]::new($repoRoot.TrimEnd('\') + '\')
@@ -198,14 +288,28 @@ try {
     $relSln = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace('/', '\')
     $worktreeSln = Join-Path $worktreePath $relSln
 
-    Write-Host "[RESTORE] dotnet restore..."
-    Invoke-NativeCommand dotnet @("restore",$worktreeSln) | Out-Null
+    # Phase 6.2: dotnet restore als Hintergrund-Job starten (parallel zum Plan)
+    $restoreJob = Start-Job -ScriptBlock {
+        param($sln)
+        & dotnet restore $sln 2>&1 | Out-String
+    } -ArgumentList $worktreeSln
 
-    # 3. PLAN (read-only)
+    Set-Location $worktreePath
+    Write-Host "[WORKTREE] OK: $worktreePath"
+
+    # 3. PLAN (read-only, laeuft parallel mit restore)
     Write-Host "[PLAN] Starte Plan-Phase (timeout: ${CONST_TIMEOUT_SECONDS}s)..."
     $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
     $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch '^\s*$|^##' } | Select-Object -First 1).Trim()
     Write-Host "[TASK] $taskLine"
+
+    # Phase 6.3: Modell-Auswahl fuer einfache Tasks
+    $isSimpleTask = Test-SimpleTask -taskText $taskPrompt
+    $effectiveModelPlan = if ($isSimpleTask) { $CONST_MODEL_FAST } else { $CONST_MODEL_PLAN }
+    $effectiveModelImpl = if ($isSimpleTask) { $CONST_MODEL_FAST } else { $CONST_MODEL_IMPLEMENT }
+    if ($isSimpleTask) { Write-Host "[MODEL] Einfacher Task erkannt - verwende $CONST_MODEL_FAST" }
+
+    # Phase 1.1-1.4 + 2.1: Strukturierter Plan-Prompt mit Regeln, Format, Scope Guard, Kontext
     $planPrompt = @"
 Analysiere das Codebase und erstelle einen Implementierungsplan.
 
@@ -214,9 +318,42 @@ $taskPrompt
 
 SOLUTION: $worktreeSln
 
-Erstelle einen detaillierten, aber kompakten Plan. Schreibe NUR den Plan, implementiere NICHTS.
+CODEBASE KONTEXT:
+$codebaseContext
+
+REGELN (muessen im Plan beruecksichtigt werden):
+- Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
+- Kein throw new NotImplementedException()
+- Max 1 Top-Level Typdeklaration pro Datei (nested/partial OK)
+- Keine neuen NuGet-Pakete
+- Kommentare auf Deutsch, minimal
+- DialogService.ShowDialogHmdException() fuer Exceptions
+- MessageService.ShowMessageBox statt MessageBox.Show
+- Kein Dispatcher.Invoke/BeginInvoke wenn vermeidbar
+- Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
+
+AUSGABEFORMAT (exakt einhalten):
+
+## Ziel
+Ein Satz der das Ziel beschreibt.
+
+## Dateien
+Fuer jede Datei:
+- Pfad: <relativer Pfad>
+- Aktion: ERSTELLEN | AENDERN | LOESCHEN
+- Aenderungen: <konkrete Beschreibung>
+
+## Reihenfolge
+1. <Schritt>
+2. <Schritt>
+...
+
+## Einschraenkungen
+- <relevante Regeln/Risiken fuer diesen Task>
+
+Schreibe NUR den Plan, implementiere NICHTS.
 "@
-    $planResult = Invoke-ClaudePlan -prompt $planPrompt
+    $planResult = Invoke-ClaudePlan -prompt $planPrompt -model $effectiveModelPlan
     if (-not $planResult.success) {
         Write-ResultJson -status "ERROR" -error "Plan-Phase fehlgeschlagen: $($planResult.output)"
         exit 1
@@ -224,48 +361,156 @@ Erstelle einen detaillierten, aber kompakten Plan. Schreibe NUR den Plan, implem
     $planOutput = $planResult.output
     Write-Host "[PLAN] OK ($(($planOutput -split '\n').Count) Zeilen)"
 
+    # Phase 6.2: Auf restore warten
+    Write-Host "[RESTORE] Warte auf dotnet restore..."
+    Wait-Job $restoreJob -Timeout 120 | Out-Null
+    Receive-Job $restoreJob -ErrorAction SilentlyContinue | Out-Null
+    Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
+
     # Retry-Schleife: Implement -> Preflight -> Review
     $attempt = 0
-    $lastFeedback = ""
+    # Phase 3.1: $lastFeedback ersetzt durch $feedbackHistory
+    $feedbackHistory = [System.Collections.ArrayList]::new()
     $finalVerdict = "FAILED"
     $finalFeedback = ""
+    $finalSeverity = ""
     $changedFiles = @()
+    $planVersion = 1
+    # Phase 4.2: Feedback-Hashes fuer identische Fehler tracken
+    $recentFeedbackHashes = [System.Collections.ArrayList]::new()
 
     while ($attempt -lt $CONST_MAX_RETRIES) {
         $attempt++
-        Write-Host "[IMPL] Versuch $attempt/$CONST_MAX_RETRIES..."
+        Write-Host "[IMPL] Versuch $attempt/$CONST_MAX_RETRIES (Plan v$planVersion)..."
+
+        # Phase 4.1: Plan-Revision nach CONST_REPLAN_THRESHOLD Fehlversuchen
+        if ($attempt -eq ($CONST_REPLAN_THRESHOLD + 1) -and $planVersion -eq 1) {
+            Write-Host "[REPLAN] $CONST_REPLAN_THRESHOLD Fehlversuche - erstelle neuen Plan..."
+            $historyText = Format-FeedbackHistory -history $feedbackHistory
+            $replanPrompt = @"
+Der vorherige Plan hat nach $CONST_REPLAN_THRESHOLD Versuchen nicht funktioniert. Erstelle einen NEUEN, vereinfachten Plan.
+
+AUFGABE:
+$taskPrompt
+
+SOLUTION: $worktreeSln
+
+CODEBASE KONTEXT:
+$codebaseContext
+
+BISHERIGE FEHLER:
+$historyText
+
+REGELN (muessen im Plan beruecksichtigt werden):
+- Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
+- Kein throw new NotImplementedException()
+- Max 1 Top-Level Typdeklaration pro Datei (nested/partial OK)
+- Keine neuen NuGet-Pakete
+- Kommentare auf Deutsch, minimal
+- DialogService.ShowDialogHmdException() fuer Exceptions
+- MessageService.ShowMessageBox statt MessageBox.Show
+- Kein Dispatcher.Invoke/BeginInvoke wenn vermeidbar
+- Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
+
+Erstelle einen EINFACHEREN Plan der die bisherigen Fehler vermeidet.
+
+AUSGABEFORMAT (exakt einhalten):
+
+## Ziel
+Ein Satz der das Ziel beschreibt.
+
+## Dateien
+Fuer jede Datei:
+- Pfad: <relativer Pfad>
+- Aktion: ERSTELLEN | AENDERN | LOESCHEN
+- Aenderungen: <konkrete Beschreibung>
+
+## Reihenfolge
+1. <Schritt>
+2. <Schritt>
+...
+
+## Einschraenkungen
+- <relevante Regeln/Risiken fuer diesen Task>
+
+Schreibe NUR den Plan, implementiere NICHTS.
+"@
+            # Worktree zuruecksetzen
+            Invoke-NativeCommand git @("checkout","--",".") | Out-Null
+            Invoke-NativeCommand git @("clean","-fd") | Out-Null
+
+            $replanResult = Invoke-ClaudePlan -prompt $replanPrompt -model $effectiveModelPlan
+            if ($replanResult.success) {
+                $planOutput = $replanResult.output
+                $planVersion = 2
+                Write-Host "[REPLAN] OK - neuer Plan (v$planVersion)"
+            } else {
+                Write-Host "[REPLAN] Fehlgeschlagen - verwende alten Plan weiter"
+            }
+        }
 
         # 4. IMPLEMENT
+        # Phase 1.3 + 1.5 + 2.2 + 3.1 + 3.2 + 3.5: Strukturiertes Feedback, Kontext, Build-Selbstpruefung
         $implPrompt = if ($attempt -eq 1) {
             @"
 Implementiere den folgenden Plan. Arbeite in: $worktreeSln
 
+CODEBASE KONTEXT:
+$codebaseContext
+
 PLAN:
 $planOutput
 
+WICHTIGE REGELN:
+- Keine TODO/FIXME/HACK/Fix:/Note: Kommentare
+- Kein throw new NotImplementedException()
+- Max 1 Top-Level Typ pro Datei
+- Kommentare auf Deutsch
+- MessageService.ShowMessageBox statt MessageBox.Show
+- Kein Dispatcher.Invoke wenn vermeidbar
+- Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
+
 Implementiere alle Aenderungen. Halte dich exakt an den Plan.
+
+Nach Abschluss aller Aenderungen: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschlaegt, sofort beheben.
 "@
         } else {
-            $diffText = (Invoke-NativeCommand git @("diff","HEAD")).output
+            $historyText = Format-FeedbackHistory -history $feedbackHistory
+            $strategyHint = Get-StrategyHint -attempt $attempt -max $CONST_MAX_RETRIES
             @"
-Vorheriger Versuch war fehlerhaft. Korrigiere die Implementierung.
+Versuch $attempt/$CONST_MAX_RETRIES - $strategyHint
 
-ORIGINALER PLAN:
+CODEBASE KONTEXT:
+$codebaseContext
+
+ORIGINALER PLAN (v$planVersion):
 $planOutput
 
-WAS BISHER GEAENDERT WURDE (git diff):
-$diffText
+ALLE BISHERIGEN FEHLER:
+$historyText
 
-FEEDBACK (Preflight/Review):
-$lastFeedback
+WICHTIGE REGELN:
+- Keine TODO/FIXME/HACK/Fix:/Note: Kommentare
+- Kein throw new NotImplementedException()
+- Max 1 Top-Level Typ pro Datei
+- Kommentare auf Deutsch
+- MessageService.ShowMessageBox statt MessageBox.Show
+- Kein Dispatcher.Invoke wenn vermeidbar
+- Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
 
-Behebe die genannten Probleme. Implementiere die Korrekturen.
+Oeffne NUR die betroffenen Dateien. Behebe NUR die genannten Probleme.
+
+Nach Abschluss: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschlaegt, sofort beheben.
 "@
         }
 
-        $implResult = Invoke-ClaudeImplement -prompt $implPrompt
+        $implResult = Invoke-ClaudeImplement -prompt $implPrompt -model $effectiveModelImpl
         if (-not $implResult.success) {
-            $lastFeedback = "Implementierung fehlgeschlagen: $($implResult.output)"
+            [void]$feedbackHistory.Add(@{
+                attempt  = $attempt
+                source   = "IMPL_FAIL"
+                feedback = "Implementierung fehlgeschlagen: $($implResult.output)"
+            })
             continue
         }
 
@@ -273,7 +518,11 @@ Behebe die genannten Probleme. Implementiere die Korrekturen.
         $changedFiles = @((Invoke-NativeCommand git @("diff","--name-only","HEAD")).output -split "`n" | Where-Object { $_.Trim() -ne "" })
         Write-Host "[IMPL] OK - $($changedFiles.Count) Dateien"
         if ($changedFiles.Count -eq 0) {
-            $lastFeedback = "Keine Dateien geaendert. Implementierung hat nichts produziert."
+            [void]$feedbackHistory.Add(@{
+                attempt  = $attempt
+                source   = "IMPL_FAIL"
+                feedback = "Keine Dateien geaendert. Implementierung hat nichts produziert."
+            })
             continue
         }
 
@@ -286,17 +535,63 @@ Behebe die genannten Probleme. Implementiere die Korrekturen.
         try {
             $preflight = $preflightJson | ConvertFrom-Json
         } catch {
-            $lastFeedback = "Preflight-Ausgabe nicht parsbar: $preflightJson"
+            [void]$feedbackHistory.Add(@{
+                attempt  = $attempt
+                source   = "PARSE_ERROR"
+                feedback = "Preflight-Ausgabe nicht parsbar: $preflightJson"
+            })
             continue
         }
 
         if (-not $preflight.passed) {
-            $blockerText = ($preflight.blockers | ForEach-Object { "- [$($_.check)] $($_.file): $($_.message)" }) -join "`n"
+            $blockerText = ($preflight.blockers | ForEach-Object {
+                $entry = "- [$($_.check)] $($_.file)"
+                if ($_.line) { $entry += " L$($_.line)" }
+                $entry += ": $($_.message)"
+                if ($_.suggestion) { $entry += " -> $($_.suggestion)" }
+                $entry
+            }) -join "`n"
             Write-Host "[PREFLIGHT] FAILED: $blockerText"
-            $lastFeedback = "PREFLIGHT FAILED:`n$blockerText"
+
+            [void]$feedbackHistory.Add(@{
+                attempt  = $attempt
+                source   = "PREFLIGHT"
+                feedback = "PREFLIGHT FAILED:`n$blockerText"
+            })
+
+            # Phase 4.2: Sofort abbrechen bei nuget_audit (nicht behebbar)
+            $hasNugetBlocker = $preflight.blockers | Where-Object { $_.check -eq "nuget_audit" }
+            if ($hasNugetBlocker) {
+                Write-Host "[PREFLIGHT] nuget_audit Blocker - nicht behebbar, breche ab"
+                break
+            }
+
+            # Phase 4.2: Feedback-Hashes fuer identische Fehler tracken
+            $feedbackHash = ($blockerText.GetHashCode()).ToString()
+            [void]$recentFeedbackHashes.Add($feedbackHash)
+            if ($recentFeedbackHashes.Count -ge 3) {
+                $lastThree = $recentFeedbackHashes | Select-Object -Last 3
+                if (($lastThree | Sort-Object -Unique).Count -eq 1) {
+                    Write-Host "[PREFLIGHT] 3x identischer Fehler - breche ab"
+                    break
+                }
+            }
+
             continue
         }
         Write-Host "[PREFLIGHT] OK"
+
+        # Phase 3.4: Preflight-Warnings weiterleiten
+        $warningText = ""
+        if ($preflight.warnings -and $preflight.warnings.Count -gt 0) {
+            $warningText = ($preflight.warnings | ForEach-Object {
+                $entry = "- [$($_.check)] $($_.file)"
+                if ($_.line) { $entry += " L$($_.line)" }
+                $entry += ": $($_.message)"
+                $entry
+            }) -join "`n"
+            Write-Host "[PREFLIGHT] Warnings: $($preflight.warnings.Count)"
+        }
 
         # 6. REVIEW
         Write-Host "[REVIEW] Starte Code-Review..."
@@ -311,8 +606,18 @@ Behebe die genannten Probleme. Implementiere die Korrekturen.
         }
 
         $diffForReview = (Invoke-NativeCommand git @("diff","HEAD")).output
+
+        # Phase 4.4: Plan, Versuch-Kontext, Warnings, Feedback-History an Reviewer
+        $truncatedPlan = if ($planOutput.Length -gt 2000) { $planOutput.Substring(0, 2000) + "`n[... gekuerzt]" } else { $planOutput }
+        $historyForReview = Format-FeedbackHistory -history $feedbackHistory -maxEntries 3
+
         $reviewPrompt = @"
 $reviewerContent
+
+---
+
+PLAN (v$planVersion):
+$truncatedPlan
 
 ---
 
@@ -323,15 +628,26 @@ $diffForReview
 
 URSPRUENGLICHER TASK:
 $taskPrompt
+
+---
+
+VERSUCH: $attempt/$CONST_MAX_RETRIES
+$(if ($warningText) { "PREFLIGHT WARNINGS:`n$warningText`n---" })
+$(if ($historyForReview) { "BISHERIGES FEEDBACK:`n$historyForReview" })
 "@
         $reviewResult = Invoke-ClaudeReview -prompt $reviewPrompt
         if (-not $reviewResult.success) {
-            $lastFeedback = "Review fehlgeschlagen: $($reviewResult.output)"
+            [void]$feedbackHistory.Add(@{
+                attempt  = $attempt
+                source   = "REVIEW"
+                feedback = "Review fehlgeschlagen: $($reviewResult.output)"
+            })
             continue
         }
 
         $verdict = Get-ReviewVerdict -reviewOutput $reviewResult.output
-        Write-Host "[REVIEW] Verdict: $($verdict.verdict)"
+        $severityInfo = if ($verdict.severity) { " ($($verdict.severity))" } else { "" }
+        Write-Host "[REVIEW] Verdict: $($verdict.verdict)$severityInfo"
 
         # 7. VERDICT
         if ($verdict.verdict -eq "ACCEPTED") {
@@ -340,14 +656,43 @@ $taskPrompt
             break
         }
 
-        # DENIED -> naechster Retry
-        $lastFeedback = "REVIEW DENIED:`n$($verdict.feedback)"
+        # Phase 4.3: Schweregrad-basiertes Verhalten
+        $deniedFeedback = "REVIEW DENIED ($($verdict.severity)):`n$($verdict.feedback)"
+        [void]$feedbackHistory.Add(@{
+            attempt  = $attempt
+            source   = "REVIEW"
+            feedback = $deniedFeedback
+        })
         $finalFeedback = $verdict.feedback
+        $finalSeverity = $verdict.severity
+
+        # Phase 4.3: DENIED_RETHINK erzwingt sofortige Plan-Revision
+        if ($verdict.severity -eq "RETHINK" -and $planVersion -eq 1) {
+            Write-Host "[REVIEW] RETHINK - erzwinge sofortige Plan-Revision..."
+            $attempt = $CONST_REPLAN_THRESHOLD  # Naechste Iteration loest Replan aus
+        }
+
+        # Phase 4.2: Review-Feedback-Hashes tracken
+        $feedbackHash = ($verdict.feedback.GetHashCode()).ToString()
+        [void]$recentFeedbackHashes.Add($feedbackHash)
+        if ($recentFeedbackHashes.Count -ge 3) {
+            $lastThree = $recentFeedbackHashes | Select-Object -Last 3
+            if (($lastThree | Sort-Object -Unique).Count -eq 1) {
+                Write-Host "[REVIEW] 3x identisches Feedback - breche ab"
+                break
+            }
+        }
     }
 
     # 9. FINALIZE
     Write-Host "[FINALIZE] $finalVerdict nach $attempt Versuch(en)"
     Set-Location $originalDir
+
+    # Phase 6.1: Pipeline-Log schreiben
+    $failureReasons = @($feedbackHistory | ForEach-Object { $_.source }) | Sort-Object -Unique
+    $logStatus = if ($finalVerdict -eq "ACCEPTED") { "ACCEPTED" } else { "FAILED" }
+    Write-PipelineLog -repoRoot $repoRoot -task $taskLine -status $logStatus `
+        -attempts $attempt -failureReasons $failureReasons -files $changedFiles
 
     if ($finalVerdict -eq "ACCEPTED") {
         Invoke-NativeCommand git @("-C",$worktreePath,"add","-A") | Out-Null
@@ -356,14 +701,15 @@ $taskPrompt
         $worktreePath = $null
 
         Write-ResultJson -status "ACCEPTED" -branch $branchName -files $changedFiles `
-            -verdict $finalVerdict -feedback $finalFeedback -attempts $attempt
+            -verdict $finalVerdict -feedback $finalFeedback -attempts $attempt -severity $finalSeverity
     } else {
         Invoke-NativeCommand git @("worktree","remove",$worktreePath,"--force") | Out-Null
         Invoke-NativeCommand git @("branch","-D",$branchName) | Out-Null
         $worktreePath = $null
 
+        $allFeedback = Format-FeedbackHistory -history $feedbackHistory
         Write-ResultJson -status "FAILED" -branch "" -files $changedFiles `
-            -verdict $finalVerdict -feedback "$lastFeedback`n---`n$finalFeedback" -attempts $attempt
+            -verdict $finalVerdict -feedback "$allFeedback`n---`n$finalFeedback" -attempts $attempt -severity $finalSeverity
     }
 
 } catch {

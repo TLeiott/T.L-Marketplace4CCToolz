@@ -1,23 +1,26 @@
 # T.L-AutoDevelop-Pro
 
-Fully autonomous .NET development pipeline plugin for Claude Code. Zero confirmations — runs plan, implement, preflight, review, and commit end-to-end unattended.
+Autonomous addon for [T.L-AutoDevelop](../T.L-AutoDevelop/). Zero confirmations — auto-commits on success without user input.
+
+**Requires T.L-AutoDevelop** (all engine scripts and agents live there).
 
 ## Skills
 
 - **`/TLA-develop`** — Fully autonomous single-task pipeline. No user input after launch, auto-commits on success.
 - **`/TLA-develop-batch`** — Fully autonomous parallel batch pipeline. No user input, auto-commits all accepted tasks.
 
-## Agents
+## Differences from T.L-AutoDevelop
 
-- **reviewer** — Read-only code reviewer for .NET/WPF/Core.UI. Outputs `ACCEPTED` or `DENIED` with structured feedback. Reviews architecture, Core.UI patterns, code quality, German comments, security, and correctness.
-
-## Scripts
-
-- **auto-develop.ps1** — Main pipeline orchestrator. Manages git worktrees, invokes Claude for plan/implement/review phases, runs preflight checks, handles retry loops.
-- **preflight.ps1** — Deterministic validation: build check, forbidden comments, stub detection, class-per-file rule, NuGet audit, and various warnings.
+| Feature | T.L-AutoDevelop | T.L-AutoDevelop-Pro |
+|---------|-----------------|---------------------|
+| Pipeline engine | Included | Uses T.L-AutoDevelop's |
+| Reviewer agent | Included | Uses T.L-AutoDevelop's |
+| Commit on ACCEPTED | Asks user first | Auto-commits |
+| User confirmations | Yes | None |
 
 ## Requirements
 
+- **T.L-AutoDevelop** plugin installed
 - Windows (PowerShell 5.1+)
 - .NET SDK
 - Git
