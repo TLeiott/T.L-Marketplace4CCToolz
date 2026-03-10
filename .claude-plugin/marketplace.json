@@ -1,23 +1,21 @@
 {
-  "name": "tl-marketplace",
+  "name": "T.L-Marketplace",
   "owner": {
     "name": "TLeiott"
   },
-  "metadata": {
-    "description": "Autonomous .NET development pipeline tools for Claude Code"
-  },
+  "description": "Autonomous .NET development pipeline tools for Claude Code",
   "plugins": [
     {
-      "name": "tl-auto-develop",
-      "source": "./plugins/tl-auto-develop",
-      "description": "Interactive .NET dev pipeline. Skills: /develop (single task), /develop-batch (parallel). User confirms each commit.",
-      "version": "2.0.0"
+      "name": "T.L-AutoDevelop",
+      "source": "./plugins/T.L-AutoDevelop",
+      "description": "Interactive .NET dev pipeline. Skills: /develop, /develop-batch. User confirms each commit.",
+      "version": "2.1.0"
     },
     {
-      "name": "tl-auto-develop-pro",
-      "source": "./plugins/tl-auto-develop-pro",
-      "description": "Autonomous .NET dev pipeline. Skills: /TLA-develop (single task), /TLA-develop-batch (parallel). Zero confirmations, auto-commits.",
-      "version": "2.0.0"
+      "name": "T.L-AutoDevelop-Pro",
+      "source": "./plugins/T.L-AutoDevelop-Pro",
+      "description": "Autonomous .NET dev pipeline. Skills: /TLA-develop, /TLA-develop-batch. Zero confirmations, auto-commits.",
+      "version": "2.1.0"
     }
   ]
 }

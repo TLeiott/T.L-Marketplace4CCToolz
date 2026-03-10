@@ -1,0 +1,15 @@
+{
+  "name": "T.L-AutoDevelop-Pro",
+  "version": "2.1.0",
+  "description": "Fully autonomous .NET dev pipeline — zero confirmations. Runs plan, implement, preflight, review, and commit end-to-end unattended.",
+  "author": {
+    "name": "TLeiott",
+    "url": "https://github.com/TLeiott"
+  },
+  "homepage": "https://github.com/TLeiott/T.L-Marketplace4CCToolz",
+  "repository": "https://github.com/TLeiott/T.L-Marketplace4CCToolz.git",
+  "license": "MIT",
+  "keywords": ["dotnet", "automation", "code-review", "pipeline", "wpf", "autonomous"],
+  "skills": "./skills/",
+  "agents": "./agents/"
+}

@@ -52,7 +52,7 @@ ALLE Bash-Aufrufe in EINER EINZIGEN Nachricht (parallel!):
 
     WIN_HOME=$(cygpath -w "$HOME")
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$WIN_HOME\.claude\plugins\tl-auto-develop\scripts\auto-develop.ps1" \
+      -File "$WIN_HOME\.claude\plugins\T.L-AutoDevelop\scripts\auto-develop.ps1" \
       -PromptFile "<prompt-pfad>" \
       -SolutionPath "<sln-pfad>" \
       -ResultFile "<result-pfad>" \

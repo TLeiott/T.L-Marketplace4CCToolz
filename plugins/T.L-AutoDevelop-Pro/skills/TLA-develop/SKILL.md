@@ -1,14 +1,15 @@
 ---
-name: develop
-description: "Auto-develop: plan, implement, preflight, review with retry. Git required."
+name: TLA-develop
+description: "Fully autonomous develop pipeline. No confirmations, no stops. Git required."
 argument-hint: [task description]
 disable-model-invocation: true
 ---
 
-# /develop — Autonome Implementierungs-Pipeline
+# /TLA-develop — Vollautonome Implementierungs-Pipeline
 
 CRITICAL: Du bist NUR ein Launcher. Du implementierst NICHTS selbst.
 Keine Dateien lesen, kein Grep, kein Code analysieren. Nur starten und Ergebnis praesentieren.
+KEIN User-Input nach dem Start. Alles laeuft automatisch bis zum Commit.
 
 ## STEP 1 — VALIDATE
 
@@ -51,7 +52,7 @@ RESULT_FILE="$WIN_TEMP/claude-develop/$TIMESTAMP-result.json"
 
 Bash-Tool mit run_in_background: true:
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$HOME/.claude/plugins/tl-auto-develop/scripts/auto-develop.ps1" \
+      -File "$HOME/.claude/plugins/T.L-AutoDevelop-Pro/scripts/auto-develop.ps1" \
       -PromptFile "$PROMPT_FILE" \
       -SolutionPath "<sln-pfad>" \
       -ResultFile "$RESULT_FILE"
@@ -63,24 +64,18 @@ Nutzer informieren: "Pipeline gestartet. Du wirst benachrichtigt."
 Read $RESULT_FILE. JSON parsen.
 
 ### ACCEPTED:
-1. git merge --squash auto/<branch>
-2. dotnet build <sln>
-3. Praesentieren: Dateien, Review-Feedback, Versuche
-4. "Teste, dann sag commit oder discard"
+Vollautomatisch, KEIN User-Input:
+1. `git merge --squash auto/<branch>`
+2. `dotnet build <sln>` — falls Build fehlschlaegt: `git reset HEAD .` und `git checkout -- .`, Branch aufraeumen, Fehler anzeigen, STOP.
+3. Deutsche Commit-Message automatisch generieren (inhaltlich, basierend auf Task-Text und geaenderten Dateien)
+4. `git commit -m "<generierte message>"`
+5. Branch aufraeumen: `git branch -D auto/<branch>`
+6. Ergebnis praesentieren: Dateien, Review-Feedback, Versuche, Commit-Message
 
 ### FAILED:
-Fehler + Feedback zeigen. Anbieten: Erneut oder verwerfen.
+1. Fehler + Feedback anzeigen
+2. Branch wurde bereits von auto-develop.ps1 aufgeraeumt
 
 ### ERROR/TIMEOUT:
-Fehler zeigen. Manuellen Ansatz vorschlagen.
-
-## STEP 6 — NUTZER-ENTSCHEIDUNG
-
-### "commit"
-1. Commit-Message auf Deutsch formulieren (inhaltlich, nicht "auto-develop")
-2. `git commit -m "<message>"` (NICHT automatisch — Nutzer bestaetigt)
-3. Branch aufraeumen: `git branch -D auto/<branch>`
-
-### "discard"
-1. `git reset HEAD` und `git checkout -- .`
-2. Branch aufraeumen: `git branch -D auto/<branch>`
+1. Fehler anzeigen
+2. Branch aufraeumen falls noetig: `git branch -D auto/<branch>` (ignoriere Fehler)
