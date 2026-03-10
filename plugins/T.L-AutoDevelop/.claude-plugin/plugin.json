@@ -1,6 +1,6 @@
 {
   "name": "T.L-AutoDevelop",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Interactive .NET dev pipeline with user confirmations. Plan, implement, preflight, review for single tasks and parallel batches.",
   "author": {
     "name": "TLeiott",
@@ -9,7 +9,5 @@
   "homepage": "https://github.com/TLeiott/T.L-Marketplace4CCToolz",
   "repository": "https://github.com/TLeiott/T.L-Marketplace4CCToolz.git",
   "license": "MIT",
-  "keywords": ["dotnet", "automation", "code-review", "pipeline", "wpf", "interactive"],
-  "skills": "./skills/",
-  "agents": "./agents/"
+  "keywords": ["dotnet", "automation", "code-review", "pipeline", "wpf", "interactive"]
 }
