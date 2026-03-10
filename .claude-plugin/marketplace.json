@@ -10,8 +10,14 @@
     {
       "name": "tl-auto-develop",
       "source": "./plugins/tl-auto-develop",
-      "description": "Autonomous .NET dev pipeline: plan, implement, preflight, review with retry loops",
-      "version": "1.0.0"
+      "description": "Interactive .NET dev pipeline. Skills: /develop (single task), /develop-batch (parallel). User confirms each commit.",
+      "version": "2.0.0"
+    },
+    {
+      "name": "tl-auto-develop-pro",
+      "source": "./plugins/tl-auto-develop-pro",
+      "description": "Autonomous .NET dev pipeline. Skills: /TLA-develop (single task), /TLA-develop-batch (parallel). Zero confirmations, auto-commits.",
+      "version": "2.0.0"
     }
   ]
 }

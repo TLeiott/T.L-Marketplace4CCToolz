@@ -1,11 +1,11 @@
-# tl-auto-develop
+# tl-auto-develop-pro
 
-Interactive .NET development pipeline plugin for Claude Code.
+Fully autonomous .NET development pipeline plugin for Claude Code. Zero confirmations — runs plan, implement, preflight, review, and commit end-to-end unattended.
 
 ## Skills
 
-- **`/develop`** — Interactive single-task pipeline (plan, implement, preflight, review) with user confirmations
-- **`/develop-batch`** — Interactive parallel batch processing via git worktrees, user confirms each commit
+- **`/TLA-develop`** — Fully autonomous single-task pipeline. No user input after launch, auto-commits on success.
+- **`/TLA-develop-batch`** — Fully autonomous parallel batch pipeline. No user input, auto-commits all accepted tasks.
 
 ## Agents
 

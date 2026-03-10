@@ -1,21 +1,26 @@
 # T.L Marketplace for Claude Code Tools
 
-A Claude Code plugin marketplace providing autonomous .NET development pipeline tools.
+A Claude Code plugin marketplace providing .NET development pipeline tools.
 
 ## What's Included
 
-### tl-auto-develop (v1.0.0)
+### tl-auto-develop (v2.0.0) — Interactive
 
-An autonomous development pipeline that orchestrates Claude Code through plan, implement, preflight-check, and code-review stages — with automatic retry on failure.
+An interactive development pipeline that orchestrates Claude Code through plan, implement, preflight-check, and code-review stages — with user confirmations before each commit.
 
-**Commands:**
+| Command | Description |
+|---------|-------------|
+| `/develop [task]` | Single task with user confirmations before commit |
+| `/develop-batch [tasks.md]` | Parallel batch via git worktrees, confirms each commit |
 
-| Command | Mode | Description |
-|---------|------|-------------|
-| `/develop [task]` | Interactive | Single task with user confirmations before commit |
-| `/develop-batch [tasks.md]` | Interactive | Parallel batch via git worktrees, confirms each commit |
-| `/TLA-develop [task]` | Autonomous | Single task, zero confirmations, auto-commit |
-| `/TLA-develop-batch [tasks.md]` | Autonomous | Parallel batch, fully automated end-to-end |
+### tl-auto-develop-pro (v2.0.0) — Autonomous
+
+A fully autonomous development pipeline — zero confirmations. Runs plan, implement, preflight, review, and commit end-to-end unattended.
+
+| Command | Description |
+|---------|-------------|
+| `/TLA-develop [task]` | Single task, zero confirmations, auto-commit |
+| `/TLA-develop-batch [tasks.md]` | Parallel batch, fully automated end-to-end |
 
 **Pipeline Flow:**
 ```
@@ -37,10 +42,14 @@ Add this marketplace to Claude Code:
 /plugin marketplace add TLeiott/T.L-Marketplace4CCToolz
 ```
 
-Then install the plugin:
+Then install the plugin(s) you want:
 
 ```
 /plugin install tl-auto-develop
+```
+
+```
+/plugin install tl-auto-develop-pro
 ```
 
 ## Configuration

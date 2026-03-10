@@ -1,7 +1,7 @@
 {
   "name": "tl-auto-develop",
-  "version": "1.0.0",
-  "description": "Autonomous .NET development pipeline with plan, implement, preflight, and review stages. Includes interactive and fully-autonomous modes for single tasks and parallel batch processing.",
+  "version": "2.0.0",
+  "description": "Interactive .NET dev pipeline with user confirmations. Plan, implement, preflight, review for single tasks and parallel batches.",
   "author": {
     "name": "TLeiott",
     "url": "https://github.com/TLeiott"
@@ -12,9 +12,28 @@
     "url": "https://github.com/TLeiott/T.L-Marketplace4CCToolz.git"
   },
   "license": "MIT",
-  "keywords": ["dotnet", "automation", "code-review", "pipeline", "wpf"],
+  "keywords": ["dotnet", "automation", "code-review", "pipeline", "wpf", "interactive"],
   "requirements": {
     "platform": "win32",
     "tools": ["powershell", "dotnet", "git", "claude"]
-  }
+  },
+  "skills": [
+    {
+      "name": "develop",
+      "path": "skills/develop/SKILL.md",
+      "description": "Interactive single-task pipeline: plan → implement → preflight → review. User confirms commit."
+    },
+    {
+      "name": "develop-batch",
+      "path": "skills/develop-batch/SKILL.md",
+      "description": "Interactive parallel batch pipeline via git worktrees. User confirms each commit."
+    }
+  ],
+  "agents": [
+    {
+      "name": "reviewer",
+      "path": "agents/reviewer.md",
+      "description": "Read-only .NET/WPF/Core.UI code reviewer. Outputs ACCEPTED or DENIED."
+    }
+  ]
 }

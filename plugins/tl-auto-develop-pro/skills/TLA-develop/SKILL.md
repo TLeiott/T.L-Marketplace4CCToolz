@@ -52,7 +52,7 @@ RESULT_FILE="$WIN_TEMP/claude-develop/$TIMESTAMP-result.json"
 
 Bash-Tool mit run_in_background: true:
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$HOME/.claude/plugins/tl-auto-develop/scripts/auto-develop.ps1" \
+      -File "$HOME/.claude/plugins/tl-auto-develop-pro/scripts/auto-develop.ps1" \
       -PromptFile "$PROMPT_FILE" \
       -SolutionPath "<sln-pfad>" \
       -ResultFile "$RESULT_FILE"
