@@ -1,0 +1,17 @@
+{
+  "name": "tl-marketplace",
+  "owner": {
+    "name": "TLeiott"
+  },
+  "metadata": {
+    "description": "Autonomous .NET development pipeline tools for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "tl-auto-develop",
+      "source": "./plugins/tl-auto-develop",
+      "description": "Autonomous .NET dev pipeline: plan, implement, preflight, review with retry loops",
+      "version": "1.0.0"
+    }
+  ]
+}
