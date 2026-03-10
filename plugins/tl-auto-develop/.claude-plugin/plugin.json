@@ -1,0 +1,20 @@
+{
+  "name": "tl-auto-develop",
+  "version": "1.0.0",
+  "description": "Autonomous .NET development pipeline with plan, implement, preflight, and review stages. Includes interactive and fully-autonomous modes for single tasks and parallel batch processing.",
+  "author": {
+    "name": "TLeiott",
+    "url": "https://github.com/TLeiott"
+  },
+  "homepage": "https://github.com/TLeiott/T.L-Marketplace4CCToolz",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TLeiott/T.L-Marketplace4CCToolz.git"
+  },
+  "license": "MIT",
+  "keywords": ["dotnet", "automation", "code-review", "pipeline", "wpf"],
+  "requirements": {
+    "platform": "win32",
+    "tools": ["powershell", "dotnet", "git", "claude"]
+  }
+}
