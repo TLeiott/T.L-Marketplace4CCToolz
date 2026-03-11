@@ -22,6 +22,7 @@ $CONST_PLAN_ATTEMPTS = 2
 $CONST_INVESTIGATION_ATTEMPTS = 2
 $CONST_IMPLEMENT_ATTEMPTS = 2
 $CONST_REMEDIATION_ATTEMPTS = 2
+$CONST_REPAIR_ATTEMPTS = 2
 
 $ErrorActionPreference = "Stop"
 $originalDir = Get-Location
@@ -129,6 +130,82 @@ function Normalize-Text {
 function Get-TextHash {
     param([string]$Text)
     return (Normalize-Text -Text $Text).GetHashCode().ToString()
+}
+
+function Get-ActionableItems {
+    param([string]$Text)
+    $items = [System.Collections.ArrayList]::new()
+    if (-not $Text) { return @($items) }
+
+    $pathMatches = [regex]::Matches($Text, '(?im)\b[\w\-.\\/]+\.(razor|cs|css|js|ts|xaml|csproj)\b')
+    foreach ($match in $pathMatches) { [void]$items.Add($match.Value.Trim()) }
+
+    $lineMatches = [regex]::Matches($Text, '(?im)\b(?:zeile|line|l)\s*\d+(?:\s*[-–]\s*\d+)?\b')
+    foreach ($match in $lineMatches) { [void]$items.Add($match.Value.Trim()) }
+
+    $replaceMatches = [regex]::Matches($Text, '(?im)\b(ersetz|replace|textersetzung|aendern|update|remove|entfern)\w*.*')
+    foreach ($match in $replaceMatches) { [void]$items.Add($match.Value.Trim()) }
+
+    return @($items | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Test-HasActionableSignal {
+    param([string]$Text)
+    return (Get-ActionableItems -Text $Text).Count -gt 0
+}
+
+function Get-RepairBlock {
+    param(
+        [string]$FailureCode,
+        [string[]]$Reasons,
+        [string]$PreviousOutput
+    )
+    $salvaged = Get-ActionableItems -Text $PreviousOutput
+    $reasonText = if ($Reasons -and $Reasons.Count -gt 0) {
+        ($Reasons | ForEach-Object { "- $_" }) -join "`n"
+    } else {
+        "- Keine Details vorhanden."
+    }
+    $salvageText = if ($salvaged.Count -gt 0) {
+        ($salvaged | Select-Object -First 8 | ForEach-Object { "- $_" }) -join "`n"
+    } else {
+        "- Nichts Verwertbares erkannt."
+    }
+    return @"
+DEIN VORHERIGER VERSUCH WAR UNGUELTIG.
+
+FEHLERKATEGORIE: $FailureCode
+WARUM UNGUELTIG:
+$reasonText
+
+WAS BEREITS BRAUCHBAR IST:
+$salvageText
+
+WAS DU JETZT TUN MUSST:
+- Behebe exakt die genannten Probleme.
+- Wenn du Dateien nennst, nenne konkrete Pfade oder Suchmuster.
+- Wenn du ein RESULT liefern sollst, schreibe die RESULT-Zeile exakt.
+- Wenn du genug Hinweise siehst, nutze sie statt erneut vage zu bleiben.
+
+WENN DU DIESES FORMAT NICHT EINHAELTST, GILT DER VERSUCH ALS FEHLER.
+"@
+}
+
+function Invoke-ClaudeRepair {
+    param(
+        [string]$PhaseName,
+        [string]$Prompt,
+        [string]$Model,
+        [int]$Attempt,
+        [switch]$CanWrite
+    )
+    if ($CanWrite) {
+        return Invoke-ClaudeImplement -Prompt $Prompt -Model $Model -Attempt $Attempt
+    }
+    if ($PhaseName -eq "PLAN") {
+        return Invoke-ClaudePlan -Prompt $Prompt -Model $Model -Attempt $Attempt
+    }
+    return Invoke-ClaudeInvestigate -Prompt $Prompt -Model $Model -Attempt $Attempt
 }
 
 function Add-FeedbackEntry {
@@ -573,6 +650,7 @@ try {
     $planOutput = ""
     $planTargets = @()
     $replanReason = ""
+    $salvagedPlanTargets = @()
     for ($planAttempt = 1; $planAttempt -le $CONST_PLAN_ATTEMPTS; $planAttempt++) {
         $currentPhase = "PLAN"
         $attemptsByPhase.plan = $planAttempt
@@ -645,6 +723,67 @@ Schreibe NUR den Plan.
         $replanReason = ($planValidation.issues -join "`n")
         Add-FeedbackEntry -Attempt $planAttempt -Source "PLAN" -Category "PLAN_INSUFFICIENT" -Feedback $replanReason
         Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan wurde verworfen." -Category "PLAN_INSUFFICIENT" -Data @{ issues = $planValidation.issues }
+        $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
+        if ($salvagedPlanTargets.Count -gt 0) {
+            $planTargets = @($salvagedPlanTargets | Select-Object -Unique)
+            $planValidation.valid = $true
+            Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan via Salvage fortgesetzt." -Category "PLAN_SALVAGED" -Data @{ targets = $planTargets }
+            break
+        }
+
+        for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
+            $repairBlock = Get-RepairBlock -FailureCode "PLAN_MISSING_TARGETS" -Reasons $planValidation.issues -PreviousOutput $planOutput
+            $repairPrompt = @"
+$repairBlock
+
+ERSTELLE JETZT EINEN KORRIGIERTEN PLAN FUER DENSELBEN TASK.
+
+AUFGABE:
+$taskPrompt
+
+SOLUTION: $worktreeSln
+
+CODEBASE KONTEXT:
+$codebaseContext
+
+AUSGABEFORMAT:
+## Ziel
+Ein Satz.
+
+## Dateien
+- Pfad: <konkreter relativer Pfad ODER Suchmuster>
+- Aktion: ERSTELLEN | AENDERN | LOESCHEN | PRUEFEN
+- Aenderungen: <konkrete erwartete Aenderung oder Untersuchung>
+
+## Reihenfolge
+1. <konkreter Schritt>
+2. <konkreter Schritt>
+
+## Einschraenkungen
+- <konkretes Risiko>
+
+investigationRequired: true|false
+"@
+            $repairResult = Invoke-ClaudeRepair -PhaseName "PLAN" -Prompt $repairPrompt -Model $effectiveModelPlan -Attempt (50 + $planAttempt * 10 + $repairAttempt)
+            if (-not $repairResult.success) { continue }
+            $planOutput = $repairResult.output.Trim()
+            Save-Artifact -Name "plan-v$planAttempt-repair-$repairAttempt.txt" -Content $planOutput | Out-Null
+            $planValidation = Get-PlanValidation -Plan $planOutput
+            if ($planValidation.valid) {
+                $planTargets = $planValidation.targets
+                if ($planValidation.investigationRequired) { $investigationRequired = $true }
+                Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan nach Repair akzeptiert." -Category "PLAN_REPAIRED" -Data @{ targets = $planTargets }
+                break
+            }
+            $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
+            if ($salvagedPlanTargets.Count -gt 0) {
+                $planTargets = @($salvagedPlanTargets | Select-Object -Unique)
+                $planValidation.valid = $true
+                Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan nach Repair salvaged." -Category "PLAN_SALVAGED" -Data @{ targets = $planTargets }
+                break
+            }
+        }
+        if ($planValidation.valid) { break }
     }
 
     Write-Host "[RESTORE] Warte auf dotnet restore..."
@@ -653,12 +792,9 @@ Schreibe NUR den Plan.
     Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
     Save-Artifact -Name "restore-output.txt" -Content $restoreOutput | Out-Null
 
-    if (-not $planValidation -or -not $planValidation.valid) {
-        $finalStatus = "FAILED"
-        $finalCategory = "PLAN_INSUFFICIENT"
-        $finalSummary = "Plan benennt keine belastbaren Ziele oder enthaelt Template-Reste."
-        $finalFeedback = Format-FeedbackHistory -History $feedbackHistory
-        throw [System.Exception]::new("TERMINAL_PLAN_INSUFFICIENT")
+    if ((-not $planValidation -or -not $planValidation.valid) -and $planTargets.Count -eq 0) {
+        $investigationRequired = $true
+        Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan bleibt schwach; Pipeline wechselt in autonome Investigation-Fallback." -Category "PLAN_FALLBACK"
     }
 
     $investigationOutput = ""
@@ -710,12 +846,39 @@ NEXT_ACTION:
             [void]$investigationHashes.Add((Get-TextHash -Text $investigationOutput))
             Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation-Ergebnis: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets }
 
+            if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
+                $investigationVerdict.result = "CHANGE_NEEDED"
+                $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
+                $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
+                Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation wurde aus verwertbaren Hinweisen salvaged." -Category "CHANGE_NEEDED_SALVAGED" -Data @{ targets = $investigationVerdict.targets }
+            }
+
             if ($investigationVerdict.result -eq "NO_CHANGE") {
-                $finalStatus = "NO_CHANGE"
-                $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
-                $finalSummary = "Investigation ergab, dass keine Codeaenderung noetig ist."
-                $finalFeedback = $investigationOutput
-                throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                $verifyPrompt = @"
+Pruefe die folgende Behauptung strikt read-only: Der Task ist bereits umgesetzt.
+
+TASK:
+$taskPrompt
+
+INVESTIGATION:
+$investigationOutput
+
+ANTWORTE EXAKT:
+RESULT: CONFIRMED | NOT_CONFIRMED
+REASON:
+<kurze Begruendung mit konkreten Dateien oder fehlenden Belegen>
+"@
+                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model $CONST_MODEL_INVESTIGATE -Attempt (80 + $investigateAttempt)
+                if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
+                    $finalStatus = "NO_CHANGE"
+                    $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+                    $finalSummary = "Investigation ergab nach Verifikation, dass keine Codeaenderung noetig ist."
+                    $finalFeedback = $investigationOutput
+                    throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                }
+                Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "NO_CHANGE_NOT_CONFIRMED" -Feedback ($verifyResult.output)
+                $investigationVerdict.result = "CHANGE_NEEDED"
+                $investigationConclusion = "NO_CHANGE_REJECTED"
             }
             if ($investigationVerdict.result -eq "CHANGE_NEEDED") {
                 if ($investigationVerdict.targets.Count -gt 0) {
@@ -725,9 +888,52 @@ NEXT_ACTION:
             }
 
             Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_INCONCLUSIVE" -Feedback $investigationOutput
+            for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
+                $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons @("Dein Output war nicht eindeutig genug, um automatisch weiterzulaufen.") -PreviousOutput $investigationOutput
+                $repairPrompt = @"
+$repairBlock
+
+LIEFERE JETZT EIN VERWERTBARES INVESTIGATION-ERGEBNIS.
+
+TASK:
+$taskPrompt
+
+PLAN:
+$planOutput
+
+CODEBASE KONTEXT:
+$codebaseContext
+
+AUSGABEFORMAT:
+RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
+TARGET_FILES:
+- <konkreter Pfad oder Suchmuster>
+ROOT_CAUSE:
+<konkrete Analyse>
+NEXT_ACTION:
+<konkrete naechste Aenderung oder Begruendung>
+"@
+                $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $CONST_MODEL_INVESTIGATE -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
+                if (-not $repairResult.success) { continue }
+                $investigationOutput = $repairResult.output.Trim()
+                Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $investigationOutput | Out-Null
+                $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
+                if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
+                    $investigationVerdict.result = "CHANGE_NEEDED"
+                    $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
+                    $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
+                }
+                if ($investigationVerdict.result -eq "CHANGE_NEEDED") {
+                    if ($investigationVerdict.targets.Count -gt 0) {
+                        $planTargets = @($planTargets + $investigationVerdict.targets | Select-Object -Unique)
+                    }
+                    break
+                }
+            }
+            if ($investigationVerdict.result -eq "CHANGE_NEEDED") { break }
             if ($investigationHashes.Count -ge 2) {
                 $lastTwo = $investigationHashes | Select-Object -Last 2
-                if (($lastTwo | Sort-Object -Unique).Count -eq 1) {
+                if (($lastTwo | Sort-Object -Unique).Count -eq 1 -and -not (Test-HasActionableSignal -Text $investigationOutput)) {
                     $finalStatus = "FAILED"
                     $finalCategory = "INVESTIGATION_INCONCLUSIVE"
                     $finalSummary = "Investigation blieb zweimal semantisch gleich und ergab keine neue Information."
@@ -737,7 +943,7 @@ NEXT_ACTION:
             }
         }
 
-        if ($investigationVerdict.result -ne "CHANGE_NEEDED") {
+        if ($investigationVerdict.result -ne "CHANGE_NEEDED" -and -not (Test-HasActionableSignal -Text $investigationOutput)) {
             $finalStatus = "FAILED"
             $finalCategory = "INVESTIGATION_INCONCLUSIVE"
             $finalSummary = "Investigation konnte keinen belastbaren Aenderungspfad bestimmen."
@@ -818,13 +1024,76 @@ SUMMARY:
             Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category $implOutcome.category -Feedback $implResult.output
 
             if ($implOutcome.category -eq "NO_CHANGE_ALREADY_SATISFIED") {
-                $finalStatus = "NO_CHANGE"
-                $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
-                $finalSummary = "Implementierung meldet, dass der gewuenschte Zustand bereits erreicht ist."
-                $finalFeedback = $implResult.output
-                throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                $verifyPrompt = @"
+Pruefe strikt read-only, ob diese Aussage stimmt: Der Task ist bereits umgesetzt.
+
+TASK:
+$taskPrompt
+
+IMPLEMENTIERUNGSANTWORT:
+$($implResult.output)
+
+ANTWORTE EXAKT:
+RESULT: CONFIRMED | NOT_CONFIRMED
+REASON:
+<kurze Begruendung>
+"@
+                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model $CONST_MODEL_INVESTIGATE -Attempt (300 + $implementAttempt)
+                if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
+                    $finalStatus = "NO_CHANGE"
+                    $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+                    $finalSummary = "Implementierung meldet nach Verifikation, dass der gewuenschte Zustand bereits erreicht ist."
+                    $finalFeedback = $implResult.output
+                    throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                }
+                Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category "NO_CHANGE_NOT_CONFIRMED" -Feedback ($verifyResult.output)
             }
 
+            $repairReasons = @()
+            switch ($implOutcome.category) {
+                "NO_CHANGE_TARGET_NOT_FOUND" { $repairReasons = @("Du hast das Ziel nicht gefunden.", "Nutze die vorhandenen Hinweise und suche gezielt in den genannten Dateien.") }
+                "NO_CHANGE_BLOCKED" { $repairReasons = @("Du hast einen Blocker gemeldet.", "Erklaere den Blocker nicht nur, sondern setze die minimal moegliche Aenderung um oder liefere konkrete Suchtreffer.") }
+                "NO_CHANGE_UNCERTAIN" { $repairReasons = @("Du warst unsicher.", "Unsicherheit ist kein Endzustand, wenn verwertbare Hinweise vorhanden sind.") }
+                default { $repairReasons = @("Es wurden keine Dateien geaendert.", "Nutze die verwertbaren Hinweise aus deinem letzten Output.") }
+            }
+            if (Test-HasActionableSignal -Text $implResult.output) {
+                $repairPrompt = @"
+$(Get-RepairBlock -FailureCode $implOutcome.category -Reasons $repairReasons -PreviousOutput $implResult.output)
+
+SETZE DEN TASK JETZT UM.
+
+TASK:
+$taskPrompt
+
+VALIDIERTER PLAN:
+$planOutput
+
+INVESTIGATION:
+$investigationBlock
+
+ERLAUBTE ZIELDATEIEN:
+$targetText
+
+WICHTIG:
+- Nutze die bereits genannten Dateien, Zeilen oder Ersetzungen.
+- Liefere keine weitere vage Begruendung.
+- Aendere mindestens eine Repo-Datei oder liefere ein klar begruendetes RESULT.
+"@
+                $repairImplResult = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $repairPrompt -Model $effectiveModelImplement -Attempt (400 + $implementAttempt)
+                if ($repairImplResult.success) {
+                    $implResult = $repairImplResult
+                    $implOutcome = Get-ImplementationOutcome -Output $implResult.output
+                    $changedFiles = Get-ChangedFiles
+                    if ($changedFiles.Count -gt 0) {
+                        Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Repair-Implementierung hat Dateien geaendert." -Category "CHANGE_APPLIED"
+                    } else {
+                        Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category "IMPLEMENT_REPAIR_NO_CHANGE" -Feedback $implResult.output
+                    }
+                }
+            }
+            if ($changedFiles.Count -gt 0) {
+                Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "$($changedFiles.Count) Datei(en) geaendert." -Category "CHANGE_APPLIED" -Data @{ files = $changedFiles }
+            } else {
             if ($implementationHistoryHashes.Count -ge 2) {
                 $lastTwo = $implementationHistoryHashes | Select-Object -Last 2
                 if (($lastTwo | Sort-Object -Unique).Count -eq 1) {
@@ -835,7 +1104,8 @@ SUMMARY:
                     throw [System.Exception]::new("TERMINAL_NO_CHANGE_REPEAT")
                 }
             }
-            continue
+                continue
+            }
         }
 
         Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "$($changedFiles.Count) Datei(en) geaendert." -Category "CHANGE_APPLIED" -Data @{ files = $changedFiles }
@@ -969,6 +1239,22 @@ $historyForReview
             $reviewFeedback = "REVIEW DENIED ($($verdict.severity)):`n$($verdict.feedback)"
             Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "REVIEW" -Category "REVIEW_DENIED_$($verdict.severity)" -Feedback $reviewFeedback
             if ($reviewCycle -ge $CONST_REMEDIATION_ATTEMPTS) {
+                if ($verdict.severity -eq "MINOR" -and (Test-HasActionableSignal -Text $verdict.feedback)) {
+                    $minorRescuePrompt = @"
+$(Get-RepairBlock -FailureCode "REVIEW_DENIED_MINOR" -Reasons @("Das Review meldet nur kleinere, aber konkrete Probleme.") -PreviousOutput $verdict.feedback)
+
+BEHEBE JETZT AUSSCHLIESSLICH DIESE MINOR-PUNKTE IM BESTEHENDEN WORKTREE.
+
+FEEDBACK:
+$($verdict.feedback)
+"@
+                    $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $effectiveModelImplement -Attempt (500 + $implementAttempt * 10 + $reviewCycle)
+                    if ($minorRescue.success) {
+                        $changedFiles = Get-ChangedFiles
+                        $reviewCycle = 0
+                        continue
+                    }
+                }
                 $finalStatus = "FAILED"
                 $finalCategory = "REVIEW_DENIED_$($verdict.severity)"
                 $finalSummary = "Review-Feedback konnte nicht innerhalb des Remediation-Budgets aufgeloest werden."
