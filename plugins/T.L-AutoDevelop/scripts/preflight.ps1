@@ -20,9 +20,7 @@ function Invoke-NativeCommand {
 
 # Geaenderte Dateien ermitteln falls nicht uebergeben
 if (-not $ChangedFiles -or $ChangedFiles.Count -eq 0) {
-    $ChangedFiles = (Invoke-NativeCommand git @("diff","--name-only","HEAD")).output -split "`n" | Where-Object { $_.Trim() -ne "" }
-    if (-not $ChangedFiles) { $ChangedFiles = @() }
-    if ($ChangedFiles -is [string]) { $ChangedFiles = @($ChangedFiles) }
+    $ChangedFiles = @((Invoke-NativeCommand git @("diff","--name-only","HEAD")).output -split "`n" | Where-Object { $_.Trim() -ne "" })
 }
 
 $blockers = [System.Collections.ArrayList]::new()

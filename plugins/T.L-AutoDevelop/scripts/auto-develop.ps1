@@ -420,7 +420,7 @@ function Invoke-ClaudeReview {
 
 function Get-ReviewVerdict {
     param([string]$ReviewOutput)
-    $lines = $ReviewOutput -split "`n" | Where-Object { $_.Trim() -ne "" }
+    $lines = @($ReviewOutput -split "`n" | Where-Object { $_.Trim() -ne "" })
     if ($lines.Count -eq 0) { return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = "Leere Review-Antwort" } }
 
     $firstLine = $lines[0].Trim().ToUpperInvariant()
