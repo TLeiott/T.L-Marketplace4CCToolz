@@ -59,7 +59,8 @@ ALLE Bash-Aufrufe in EINER EINZIGEN Nachricht (parallel!):
       -SolutionPath "<sln-pfad>" \
       -ResultFile "<result-pfad>" \
       -TaskName "batch-<timestamp>-<id>" \
-      -SkipRun
+      -SkipRun \
+      -AllowNuget
 
 Nutzer informieren: "N Pipelines gestartet. Du wirst nach Abschluss benachrichtigt."
 

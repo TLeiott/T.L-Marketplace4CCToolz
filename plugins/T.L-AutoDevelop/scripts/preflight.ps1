@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [string[]]$ChangedFiles,
     [switch]$SkipRun,
+    [switch]$AllowNuget,
     [string]$ProjectPath
 )
 
@@ -165,8 +166,8 @@ foreach ($file in $changedCs) {
     }
 }
 
-# --- BLOCKER 6: NuGet Audit ---
-foreach ($csproj in $changedCsproj) {
+# --- BLOCKER 6: NuGet Audit (uebersprungen wenn AllowNuget gesetzt) ---
+if (-not $AllowNuget) { foreach ($csproj in $changedCsproj) {
     $currentPkgs = (Select-String -Path $csproj -Pattern '<PackageReference\s+Include="([^"]+)"' -AllMatches).Matches |
         ForEach-Object { $_.Groups[1].Value }
     $basePkgs = @()
@@ -181,7 +182,7 @@ foreach ($csproj in $changedCsproj) {
     foreach ($pkg in $newPkgs) {
         Add-Blocker "nuget_audit" $csproj "Neues NuGet-Paket ohne Freigabe: $pkg" -suggestion "NuGet-Paket entfernen"
     }
-}
+} }  # Ende foreach + Ende if AllowNuget
 
 # Phase 5.3: XAML-Validierung
 foreach ($file in $changedXaml) {

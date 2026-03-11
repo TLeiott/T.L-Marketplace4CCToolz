@@ -57,7 +57,8 @@ Bash-Tool mit run_in_background: true:
       -File "$(cygpath -w "$SCRIPT")" \
       -PromptFile "$PROMPT_FILE" \
       -SolutionPath "<sln-pfad>" \
-      -ResultFile "$RESULT_FILE"
+      -ResultFile "$RESULT_FILE" \
+      -AllowNuget
 
 Nutzer informieren: "Pipeline gestartet. Du wirst benachrichtigt."
 

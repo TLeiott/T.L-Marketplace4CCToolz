@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [Parameter(Mandatory)][string]$ResultFile,
     [string]$TaskName = "develop-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
-    [switch]$SkipRun
+    [switch]$SkipRun,
+    [switch]$AllowNuget
 )
 
 # --- Konstanten ---
@@ -95,8 +96,15 @@ function Invoke-ClaudeWithTimeout {
         Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
         $promptContent = [System.IO.File]::ReadAllText($promptFile, [System.Text.Encoding]::UTF8)
         $allArgs = @("-p") + $extraArgs
-        $output = $promptContent | & $exe @allArgs 2>&1 | Out-String
-        [System.IO.File]::WriteAllText($outFile, $output, [System.Text.Encoding]::UTF8)
+        try {
+            $output = $promptContent | & $exe @allArgs 2>&1 | Out-String
+            $exitCode = $LASTEXITCODE
+        } catch {
+            $output = "JOB_EXCEPTION: $_"
+            $exitCode = 99
+        }
+        # Exit-Code als erste Zeile schreiben, damit der Aufrufer ihn auslesen kann
+        [System.IO.File]::WriteAllText($outFile, "$exitCode`n$output", [System.Text.Encoding]::UTF8)
     } -ArgumentList $claudeExe, $tempPromptFile, $extraArgs, $tempOutputFile, (Get-Location).Path
 
     $completed = Wait-Job $job -Timeout $timeoutSec
@@ -107,17 +115,32 @@ function Invoke-ClaudeWithTimeout {
         return @{ success = $false; output = "TIMEOUT nach $timeoutSec Sekunden"; timedOut = $true }
     }
 
-    Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
+    # Job-Fehler abfangen (z.B. exe nicht gefunden)
+    $jobFailed = $job.State -eq 'Failed'
+    $jobErrors = Receive-Job $job 2>&1 | Out-String
     Remove-Job $job -Force -ErrorAction SilentlyContinue
 
-    $output = ""
+    $rawOutput = ""
     if (Test-Path $tempOutputFile) {
-        $output = [System.IO.File]::ReadAllText($tempOutputFile, [System.Text.Encoding]::UTF8)
+        $rawOutput = [System.IO.File]::ReadAllText($tempOutputFile, [System.Text.Encoding]::UTF8)
         Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
     }
     Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
 
-    return @{ success = $true; output = $output; timedOut = $false }
+    if ($jobFailed) {
+        return @{ success = $false; output = "JOB_FAILED: $jobErrors"; timedOut = $false }
+    }
+
+    # Erste Zeile = Exit-Code, Rest = eigentliche Ausgabe
+    $lines = $rawOutput -split "`n", 2
+    $exitCode = 0
+    $output = $rawOutput
+    if ($lines.Count -ge 2 -and $lines[0] -match '^\d+$') {
+        $exitCode = [int]$lines[0]
+        $output = $lines[1]
+    }
+
+    return @{ success = ($exitCode -eq 0); output = $output; timedOut = $false; exitCode = $exitCode }
 }
 
 function Invoke-ClaudePlan {
@@ -314,6 +337,9 @@ try {
     $effectiveModelImpl = if ($isSimpleTask) { $CONST_MODEL_FAST } else { $CONST_MODEL_IMPLEMENT }
     if ($isSimpleTask) { Write-Host "[MODEL] Einfacher Task erkannt - verwende $CONST_MODEL_FAST" }
 
+    # NuGet-Regel je nach AllowNuget-Parameter
+    $nugetRegel = if ($AllowNuget) { "- Neue NuGet-Pakete erlaubt (nur wenn benoetigt)" } else { "$nugetRegel" }
+
     # Phase 1.1-1.4 + 2.1: Strukturierter Plan-Prompt mit Regeln, Format, Scope Guard, Kontext
     $planPrompt = @"
 Analysiere das Codebase und erstelle einen Implementierungsplan.
@@ -330,7 +356,7 @@ REGELN (muessen im Plan beruecksichtigt werden):
 - Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
 - Kein throw new NotImplementedException()
 - Max 1 Top-Level Typdeklaration pro Datei (nested/partial OK)
-- Keine neuen NuGet-Pakete
+$nugetRegel
 - Kommentare auf Deutsch, minimal
 - DialogService.ShowDialogHmdException() fuer Exceptions
 - MessageService.ShowMessageBox statt MessageBox.Show
@@ -365,6 +391,12 @@ Schreibe NUR den Plan, implementiere NICHTS.
         exit 1
     }
     $planOutput = $planResult.output
+    # Plan-Struktur prüfen: erwartete Abschnitte müssen vorhanden sein
+    if ($planOutput -notmatch '##\s*Ziel' -or $planOutput -notmatch '##\s*Dateien') {
+        $planErrLines = ($planOutput -split "`n" | Select-Object -Last 20) -join "`n"
+        Write-ResultJson -status "ERROR" -error "Plan-Struktur ungueltig (## Ziel / ## Dateien fehlt). Letzte 20 Zeilen:`n$planErrLines" -phase "PLAN"
+        exit 1
+    }
     Write-Host "[PLAN] OK ($(($planOutput -split '\n').Count) Zeilen)"
 
     # Phase 6.2: Auf restore warten
@@ -412,7 +444,7 @@ REGELN (muessen im Plan beruecksichtigt werden):
 - Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
 - Kein throw new NotImplementedException()
 - Max 1 Top-Level Typdeklaration pro Datei (nested/partial OK)
-- Keine neuen NuGet-Pakete
+$nugetRegel
 - Kommentare auf Deutsch, minimal
 - DialogService.ShowDialogHmdException() fuer Exceptions
 - MessageService.ShowMessageBox statt MessageBox.Show
@@ -521,24 +553,29 @@ Nach Abschluss: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschl
             continue
         }
 
-        # Geaenderte Dateien erfassen
-        $changedFiles = @((Invoke-NativeCommand git @("diff","--name-only","HEAD")).output -split "`n" | Where-Object { $_.Trim() -ne "" })
-        Write-Host "[IMPL] OK - $($changedFiles.Count) Dateien"
+        # Geaenderte Dateien erfassen (inkl. neue, noch nicht getrackte Dateien)
+        $diffFiles      = (Invoke-NativeCommand git @("diff","--name-only","HEAD")).output
+        $untrackedFiles = (Invoke-NativeCommand git @("ls-files","--others","--exclude-standard")).output
+        $changedFiles   = @(($diffFiles + "`n" + $untrackedFiles) -split "`n" | Where-Object { $_.Trim() -ne "" })
         if ($changedFiles.Count -eq 0) {
+            $implOutSnippet = ($implResult.output -split "`n" | Select-Object -Last 30) -join "`n"
+            Write-Host "[IMPL] LEER - keine Dateien geaendert"
             [void]$feedbackHistory.Add(@{
                 attempt  = $attempt
                 source   = "IMPL_FAIL"
-                feedback = "Keine Dateien geaendert. Implementierung hat nichts produziert."
+                feedback = "Keine Dateien geaendert. Implementierung hat nichts produziert.`n`nClaude-Ausgabe (letzte 30 Zeilen):`n$implOutSnippet"
             })
             continue
         }
+        Write-Host "[IMPL] OK - $($changedFiles.Count) Dateien"
 
         # 5. PREFLIGHT
         $currentPhase = "PREFLIGHT"
         Write-Host "[PREFLIGHT] Pruefe Build + Regeln..."
         $preflightScript = Join-Path $PSScriptRoot "preflight.ps1"
         $pfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflightScript, "-SolutionPath", $worktreeSln)
-        if ($SkipRun) { $pfArgs += "-SkipRun" }
+        if ($SkipRun)    { $pfArgs += "-SkipRun" }
+        if ($AllowNuget) { $pfArgs += "-AllowNuget" }
         $preflightJson = & powershell.exe @pfArgs 2>&1 | Out-String
         try {
             $preflight = $preflightJson | ConvertFrom-Json
@@ -567,9 +604,9 @@ Nach Abschluss: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschl
                 feedback = "PREFLIGHT FAILED:`n$blockerText"
             })
 
-            # Phase 4.2: Sofort abbrechen bei nuget_audit (nicht behebbar)
+            # Phase 4.2: Sofort abbrechen bei nuget_audit (nicht behebbar) — ausser AllowNuget ist gesetzt
             $hasNugetBlocker = $preflight.blockers | Where-Object { $_.check -eq "nuget_audit" }
-            if ($hasNugetBlocker) {
+            if ($hasNugetBlocker -and -not $AllowNuget) {
                 Write-Host "[PREFLIGHT] nuget_audit Blocker - nicht behebbar, breche ab"
                 break
             }
