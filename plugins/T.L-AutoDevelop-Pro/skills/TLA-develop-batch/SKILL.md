@@ -51,7 +51,10 @@ Result-Pfade merken: $WIN_TEMP/claude-develop/batch-$TIMESTAMP-<id>-result.json
 Fuer JEDEN Task einen eigenen Bash-Aufruf mit run_in_background: true.
 ALLE Bash-Aufrufe in EINER EINZIGEN Nachricht (parallel!):
 
-    SCRIPT=$(find "$HOME/.claude" -path "*/T*AutoDevelop/scripts/auto-develop.ps1" -print -quit 2>/dev/null)
+    SCRIPT=$(find "$HOME/.claude/plugins/marketplaces" -path "*/T.L-AutoDevelop/scripts/auto-develop.ps1" -print -quit 2>/dev/null)
+    if [ -z "$SCRIPT" ]; then
+      SCRIPT=$(find "$HOME/.claude/plugins/cache" -path "*/T-L-AutoDevelop/*/scripts/auto-develop.ps1" -print -quit 2>/dev/null)
+    fi
     if [ -z "$SCRIPT" ]; then echo "ERROR: auto-develop.ps1 nicht gefunden"; exit 1; fi
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
       -File "$(cygpath -w "$SCRIPT")" \

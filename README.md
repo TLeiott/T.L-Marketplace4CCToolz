@@ -4,7 +4,7 @@ A Claude Code plugin marketplace providing .NET development pipeline tools.
 
 ## What's Included
 
-### T.L-AutoDevelop (v2.1.0) — Interactive
+### T.L-AutoDevelop (v2.3.0) — Interactive
 
 An interactive development pipeline that orchestrates Claude Code through plan, implement, preflight-check, and code-review stages — with user confirmations before each commit.
 
@@ -13,7 +13,7 @@ An interactive development pipeline that orchestrates Claude Code through plan, 
 | `/develop [task]` | Single task with user confirmations before commit |
 | `/develop-batch [tasks.md]` | Parallel batch via git worktrees, confirms each commit |
 
-### T.L-AutoDevelop-Pro (v2.1.0) — Autonomous
+### T.L-AutoDevelop-Pro (v2.3.0) — Autonomous
 
 A fully autonomous development pipeline — zero confirmations. Runs plan, implement, preflight, review, and commit end-to-end unattended.
 
