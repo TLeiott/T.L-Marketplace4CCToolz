@@ -1,6 +1,6 @@
 ---
 name: TLA-develop-batch
-description: "Fully autonomous batch develop pipeline. No confirmations, no stops."
+description: "Fully autonomous batch develop pipeline with capped parallelism. No confirmations, no stops."
 argument-hint: [path to tasks.md]
 disable-model-invocation: true
 ---
@@ -46,10 +46,10 @@ Fuer jeden Task (id = 1, 2, 3, ...) eine Prompt-Datei schreiben:
 
 Result-Pfade merken: $WIN_TEMP/claude-develop/batch-$TIMESTAMP-<id>-result.json
 
-## STEP 5 — ALLE PIPELINES PARALLEL STARTEN
+## STEP 5 — PIPELINES MIT MAXIMAL 2 GLEICHZEITIG STARTEN
 
-Fuer JEDEN Task einen eigenen Bash-Aufruf mit run_in_background: true.
-ALLE Bash-Aufrufe in EINER EINZIGEN Nachricht (parallel!):
+Starte hoechstens 2 Pipelines gleichzeitig. Erst wenn eine fertig ist, die naechste starten.
+Nutze pro Task einen eigenen Bash-Aufruf mit `run_in_background: true`.
 
     SCRIPT=$(find "$HOME/.claude/plugins/marketplaces" -path "*/T.L-AutoDevelop/scripts/auto-develop.ps1" -print -quit 2>/dev/null)
     if [ -z "$SCRIPT" ]; then
@@ -65,7 +65,7 @@ ALLE Bash-Aufrufe in EINER EINZIGEN Nachricht (parallel!):
       -SkipRun \
       -AllowNuget
 
-Nutzer informieren: "N Pipelines gestartet. Du wirst nach Abschluss benachrichtigt."
+Nutzer informieren: "N Pipelines gestartet. Maximal 2 laufen gleichzeitig."
 
 ## STEP 6 — ERGEBNISSE SAMMELN (nach ALLEN Benachrichtigungen)
 
@@ -79,7 +79,7 @@ Uebersichtstabelle anzeigen:
     | 1 | Add logging       | ACCEPTED | 3       | 1        |
     | 2 | Fix validation    | FAILED   | 0       | 3        |
 
-Falls KEINE Tasks ACCEPTED: Fehler zeigen, abbrechen.
+Falls KEINE Tasks `ACCEPTED`: Fehler zeigen, `finalCategory`/`summary` nennen, abbrechen.
 
 ## STEP 7 — SEQUENZIELL MERGEN + AUTO-COMMITTEN
 
@@ -103,6 +103,6 @@ Fuer SKIPPED Tasks:
 - Grund nennen (Konflikt / Build-Fehler)
 - Branch aufraeumen: `git branch -D auto/batch-<timestamp>-<id>`
 
-Fuer FAILED/ERROR Tasks:
-- Fehler + Feedback zeigen
+Fuer FAILED/ERROR/NO_CHANGE Tasks:
+- `finalCategory`, `summary`, `artifacts.runDir` zeigen
 - Branch wurde bereits von auto-develop.ps1 aufgeraeumt

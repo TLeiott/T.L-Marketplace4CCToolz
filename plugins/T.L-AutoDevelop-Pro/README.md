@@ -7,7 +7,7 @@ Autonomous addon for [T.L-AutoDevelop](../T.L-AutoDevelop/). Zero confirmations 
 ## Skills
 
 - **`/TLA-develop`** — Fully autonomous single-task pipeline. No user input after launch, auto-commits on success.
-- **`/TLA-develop-batch`** — Fully autonomous parallel batch pipeline. No user input, auto-commits all accepted tasks.
+- **`/TLA-develop-batch`** — Fully autonomous batched pipeline with capped parallelism. No user input, auto-commits all accepted tasks.
 
 ## Differences from T.L-AutoDevelop
 
@@ -17,6 +17,7 @@ Autonomous addon for [T.L-AutoDevelop](../T.L-AutoDevelop/). Zero confirmations 
 | Reviewer agent | Included | Uses T.L-AutoDevelop's |
 | Commit on ACCEPTED | Asks user first | Auto-commits |
 | User confirmations | Yes | None |
+| Investigation / no-op logic | Included | Uses T.L-AutoDevelop's |
 
 ## Requirements
 

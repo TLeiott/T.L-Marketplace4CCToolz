@@ -1,6 +1,6 @@
 ---
 name: TLA-develop
-description: "Fully autonomous develop pipeline. No confirmations, no stops. Git required."
+description: "Fully autonomous develop pipeline with investigation and no-op handling. Git required."
 argument-hint: [task description]
 disable-model-invocation: true
 ---
@@ -76,7 +76,12 @@ Vollautomatisch, KEIN User-Input:
 3. Deutsche Commit-Message automatisch generieren (inhaltlich, basierend auf Task-Text und geaenderten Dateien)
 4. `git commit -m "<generierte message>"`
 5. Branch aufraeumen: `git branch -D auto/<branch>`
-6. Ergebnis praesentieren: Dateien, Review-Feedback, Versuche, Commit-Message
+6. Ergebnis praesentieren: Dateien, `summary`, `finalCategory`, Versuche, Commit-Message
+
+### NO_CHANGE:
+1. `summary`, `finalCategory`, `noChangeReason`, `artifacts.runDir` zeigen
+2. NICHT committen
+3. Branch wurde bereits von auto-develop.ps1 aufgeraeumt
 
 ### FAILED:
 1. Fehler + Feedback anzeigen

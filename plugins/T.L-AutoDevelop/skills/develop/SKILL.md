@@ -1,6 +1,6 @@
 ---
 name: develop
-description: "Auto-develop: plan, implement, preflight, review with retry. Git required."
+description: "Auto-develop: validate, investigate, implement, preflight, review. Git required."
 argument-hint: [task description]
 disable-model-invocation: true
 ---
@@ -70,11 +70,17 @@ Read $RESULT_FILE. JSON parsen.
 ### ACCEPTED:
 1. git merge --squash auto/<branch>
 2. dotnet build <sln>
-3. Praesentieren: Dateien, Review-Feedback, Versuche
+3. Praesentieren: Dateien, `summary`, `finalCategory`, `artifacts.runDir`, Versuche
 4. "Teste, dann sag commit oder discard"
 
+### NO_CHANGE:
+1. `summary`, `finalCategory`, `noChangeReason`, `artifacts.runDir` zeigen
+2. Erklaeren, dass die Pipeline bewusst ohne Codeaenderung beendet hat
+3. Nur verwerfen / neu starten anbieten, nicht committen
+
 ### FAILED:
-Fehler + Feedback zeigen. Anbieten: Erneut oder verwerfen.
+1. `summary`, `finalCategory`, `feedback`, `artifacts.runDir` zeigen
+2. Anbieten: Erneut oder verwerfen
 
 ### ERROR/TIMEOUT:
 Fehler zeigen. Manuellen Ansatz vorschlagen.

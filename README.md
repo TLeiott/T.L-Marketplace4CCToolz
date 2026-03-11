@@ -6,26 +6,33 @@ A Claude Code plugin marketplace providing .NET development pipeline tools.
 
 ### T.L-AutoDevelop (v2.3.0) — Interactive
 
-An interactive development pipeline that orchestrates Claude Code through plan, implement, preflight-check, and code-review stages — with user confirmations before each commit.
+An interactive development pipeline that orchestrates Claude Code through plan, semantic plan validation, investigation, implementation, preflight, and review — with user confirmations before each commit.
 
 | Command | Description |
 |---------|-------------|
 | `/develop [task]` | Single task with user confirmations before commit |
-| `/develop-batch [tasks.md]` | Parallel batch via git worktrees, confirms each commit |
+| `/develop-batch [tasks.md]` | Batched git-worktree pipeline with capped parallelism, confirms each commit |
 
 ### T.L-AutoDevelop-Pro (v2.3.0) — Autonomous
 
-A fully autonomous development pipeline — zero confirmations. Runs plan, implement, preflight, review, and commit end-to-end unattended.
+A fully autonomous development pipeline — zero confirmations. Runs plan, investigation, implement, preflight, review, and commit end-to-end unattended.
 
 | Command | Description |
 |---------|-------------|
 | `/TLA-develop [task]` | Single task, zero confirmations, auto-commit |
-| `/TLA-develop-batch [tasks.md]` | Parallel batch, fully automated end-to-end |
+| `/TLA-develop-batch [tasks.md]` | Batched pipeline with capped parallelism, fully automated end-to-end |
 
 **Pipeline Flow:**
 ```
-Plan (read-only) -> Implement (write) -> Preflight (build + lint) -> Review (LLM judge) -> Retry or Accept
+Plan -> Plan Validate -> Investigate -> Implement -> Change Validate -> Preflight -> Review
 ```
+
+**New runtime behavior:**
+- Explicit no-op categories instead of generic `IMPL_FAIL`
+- Per-run artifacts under `.claude-develop-logs/runs/<taskName>/`
+- Investigation phase for ambiguous or diagnostic tasks
+- Semantic plan validation that rejects placeholder/template plans
+- Batch launchers should cap concurrency at 2 simultaneous pipelines
 
 ## Prerequisites
 
@@ -59,10 +66,30 @@ Constants in `auto-develop.ps1`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `CONST_MODEL_PLAN` | `claude-opus-4-6` | Model for planning phase |
+| `CONST_MODEL_INVESTIGATE` | `claude-opus-4-6` | Model for investigation phase |
 | `CONST_MODEL_IMPLEMENT` | `claude-opus-4-6` | Model for implementation |
 | `CONST_MODEL_REVIEW` | `claude-opus-4-6` | Model for code review |
-| `CONST_MAX_RETRIES` | `10` | Max retry attempts |
+| `CONST_PLAN_ATTEMPTS` | `2` | Plan / replan attempts |
+| `CONST_INVESTIGATION_ATTEMPTS` | `2` | Investigation attempts |
+| `CONST_IMPLEMENT_ATTEMPTS` | `2` | Fresh implementation attempts |
+| `CONST_REMEDIATION_ATTEMPTS` | `2` | Preflight / review remediation attempts |
 | `CONST_TIMEOUT_SECONDS` | `900` | Timeout per phase (15 min) |
+
+## Result Categories
+
+`auto-develop.ps1` now returns structured terminal categories such as:
+
+- `ACCEPTED`
+- `PLAN_INSUFFICIENT`
+- `INVESTIGATION_INCONCLUSIVE`
+- `NO_CHANGE_ALREADY_SATISFIED`
+- `NO_CHANGE_TARGET_NOT_FOUND`
+- `NO_CHANGE_BLOCKED`
+- `PREFLIGHT_FAILED`
+- `REVIEW_DENIED_MAJOR`
+- `REVIEW_DENIED_RETHINK`
+
+The result JSON also includes `summary`, `attemptsByPhase`, `artifacts.runDir`, and `noChangeReason`.
 
 ## Language
 

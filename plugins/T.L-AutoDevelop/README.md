@@ -1,11 +1,11 @@
 # T.L-AutoDevelop
 
-Interactive .NET development pipeline plugin for Claude Code.
+Interactive .NET development pipeline plugin for Claude Code with explicit investigation and no-op handling.
 
 ## Skills
 
-- **`/develop`** — Interactive single-task pipeline (plan, implement, preflight, review) with user confirmations
-- **`/develop-batch`** — Interactive parallel batch processing via git worktrees, user confirms each commit
+- **`/develop`** — Interactive single-task pipeline (plan, validate, investigate, implement, preflight, review) with user confirmations
+- **`/develop-batch`** — Interactive batch processing via git worktrees with capped parallelism and per-commit confirmations
 
 ## Agents
 
@@ -13,8 +13,19 @@ Interactive .NET development pipeline plugin for Claude Code.
 
 ## Scripts
 
-- **auto-develop.ps1** — Main pipeline orchestrator. Manages git worktrees, invokes Claude for plan/implement/review phases, runs preflight checks, handles retry loops.
+- **auto-develop.ps1** — Main pipeline orchestrator. Manages git worktrees, persists per-run artifacts, validates plans semantically, runs investigation before implementation when needed, classifies no-op outcomes, and performs preflight/review remediation.
 - **preflight.ps1** — Deterministic validation: build check, forbidden comments, stub detection, class-per-file rule, NuGet audit, and various warnings.
+
+## Runtime Output
+
+Each run writes artifacts under `.claude-develop-logs/runs/<taskName>/` and returns structured result fields such as:
+
+- `finalCategory`
+- `summary`
+- `attemptsByPhase`
+- `artifacts.runDir`
+- `investigationConclusion`
+- `noChangeReason`
 
 ## Requirements
 
