@@ -145,9 +145,11 @@ function Invoke-ClaudeWithTimeout {
 
 function Invoke-ClaudePlan {
     param([string]$prompt, [string]$model = $CONST_MODEL_PLAN)
+    # Kein --permission-mode plan: inkompatibel mit -p (non-interactive gibt nur UI-Text aus)
+    # --allowedTools ohne bypass: unlisted tools werden in -p-Mode automatisch abgelehnt
     return Invoke-ClaudeWithTimeout -prompt $prompt -extraArgs @(
         "--model", $model,
-        "--permission-mode", "plan",
+        "--allowedTools", "Read,Glob,Grep",
         "--max-turns", $CONST_MAX_TURNS_PLAN.ToString()
     )
 }
@@ -164,9 +166,10 @@ function Invoke-ClaudeImplement {
 
 function Invoke-ClaudeReview {
     param([string]$prompt)
+    # Kein --permission-mode plan: inkompatibel mit -p (non-interactive gibt nur UI-Text aus)
     return Invoke-ClaudeWithTimeout -prompt $prompt -extraArgs @(
         "--model", $CONST_MODEL_REVIEW,
-        "--permission-mode", "plan",
+        "--allowedTools", "Read,Glob,Grep",
         "--max-turns", $CONST_MAX_TURNS_REVIEW.ToString()
     )
 }
@@ -215,6 +218,22 @@ function Get-StrategyHint {
         { $_ -le 5 } { return "Vereinfache die Implementierung wenn moeglich. Weniger ist mehr." }
         default       { return "KRITISCH: Letzter Versuch. Implementiere nur das absolute Minimum." }
     }
+}
+
+# Plan-Validierung: degenerierte oder UI-kontaminierte Plaene ablehnen
+function Test-PlanValid {
+    param([string]$plan)
+    # Bekannte UI-Kontamination abfangen (permission-mode plan UI-Text)
+    if ($plan -match 'Freigabe bereit|approval pending|plan ready for approval') { return $false }
+    # Pflicht-Abschnitte
+    if ($plan -notmatch '##\s*Ziel') { return $false }
+    if ($plan -notmatch '##\s*Dateien') { return $false }
+    # Mindestens ein Dateieintrag
+    if ($plan -notmatch '-\s*Pfad\s*:') { return $false }
+    # Mindestens 10 nicht-leere Zeilen
+    $nonEmpty = @($plan -split "`n" | Where-Object { $_.Trim() -ne "" })
+    if ($nonEmpty.Count -lt 10) { return $false }
+    return $true
 }
 
 # Phase 6.3: Einfache Tasks erkennen
@@ -338,7 +357,7 @@ try {
     if ($isSimpleTask) { Write-Host "[MODEL] Einfacher Task erkannt - verwende $CONST_MODEL_FAST" }
 
     # NuGet-Regel je nach AllowNuget-Parameter
-    $nugetRegel = if ($AllowNuget) { "- Neue NuGet-Pakete erlaubt (nur wenn benoetigt)" } else { "$nugetRegel" }
+    $nugetRegel = if ($AllowNuget) { "- Neue NuGet-Pakete erlaubt (nur wenn benoetigt)" } else { "- Keine neuen NuGet-Pakete" }
 
     # Phase 1.1-1.4 + 2.1: Strukturierter Plan-Prompt mit Regeln, Format, Scope Guard, Kontext
     $planPrompt = @"
@@ -362,6 +381,8 @@ $nugetRegel
 - MessageService.ShowMessageBox statt MessageBox.Show
 - Kein Dispatcher.Invoke/BeginInvoke wenn vermeidbar
 - Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
+
+WICHTIG: Lies die relevanten Dateien BEVOR du den Plan erstellst. Plane nur auf Basis von tatsaechlich gelesenem Code.
 
 AUSGABEFORMAT (exakt einhalten):
 
@@ -391,13 +412,12 @@ Schreibe NUR den Plan, implementiere NICHTS.
         exit 1
     }
     $planOutput = $planResult.output
-    # Plan-Struktur prüfen: erwartete Abschnitte müssen vorhanden sein
-    if ($planOutput -notmatch '##\s*Ziel' -or $planOutput -notmatch '##\s*Dateien') {
+    if (-not (Test-PlanValid -plan $planOutput)) {
         $planErrLines = ($planOutput -split "`n" | Select-Object -Last 20) -join "`n"
-        Write-ResultJson -status "ERROR" -error "Plan-Struktur ungueltig (## Ziel / ## Dateien fehlt). Letzte 20 Zeilen:`n$planErrLines" -phase "PLAN"
+        Write-ResultJson -status "ERROR" -error "Plan ungueltig oder degeneriert (UI-Text / zu kurz / kein Dateieintrag). Letzte 20 Zeilen:`n$planErrLines" -phase "PLAN"
         exit 1
     }
-    Write-Host "[PLAN] OK ($(($planOutput -split '\n').Count) Zeilen)"
+    Write-Host "[PLAN] OK ($(@($planOutput -split '\n' | Where-Object { $_.Trim() -ne '' }).Count) Zeilen)"
 
     # Phase 6.2: Auf restore warten
     Write-Host "[RESTORE] Warte auf dotnet restore..."
@@ -453,6 +473,8 @@ $nugetRegel
 
 Erstelle einen EINFACHEREN Plan der die bisherigen Fehler vermeidet.
 
+WICHTIG: Lies die relevanten Dateien BEVOR du den Plan erstellst. Plane nur auf Basis von tatsaechlich gelesenem Code.
+
 AUSGABEFORMAT (exakt einhalten):
 
 ## Ziel
@@ -479,12 +501,12 @@ Schreibe NUR den Plan, implementiere NICHTS.
             Invoke-NativeCommand git @("clean","-fd") | Out-Null
 
             $replanResult = Invoke-ClaudePlan -prompt $replanPrompt -model $effectiveModelPlan
-            if ($replanResult.success) {
+            if ($replanResult.success -and (Test-PlanValid -plan $replanResult.output)) {
                 $planOutput = $replanResult.output
                 $planVersion = 2
                 Write-Host "[REPLAN] OK - neuer Plan (v$planVersion)"
             } else {
-                Write-Host "[REPLAN] Fehlgeschlagen - verwende alten Plan weiter"
+                Write-Host "[REPLAN] Fehlgeschlagen oder degeneriert - verwende alten Plan weiter"
             }
         }
 
@@ -509,7 +531,7 @@ WICHTIGE REGELN:
 - Kein Dispatcher.Invoke wenn vermeidbar
 - Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
 
-Implementiere alle Aenderungen. Halte dich exakt an den Plan.
+Implementiere alle Aenderungen. Halte dich exakt an den Plan. Lies die betroffenen Dateien bevor du Aenderungen vornimmst.
 
 Nach Abschluss aller Aenderungen: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschlaegt, sofort beheben.
 "@
@@ -537,7 +559,7 @@ WICHTIGE REGELN:
 - Kein Dispatcher.Invoke wenn vermeidbar
 - Max 3 catch-Bloecke pro Datei, Dateien unter 500 Zeilen
 
-Oeffne NUR die betroffenen Dateien. Behebe NUR die genannten Probleme.
+Oeffne NUR die betroffenen Dateien. Behebe NUR die genannten Probleme. Falls der Plan unklar oder unvollstaendig ist, lies die betroffenen Dateien selbst und implementiere basierend auf dem Task.
 
 Nach Abschluss: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschlaegt, sofort beheben.
 "@
