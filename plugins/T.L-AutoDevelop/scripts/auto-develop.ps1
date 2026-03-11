@@ -27,6 +27,7 @@ $originalDir = Get-Location
 $worktreePath = $null
 $branchName = "auto/$TaskName"
 $attempt = 0
+$currentPhase = "VALIDATE"
 
 # --- CLAUDECODE Guard entfernen ---
 Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
@@ -51,10 +52,12 @@ function Write-ResultJson {
         [string]$feedback = "",
         [int]$attempts = 0,
         [string]$error = "",
-        [string]$severity = ""
+        [string]$severity = "",
+        [string]$phase = ""
     )
     $result = @{
         status   = $status
+        phase    = $phase
         branch   = $branch
         files    = @($files)
         verdict  = $verdict
@@ -234,21 +237,22 @@ try {
     $r = Invoke-NativeCommand git @("rev-parse","--is-inside-work-tree")
     $isGit = $r.output
     if ($isGit -ne "true") {
-        Write-ResultJson -status "ERROR" -error "Kein Git-Repository"
+        Write-ResultJson -status "ERROR" -error "Kein Git-Repository" -phase "VALIDATE"
         exit 1
     }
     $r = Invoke-NativeCommand git @("status","--porcelain")
     $dirty = $r.output
     if ($dirty) {
-        Write-ResultJson -status "ERROR" -error "Working Tree nicht sauber. Bitte zuerst committen oder stashen."
+        Write-ResultJson -status "ERROR" -phase "VALIDATE" -error "Working Tree nicht sauber.`nSchmutzige Dateien:`n$dirty`nBitte zuerst committen, stashen oder .gitignore anpassen."
         exit 1
     }
     if (-not (Test-Path $SolutionPath)) {
-        Write-ResultJson -status "ERROR" -error "Solution nicht gefunden: $SolutionPath"
+        Write-ResultJson -status "ERROR" -error "Solution nicht gefunden: $SolutionPath" -phase "VALIDATE"
         exit 1
     }
 
     # 2. WORKTREE ERSTELLEN
+    $currentPhase = "WORKTREE"
     Write-Host "[WORKTREE] Erstelle $branchName..."
     $repoRoot = (Invoke-NativeCommand git @("rev-parse","--show-toplevel")).output
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
@@ -278,7 +282,7 @@ try {
 
     $r = Invoke-NativeCommand git @("worktree","add",$worktreePath,"-b",$branchName)
     if ($r.exitCode -ne 0) {
-        Write-ResultJson -status "ERROR" -error "Worktree konnte nicht erstellt werden: $($r.output)"
+        Write-ResultJson -status "ERROR" -error "Worktree konnte nicht erstellt werden: $($r.output)" -phase "WORKTREE"
         exit 1
     }
 
@@ -298,6 +302,7 @@ try {
     Write-Host "[WORKTREE] OK: $worktreePath"
 
     # 3. PLAN (read-only, laeuft parallel mit restore)
+    $currentPhase = "PLAN"
     Write-Host "[PLAN] Starte Plan-Phase (timeout: ${CONST_TIMEOUT_SECONDS}s)..."
     $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
     $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch '^\s*$|^##' } | Select-Object -First 1).Trim()
@@ -355,7 +360,8 @@ Schreibe NUR den Plan, implementiere NICHTS.
 "@
     $planResult = Invoke-ClaudePlan -prompt $planPrompt -model $effectiveModelPlan
     if (-not $planResult.success) {
-        Write-ResultJson -status "ERROR" -error "Plan-Phase fehlgeschlagen: $($planResult.output)"
+        $planErrLines = ($planResult.output -split "`n" | Select-Object -Last 20) -join "`n"
+        Write-ResultJson -status "ERROR" -error "Plan-Phase fehlgeschlagen (letzte 20 Zeilen):`n$planErrLines" -phase "PLAN"
         exit 1
     }
     $planOutput = $planResult.output
@@ -381,6 +387,7 @@ Schreibe NUR den Plan, implementiere NICHTS.
 
     while ($attempt -lt $CONST_MAX_RETRIES) {
         $attempt++
+        $currentPhase = "IMPLEMENT"
         Write-Host "[IMPL] Versuch $attempt/$CONST_MAX_RETRIES (Plan v$planVersion)..."
 
         # Phase 4.1: Plan-Revision nach CONST_REPLAN_THRESHOLD Fehlversuchen
@@ -527,6 +534,7 @@ Nach Abschluss: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschl
         }
 
         # 5. PREFLIGHT
+        $currentPhase = "PREFLIGHT"
         Write-Host "[PREFLIGHT] Pruefe Build + Regeln..."
         $preflightScript = Join-Path $PSScriptRoot "preflight.ps1"
         $pfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflightScript, "-SolutionPath", $worktreeSln)
@@ -594,6 +602,7 @@ Nach Abschluss: ``dotnet build $worktreeSln --no-restore``. Falls Build fehlschl
         }
 
         # 6. REVIEW
+        $currentPhase = "REVIEW"
         Write-Host "[REVIEW] Starte Code-Review..."
         $reviewerMd = Join-Path $PSScriptRoot "..\agents\reviewer.md"
         $reviewerContent = ""
@@ -700,8 +709,9 @@ $(if ($historyForReview) { "BISHERIGES FEEDBACK:`n$historyForReview" })
         Invoke-NativeCommand git @("worktree","remove",$worktreePath) | Out-Null
         $worktreePath = $null
 
+        $currentPhase = "FINALIZE"
         Write-ResultJson -status "ACCEPTED" -branch $branchName -files $changedFiles `
-            -verdict $finalVerdict -feedback $finalFeedback -attempts $attempt -severity $finalSeverity
+            -verdict $finalVerdict -feedback $finalFeedback -attempts $attempt -severity $finalSeverity -phase "FINALIZE"
     } else {
         Invoke-NativeCommand git @("worktree","remove",$worktreePath,"--force") | Out-Null
         Invoke-NativeCommand git @("branch","-D",$branchName) | Out-Null
@@ -709,14 +719,14 @@ $(if ($historyForReview) { "BISHERIGES FEEDBACK:`n$historyForReview" })
 
         $allFeedback = Format-FeedbackHistory -history $feedbackHistory
         Write-ResultJson -status "FAILED" -branch "" -files $changedFiles `
-            -verdict $finalVerdict -feedback "$allFeedback`n---`n$finalFeedback" -attempts $attempt -severity $finalSeverity
+            -verdict $finalVerdict -feedback "$allFeedback`n---`n$finalFeedback" -attempts $attempt -severity $finalSeverity -phase "FINALIZE"
     }
 
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
     $errMsg = $_.Exception.Message
     Write-Host "[ERROR] $errMsg"
-    Write-ResultJson -status "ERROR" -error "Unerwarteter Fehler: $errMsg" -attempts $attempt
+    Write-ResultJson -status "ERROR" -error "Unerwarteter Fehler in Phase $currentPhase`: $errMsg" -attempts $attempt -phase $currentPhase
 } finally {
     # Aufraumen bei unerwartetem Abbruch
     Set-Location $originalDir -ErrorAction SilentlyContinue

@@ -51,8 +51,10 @@ Verwende IMMER $WIN_TEMP fuer alle Pfade die an powershell.exe gehen.
 RESULT_FILE="$WIN_TEMP/claude-develop/$TIMESTAMP-result.json"
 
 Bash-Tool mit run_in_background: true:
+    SCRIPT=$(find "$HOME/.claude" -path "*/T*AutoDevelop/scripts/auto-develop.ps1" -print -quit 2>/dev/null)
+    if [ -z "$SCRIPT" ]; then echo "ERROR: auto-develop.ps1 nicht gefunden"; exit 1; fi
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$HOME/.claude/plugins/T.L-AutoDevelop/scripts/auto-develop.ps1" \
+      -File "$(cygpath -w "$SCRIPT")" \
       -PromptFile "$PROMPT_FILE" \
       -SolutionPath "<sln-pfad>" \
       -ResultFile "$RESULT_FILE"
