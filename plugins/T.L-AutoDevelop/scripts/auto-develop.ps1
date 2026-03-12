@@ -13,11 +13,11 @@ $CONST_MODEL_INVESTIGATE = "claude-opus-4-6"
 $CONST_MODEL_IMPLEMENT = "claude-opus-4-6"
 $CONST_MODEL_REVIEW = "claude-opus-4-6"
 $CONST_MODEL_FAST = "claude-sonnet-4-6"
-$CONST_MAX_TURNS_DISCOVER = 20
-$CONST_MAX_TURNS_PLAN = 30
-$CONST_MAX_TURNS_INVESTIGATE = 20
-$CONST_MAX_TURNS_IMPL = 30
-$CONST_MAX_TURNS_REVIEW = 10
+$CONST_MAX_TURNS_DISCOVER = 12
+$CONST_MAX_TURNS_PLAN = 18
+$CONST_MAX_TURNS_INVESTIGATE = 14
+$CONST_MAX_TURNS_IMPL = 24
+$CONST_MAX_TURNS_REVIEW = 8
 $CONST_TIMEOUT_SECONDS = 900
 $CONST_DISCOVER_ATTEMPTS = 2
 $CONST_PLAN_ATTEMPTS = 2
@@ -26,6 +26,18 @@ $CONST_REPRODUCE_ATTEMPTS = 2
 $CONST_IMPLEMENT_ATTEMPTS = 2
 $CONST_REMEDIATION_ATTEMPTS = 2
 $CONST_REPAIR_ATTEMPTS = 2
+$CONST_CONTEXT_MAX_CHARS = 3500
+$CONST_FEEDBACK_MAX_CHARS = 2000
+$CONST_TEST_PROJECTS_MAX_CHARS = 1200
+$CONST_REVIEW_DIFF_LITE_CHARS = 3500
+$CONST_REVIEW_DIFF_FULL_CHARS = 14000
+$CONST_REVIEW_FULL_PRESERVE_MAX_FILES = 3
+$CONST_REVIEW_FULL_PRESERVE_MAX_DIFF_CHARS = 18000
+$CONST_REVIEW_PLAN_MAX_CHARS = 2200
+$CONST_REVIEW_HISTORY_MAX_CHARS = 1400
+$CONST_REVIEW_FAST_MAX_FILES = 3
+$CONST_REVIEW_FAST_MAX_DIFF_CHARS = 7000
+$CONST_TARGET_HINTS_MAX = 5
 
 $ErrorActionPreference = "Stop"
 $originalDir = Get-Location
@@ -38,6 +50,7 @@ $debugRunDir = $null
 $scriptStartTime = Get-Date
 $runId = $null
 $timeline = [System.Collections.ArrayList]::new()
+$phaseMetrics = [System.Collections.ArrayList]::new()
 $feedbackHistory = [System.Collections.ArrayList]::new()
 $attemptsByPhase = [ordered]@{
     discover = 0
@@ -134,6 +147,648 @@ function Get-SafeFileToken {
     if (-not $token) { return "run" }
     if ($token.Length -gt 60) { return $token.Substring(0, 60) }
     return $token
+}
+
+function Clip-Text {
+    param(
+        [string]$Text,
+        [int]$MaxChars,
+        [string]$Marker = "Inhalt gekuerzt"
+    )
+    if (-not $Text) { return "" }
+    if ($MaxChars -le 0 -or $Text.Length -le $MaxChars) { return $Text.Trim() }
+    $safeLength = [Math]::Max(0, $MaxChars - ($Marker.Length + 24))
+    $clipped = $Text.Substring(0, $safeLength).TrimEnd()
+    return "$clipped`n...[${Marker}; originalChars=$($Text.Length)]"
+}
+
+function Estimate-TokenCount {
+    param([string]$Text)
+    if (-not $Text) { return 0 }
+    return [int][Math]::Ceiling($Text.Length / 4.0)
+}
+
+function Get-PhaseMetricKey {
+    param([string]$PhaseName)
+    if (-not $PhaseName) { return "unknown" }
+    $phase = $PhaseName.ToLowerInvariant()
+    if ($phase -match '^(discover|plan|fix-plan|investigate|implement|reproduce|review)') {
+        return $Matches[1]
+    }
+    return $phase
+}
+
+function Add-PhaseMetric {
+    param(
+        [string]$PhaseName,
+        [int]$Attempt,
+        [string]$Model,
+        [string]$Prompt,
+        [string]$Output,
+        [double]$DurationSeconds,
+        [bool]$Success,
+        [bool]$TimedOut,
+        [int]$ExitCode
+    )
+    [void]$phaseMetrics.Add([ordered]@{
+        phase = $PhaseName
+        phaseKey = Get-PhaseMetricKey -PhaseName $PhaseName
+        attempt = $Attempt
+        model = $Model
+        durationSeconds = [Math]::Round($DurationSeconds, 2)
+        promptChars = if ($Prompt) { $Prompt.Length } else { 0 }
+        outputChars = if ($Output) { $Output.Length } else { 0 }
+        estimatedPromptTokens = Estimate-TokenCount -Text $Prompt
+        estimatedOutputTokens = Estimate-TokenCount -Text $Output
+        success = [bool]$Success
+        timedOut = [bool]$TimedOut
+        exitCode = $ExitCode
+    })
+}
+
+function Get-PhaseMetricsSummary {
+    $tokensByPhase = [ordered]@{}
+    $durationByPhase = [ordered]@{}
+    $callsByPhase = [ordered]@{}
+    $modelEscalations = 0
+    $lastModelByKey = @{}
+    $totalPromptTokens = 0
+    $totalOutputTokens = 0
+
+    foreach ($metric in $phaseMetrics) {
+        $phaseKey = [string]$metric.phaseKey
+        if (-not $tokensByPhase.Contains($phaseKey)) {
+            $tokensByPhase[$phaseKey] = 0
+            $durationByPhase[$phaseKey] = 0.0
+            $callsByPhase[$phaseKey] = 0
+        }
+        $tokensByPhase[$phaseKey] += ([int]$metric.estimatedPromptTokens + [int]$metric.estimatedOutputTokens)
+        $durationByPhase[$phaseKey] = [Math]::Round(([double]$durationByPhase[$phaseKey] + [double]$metric.durationSeconds), 2)
+        $callsByPhase[$phaseKey] += 1
+        $totalPromptTokens += [int]$metric.estimatedPromptTokens
+        $totalOutputTokens += [int]$metric.estimatedOutputTokens
+
+        if ($lastModelByKey.ContainsKey($phaseKey) -and
+            $lastModelByKey[$phaseKey] -ne $metric.model -and
+            $metric.model -in @($CONST_MODEL_PLAN, $CONST_MODEL_INVESTIGATE, $CONST_MODEL_IMPLEMENT, $CONST_MODEL_REVIEW)) {
+            $modelEscalations++
+        }
+        $lastModelByKey[$phaseKey] = $metric.model
+    }
+
+    return [ordered]@{
+        totalEstimatedTokens = ($totalPromptTokens + $totalOutputTokens)
+        estimatedPromptTokens = $totalPromptTokens
+        estimatedOutputTokens = $totalOutputTokens
+        tokensByPhase = $tokensByPhase
+        durationByPhase = $durationByPhase
+        callsByPhase = $callsByPhase
+        modelEscalations = $modelEscalations
+    }
+}
+
+function Format-BulletList {
+    param(
+        [string[]]$Items,
+        [int]$MaxItems = 0,
+        [string]$EmptyText = "- Keine"
+    )
+    $values = @($Items | Where-Object { $_ })
+    if ($values.Count -eq 0) { return $EmptyText }
+    if ($MaxItems -gt 0) {
+        $values = @($values | Select-Object -First $MaxItems)
+    }
+    return (($values | ForEach-Object { "- $_" }) -join "`n")
+}
+
+function Get-TextTokens {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    return @([regex]::Matches($Text.ToLowerInvariant(), '[a-z0-9][a-z0-9_-]{2,}') |
+        ForEach-Object { $_.Value.Trim('_-') } |
+        Where-Object { $_ -and $_.Length -ge 3 } |
+        Select-Object -Unique)
+}
+
+function Test-LikelyTestPath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    return $Path -match '(?i)(^|[\\/._-])(test|tests|spec|specs|integration|functional|e2e|fixture)([\\/._-]|$)'
+}
+
+function Get-RelevanceScore {
+    param(
+        [string]$Candidate,
+        [string[]]$SearchTokens
+    )
+    if (-not $Candidate) { return 0 }
+    $lower = $Candidate.ToLowerInvariant()
+    $score = 0
+    foreach ($token in @($SearchTokens | Select-Object -Unique)) {
+        if (-not $token) { continue }
+        $escaped = [regex]::Escape($token)
+        if ($lower -match "(^|[\\/_\.\-])$escaped([\\/_\.\-]|$)") {
+            $score += 12
+            continue
+        }
+        if ($lower.Contains($token)) {
+            $score += 4
+        }
+    }
+    return $score
+}
+
+function Select-RelevantItems {
+    param(
+        [string[]]$Items,
+        [string]$TaskText = "",
+        [string[]]$Targets = @(),
+        [int]$MaxChars = 0,
+        [int]$MinItems = 1
+    )
+    $searchTokens = @(
+        @(Get-TextTokens -Text $TaskText) +
+        @(Get-TextTokens -Text (($Targets | Where-Object { $_ }) -join " "))
+    ) | Select-Object -Unique
+
+    $ranked = @($Items | Where-Object { $_ } | Select-Object -Unique | ForEach-Object {
+        [pscustomobject]@{
+            text = [string]$_
+            score = Get-RelevanceScore -Candidate ([string]$_) -SearchTokens $searchTokens
+            length = ([string]$_).Length
+        }
+    }) | Sort-Object @{ Expression = 'score'; Descending = $true }, @{ Expression = 'length'; Descending = $false }, @{ Expression = 'text'; Descending = $false }
+
+    $selected = [System.Collections.ArrayList]::new()
+    $usedChars = 0
+    foreach ($entry in $ranked) {
+        $candidate = [string]$entry.text
+        $requiredChars = if ($selected.Count -gt 0) { $candidate.Length + 1 } else { $candidate.Length }
+        if ($MaxChars -gt 0 -and $selected.Count -ge $MinItems -and ($usedChars + $requiredChars) -gt $MaxChars) {
+            continue
+        }
+        [void]$selected.Add($candidate)
+        $usedChars += $requiredChars
+    }
+
+    if ($selected.Count -eq 0 -and $ranked.Count -gt 0) {
+        [void]$selected.Add([string]$ranked[0].text)
+    }
+
+    return [ordered]@{
+        selected = @($selected)
+        omitted = [Math]::Max(0, $ranked.Count - $selected.Count)
+        total = $ranked.Count
+    }
+}
+
+function Format-RelevantList {
+    param(
+        [string[]]$Items,
+        [string]$TaskText = "",
+        [string[]]$Targets = @(),
+        [int]$MaxChars = 0,
+        [string]$EmptyText = "- Keine"
+    )
+    $selection = Select-RelevantItems -Items $Items -TaskText $TaskText -Targets $Targets -MaxChars $MaxChars
+    if ($selection.selected.Count -eq 0) { return $EmptyText }
+    $lines = @($selection.selected | ForEach-Object { "- $_" })
+    if ($selection.omitted -gt 0) {
+        $lines += "- ... $($selection.omitted) weitere Eintraege ausgelassen"
+    }
+    return ($lines -join "`n")
+}
+
+function Get-CompactClaudeContext {
+    param([string]$RepoRoot)
+    $claudeMdPath = Join-Path $RepoRoot "CLAUDE.md"
+    if (-not (Test-Path $claudeMdPath)) { return "" }
+    try {
+        $claudeText = [System.IO.File]::ReadAllText($claudeMdPath, [System.Text.Encoding]::UTF8)
+    } catch {
+        return ""
+    }
+    $lines = @($claudeText -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+    $headings = @($lines | Where-Object { $_ -match '^\s*#' } | Select-Object -First 8)
+    $body = @($lines | Where-Object { $_ -notmatch '^\s*#' } | Select-Object -First 14)
+    return Clip-Text -Text (($headings + $body) -join "`n") -MaxChars 1800 -Marker "CLAUDE.md gekuerzt"
+}
+
+function Get-CodebaseInventory {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath
+    )
+    $slnDir = Split-Path $SolutionPath -Parent
+    $slnListResult = Invoke-NativeCommand dotnet @("sln", $SolutionPath, "list")
+    $projectLines = if ($slnListResult.exitCode -eq 0) {
+        @($slnListResult.output -split "`r?`n" |
+            Where-Object { $_.Trim() -and $_ -notmatch '^Project\(s\)$|^-+$' })
+    } else {
+        @()
+    }
+    $directoryLines = @(Get-ChildItem -Path $slnDir -Directory -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '(?i)[\\/](bin|obj|node_modules|packages|\.git|\.vs)([\\/]|$)' } |
+        ForEach-Object { Get-RelativePath -BasePath $slnDir -TargetPath $_.FullName } |
+        Select-Object -Unique)
+
+    return [ordered]@{
+        claudeContext = Get-CompactClaudeContext -RepoRoot $RepoRoot
+        projects = @($projectLines)
+        directories = @($directoryLines)
+    }
+}
+
+function Build-CompactCodebaseContext {
+    param(
+        $Inventory,
+        [string]$TaskText = "",
+        [string[]]$Targets = @()
+    )
+    $parts = [System.Collections.ArrayList]::new()
+    if ($Inventory.claudeContext) {
+        [void]$parts.Add("CLAUDE_MD_KURZ:`n$($Inventory.claudeContext)")
+    }
+    if ($Inventory.projects.Count -gt 0) {
+        [void]$parts.Add("PROJEKTE:`n" + (Format-RelevantList -Items $Inventory.projects -TaskText $TaskText -Targets $Targets -MaxChars 1200 -EmptyText "- Keine Projekte"))
+    }
+    if ($Inventory.directories.Count -gt 0) {
+        [void]$parts.Add("MODULE:`n" + (Format-RelevantList -Items $Inventory.directories -TaskText $TaskText -Targets $Targets -MaxChars 1000 -EmptyText "- Keine Module"))
+    }
+    return Clip-Text -Text (($parts -join "`n`n").Trim()) -MaxChars $CONST_CONTEXT_MAX_CHARS -Marker "Codebase-Kontext gekuerzt"
+}
+
+function Get-ScopedCodebaseContext {
+    param(
+        $Inventory,
+        [string]$TaskText = "",
+        [string[]]$Targets = @(),
+        [string[]]$ChangedFiles = @()
+    )
+    $relevantTargets = @($Targets | Where-Object { $_ } | Select-Object -Unique)
+    $baseContext = Build-CompactCodebaseContext -Inventory $Inventory -TaskText $TaskText -Targets $relevantTargets
+    return Format-ScopedContext -BaseContext $baseContext -Targets $relevantTargets -ChangedFiles $ChangedFiles
+}
+
+function Format-ScopedContext {
+    param(
+        [string]$BaseContext,
+        [string[]]$Targets = @(),
+        [string[]]$ChangedFiles = @()
+    )
+    $parts = [System.Collections.ArrayList]::new()
+    if ($BaseContext) {
+        [void]$parts.Add("CODEBASE KURZKONTEXT:`n$BaseContext")
+    }
+    $targetHints = @($Targets | Where-Object { $_ } | Select-Object -Unique -First $CONST_TARGET_HINTS_MAX)
+    if ($targetHints.Count -gt 0) {
+        [void]$parts.Add("ZIELHINWEISE:`n" + (Format-BulletList -Items $targetHints -EmptyText "- Keine Zielhinweise"))
+    }
+    $changed = @($ChangedFiles | Where-Object { $_ } | Select-Object -Unique -First 6)
+    if ($changed.Count -gt 0) {
+        [void]$parts.Add("BETROFFENE DATEIEN:`n" + (Format-BulletList -Items $changed -EmptyText "- Keine Dateien"))
+    }
+    return ($parts -join "`n`n").Trim()
+}
+
+function Get-NoChangeAssessment {
+    param(
+        [string]$Output,
+        [string[]]$Targets = @()
+    )
+    $trimmed = if ($Output) { $Output.Trim() } else { "" }
+    if (-not $trimmed) {
+        return [ordered]@{
+            explicitSatisfied = $false
+            explicitNoChange = $false
+            hasStrongLanguage = $false
+            evidenceTargets = @()
+            hasEvidence = $false
+            usable = $false
+            shouldVerify = $false
+        }
+    }
+
+    $explicitSatisfied = $trimmed -match '(?im)^RESULT\s*:\s*NO_CHANGE_ALREADY_SATISFIED\s*$'
+    $explicitNoChange = $explicitSatisfied -or ($trimmed -match '(?im)^RESULT\s*:\s*NO_CHANGE\b')
+    $hasStrongLanguage = $trimmed -match '(?im)bereits implementiert|bereits umgesetzt|already implemented|already satisfied'
+    $evidenceTargets = @($Targets + (Get-ActionableItems -Text $trimmed) | Where-Object { $_ } | Select-Object -Unique)
+    $nonEmptyLines = @($trimmed -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+    $hasReasonSection = $trimmed -match '(?im)^(REASON|ROOT_CAUSE|SUMMARY|NEXT_ACTION)\s*:'
+    $usable = ($nonEmptyLines.Count -ge 2) -or $hasReasonSection -or ($evidenceTargets.Count -gt 0)
+    $shouldVerify = (($explicitSatisfied -or $explicitNoChange -or $hasStrongLanguage) -and $usable)
+
+    return [ordered]@{
+        explicitSatisfied = $explicitSatisfied
+        explicitNoChange = $explicitNoChange
+        hasStrongLanguage = $hasStrongLanguage
+        evidenceTargets = @($evidenceTargets)
+        hasEvidence = ($evidenceTargets.Count -gt 0)
+        usable = $usable
+        shouldVerify = $shouldVerify
+    }
+}
+
+function Get-ReviewFileKind {
+    param([string]$Path)
+    if (-not $Path) { return "unknown" }
+    if ($Path -match '(?i)\.(csproj|props|targets|sln|slnx|json|ya?ml|config)$') { return "config" }
+    if (Test-LikelyTestPath -Path $Path) { return "test" }
+    if ($Path -match '(?i)\.(md|txt)$') { return "docs" }
+    if ($Path -match '(?i)\.(css|scss|sass|less|svg|png|jpe?g|gif|resx)$') { return "resource" }
+    return "production"
+}
+
+function Test-LowRiskReview {
+    param(
+        [string[]]$ChangedFiles,
+        [string]$DiffText,
+        [string]$WarningText,
+        [bool]$ReproductionConfirmed,
+        [string]$TaskClass
+    )
+    $files = @($ChangedFiles | Where-Object { $_ })
+    if ($files.Count -eq 0) { return $false }
+    if ($files.Count -gt $CONST_REVIEW_FAST_MAX_FILES) { return $false }
+    if ($DiffText.Length -gt $CONST_REVIEW_FAST_MAX_DIFF_CHARS) { return $false }
+    if ($WarningText) { return $false }
+    if ($TaskClass -eq "INVESTIGATIVE") { return $false }
+    $kinds = @($files | ForEach-Object { Get-ReviewFileKind -Path $_ })
+    if (@($kinds | Where-Object { $_ -eq "config" }).Count -gt 0) { return $false }
+    $productionCount = @($kinds | Where-Object { $_ -eq "production" }).Count
+    if ($productionCount -gt 0) {
+        if ($files.Count -ne 1) { return $false }
+        if ($TaskClass -ne "DIRECT_EDIT") { return $false }
+        if ($ReproductionConfirmed) { return $false }
+        if ($DiffText.Length -gt 4500) { return $false }
+    }
+    return $true
+}
+
+function Get-DiffBlocksByFile {
+    param([string]$DiffText)
+    $blocks = [System.Collections.ArrayList]::new()
+    if (-not $DiffText) { return @($blocks) }
+
+    $matches = [regex]::Matches($DiffText, '(?m)^diff --git a/(?<a>.+?) b/(?<b>.+?)$')
+    if ($matches.Count -eq 0) {
+        [void]$blocks.Add([ordered]@{ path = "(patch)"; diff = $DiffText.Trim() })
+        return @($blocks)
+    }
+
+    for ($i = 0; $i -lt $matches.Count; $i++) {
+        $start = $matches[$i].Index
+        $end = if ($i + 1 -lt $matches.Count) { $matches[$i + 1].Index } else { $DiffText.Length }
+        $path = $matches[$i].Groups['b'].Value.Replace("/", "\")
+        $blockText = $DiffText.Substring($start, $end - $start).Trim()
+        [void]$blocks.Add([ordered]@{
+            path = $path
+            diff = $blockText
+        })
+    }
+
+    return @($blocks)
+}
+
+function Get-DiffTextForFile {
+    param(
+        $Blocks,
+        [string]$Path
+    )
+    if (-not $Path) { return "" }
+    $normalized = $Path.Replace("/", "\")
+    $exact = @($Blocks | Where-Object { $_.path -ieq $normalized })
+    if ($exact.Count -gt 0) { return [string]$exact[0].diff }
+    $suffix = @($Blocks | Where-Object {
+        $candidate = [string]$_.path
+        $candidate.EndsWith($normalized, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $normalized.EndsWith($candidate, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($suffix.Count -gt 0) { return [string]$suffix[0].diff }
+    return ""
+}
+
+function Get-DiffHunks {
+    param([string]$DiffText)
+    $trimmed = if ($DiffText) { $DiffText.Trim() } else { "" }
+    if (-not $trimmed) {
+        return [ordered]@{
+            header = ""
+            hunks = @()
+        }
+    }
+
+    $matches = [regex]::Matches($trimmed, '(?m)^@@ .* @@.*$')
+    if ($matches.Count -eq 0) {
+        return [ordered]@{
+            header = $trimmed
+            hunks = @()
+        }
+    }
+
+    $hunks = [System.Collections.ArrayList]::new()
+    $header = $trimmed.Substring(0, $matches[0].Index).Trim()
+    for ($i = 0; $i -lt $matches.Count; $i++) {
+        $start = $matches[$i].Index
+        $end = if ($i + 1 -lt $matches.Count) { $matches[$i + 1].Index } else { $trimmed.Length }
+        [void]$hunks.Add($trimmed.Substring($start, $end - $start).Trim())
+    }
+
+    return [ordered]@{
+        header = $header
+        hunks = @($hunks)
+    }
+}
+
+function Get-ReviewDiffExcerpt {
+    param(
+        [string]$DiffText,
+        [int]$MaxChars
+    )
+    $trimmed = if ($DiffText) { $DiffText.Trim() } else { "" }
+    if (-not $trimmed) {
+        return [ordered]@{
+            text = ""
+            totalHunks = 0
+            includedHunks = 0
+            omittedHunks = 0
+            wasTruncated = $false
+        }
+    }
+    if ($MaxChars -le 0 -or $trimmed.Length -le $MaxChars) {
+        return [ordered]@{
+            text = $trimmed
+            totalHunks = 0
+            includedHunks = 0
+            omittedHunks = 0
+            wasTruncated = $false
+        }
+    }
+
+    $parsed = Get-DiffHunks -DiffText $trimmed
+    if ($parsed.hunks.Count -eq 0) {
+        return [ordered]@{
+            text = Clip-Text -Text $trimmed -MaxChars $MaxChars -Marker "Diff fuer Datei gekuerzt"
+            totalHunks = 0
+            includedHunks = 0
+            omittedHunks = 1
+            wasTruncated = $true
+        }
+    }
+
+    $parts = [System.Collections.ArrayList]::new()
+    if ($parsed.header) {
+        $headerBudget = [Math]::Min($parsed.header.Length, [Math]::Max(220, [int][Math]::Floor($MaxChars * 0.22)))
+        $headerBudget = [Math]::Min($headerBudget, [Math]::Max(0, $MaxChars - 240))
+        if ($headerBudget -gt 0) {
+            $headerText = if ($parsed.header.Length -le $headerBudget) {
+                $parsed.header
+            } else {
+                Clip-Text -Text $parsed.header -MaxChars $headerBudget -Marker "Diff-Header gekuerzt"
+            }
+            if ($headerText) {
+                [void]$parts.Add($headerText)
+            }
+        }
+    }
+
+    $priorityIndexes = [System.Collections.ArrayList]::new()
+    [void]$priorityIndexes.Add(0)
+    if ($parsed.hunks.Count -gt 1) {
+        [void]$priorityIndexes.Add($parsed.hunks.Count - 1)
+    }
+    for ($i = 1; $i -lt $parsed.hunks.Count - 1; $i++) {
+        [void]$priorityIndexes.Add($i)
+    }
+
+    $includedIndexes = [System.Collections.ArrayList]::new()
+    $wasTruncated = $false
+    foreach ($index in @($priorityIndexes | Select-Object -Unique)) {
+        $hunk = [string]$parsed.hunks[$index]
+        $currentText = ($parts -join "`n`n")
+        $separatorChars = if ($parts.Count -gt 0) { 2 } else { 0 }
+        $availableChars = $MaxChars - $currentText.Length - $separatorChars
+        if ($availableChars -le 0) {
+            $wasTruncated = $true
+            continue
+        }
+
+        $tentativeText = if ($parts.Count -gt 0) { "$currentText`n`n$hunk" } else { $hunk }
+        if ($tentativeText.Length -le $MaxChars) {
+            [void]$parts.Add($hunk)
+            [void]$includedIndexes.Add($index)
+            continue
+        }
+
+        $isAnchorHunk = ($index -eq 0) -or ($index -eq ($parsed.hunks.Count - 1))
+        if (($includedIndexes.Count -eq 0 -or $isAnchorHunk) -and $availableChars -gt 180) {
+            [void]$parts.Add((Clip-Text -Text $hunk -MaxChars $availableChars -Marker "Hunk gekuerzt"))
+            [void]$includedIndexes.Add($index)
+        }
+        $wasTruncated = $true
+        if ($availableChars -gt 180) {
+            break
+        }
+    }
+
+    $includedCount = (@($includedIndexes | Select-Object -Unique)).Count
+    $omittedHunks = [Math]::Max(0, $parsed.hunks.Count - $includedCount)
+    if ($omittedHunks -gt 0) {
+        $wasTruncated = $true
+    }
+
+    $text = ($parts -join "`n`n").Trim()
+    if ($wasTruncated) {
+        $summaryLine = "...[Diff-Auszug; includedHunks=$includedCount/$($parsed.hunks.Count)]"
+        if (($text.Length + $summaryLine.Length + 1) -le $MaxChars) {
+            $text = "$text`n$summaryLine"
+        } else {
+            $safeBudget = [Math]::Max(0, $MaxChars - $summaryLine.Length - 1)
+            $text = (Clip-Text -Text $text -MaxChars $safeBudget -Marker "Diff fuer Datei gekuerzt")
+            $text = "$text`n$summaryLine"
+        }
+    }
+
+    return [ordered]@{
+        text = $text
+        totalHunks = $parsed.hunks.Count
+        includedHunks = $includedCount
+        omittedHunks = $omittedHunks
+        wasTruncated = $wasTruncated
+    }
+}
+
+function Get-CompactReviewPayload {
+    param(
+        [string]$PlanText,
+        [string]$InvestigationText,
+        [string]$ReproductionText,
+        [string]$DiffText,
+        [string]$DiffStat,
+        [string[]]$ChangedFiles,
+        [string]$WarningText,
+        [string]$HistoryText,
+        [bool]$LowRiskReview
+    )
+    $maxDiffChars = if ($LowRiskReview) { $CONST_REVIEW_DIFF_LITE_CHARS } else { $CONST_REVIEW_DIFF_FULL_CHARS }
+    $parts = [System.Collections.ArrayList]::new()
+    $omittedProductionHunks = $false
+    $truncatedFiles = [System.Collections.ArrayList]::new()
+    [void]$parts.Add("FIX PLAN:`n" + (Clip-Text -Text $PlanText -MaxChars $CONST_REVIEW_PLAN_MAX_CHARS -Marker "Fix-Plan gekuerzt"))
+    if ($InvestigationText) {
+        [void]$parts.Add("INVESTIGATION:`n" + (Clip-Text -Text $InvestigationText -MaxChars 1800 -Marker "Investigation gekuerzt"))
+    }
+    if ($ReproductionText) {
+        [void]$parts.Add("REPRODUKTION:`n" + (Clip-Text -Text $ReproductionText -MaxChars 1400 -Marker "Reproduktion gekuerzt"))
+    }
+    $reviewFiles = if ($ChangedFiles.Count -gt 0) {
+        @($ChangedFiles | Select-Object -Unique)
+    } else {
+        @(Get-DiffBlocksByFile -DiffText $DiffText | ForEach-Object { $_.path } | Select-Object -Unique)
+    }
+    if ($reviewFiles.Count -gt 0) {
+        [void]$parts.Add("GEAENDERTE DATEIEN:`n" + (Format-BulletList -Items $reviewFiles -MaxItems 8 -EmptyText "- Keine Dateien"))
+    }
+    if ($DiffStat) {
+        [void]$parts.Add("DIFFSTAT:`n" + (Clip-Text -Text $DiffStat -MaxChars 1200 -Marker "Diffstat gekuerzt"))
+    }
+    $diffBlocks = Get-DiffBlocksByFile -DiffText $DiffText
+    $preserveFullDiffs = (-not $LowRiskReview) -and $reviewFiles.Count -gt 0 -and $reviewFiles.Count -le $CONST_REVIEW_FULL_PRESERVE_MAX_FILES -and $DiffText.Length -le $CONST_REVIEW_FULL_PRESERVE_MAX_DIFF_CHARS
+    if ($reviewFiles.Count -gt 0) {
+        $perFileBudget = if ($preserveFullDiffs) { 0 } else { [Math]::Max(1, [int][Math]::Floor($maxDiffChars / [Math]::Max(1, $reviewFiles.Count))) }
+        $fileSections = foreach ($file in $reviewFiles) {
+            $fileDiff = Get-DiffTextForFile -Blocks $diffBlocks -Path $file
+            if (-not $fileDiff) { $fileDiff = "Kein Diffblock fuer diese Datei gefunden." }
+            $fileKind = Get-ReviewFileKind -Path $file
+            if ($preserveFullDiffs) {
+                "DATEI: $file`n$fileDiff"
+                continue
+            }
+
+            $diffExcerpt = Get-ReviewDiffExcerpt -DiffText $fileDiff -MaxChars $perFileBudget
+            if ($diffExcerpt.wasTruncated) {
+                [void]$truncatedFiles.Add($file)
+                if ($fileKind -eq "production") {
+                    $omittedProductionHunks = $true
+                }
+            }
+            "DATEI: $file`n$($diffExcerpt.text)"
+        }
+        [void]$parts.Add("DATEIWEISE DIFFS:`n" + (($fileSections | Where-Object { $_ }) -join "`n`n"))
+    } else {
+        [void]$parts.Add("GIT DIFF AUSSCHNITT:`n" + (Clip-Text -Text $DiffText -MaxChars $maxDiffChars -Marker "Diff gekuerzt"))
+    }
+    if ($WarningText) {
+        [void]$parts.Add("PREFLIGHT WARNINGS:`n" + (Clip-Text -Text $WarningText -MaxChars 1000 -Marker "Warnings gekuerzt"))
+    }
+    if ($HistoryText) {
+        [void]$parts.Add("BISHERIGES FEEDBACK:`n" + (Clip-Text -Text $HistoryText -MaxChars $CONST_REVIEW_HISTORY_MAX_CHARS -Marker "Feedback gekuerzt"))
+    }
+    return [ordered]@{
+        payload = ($parts -join "`n`n").Trim()
+        omittedProductionHunks = $omittedProductionHunks
+        truncatedFiles = @($truncatedFiles | Select-Object -Unique)
+    }
 }
 
 function Ensure-ArtifactDir {
@@ -400,11 +1055,16 @@ function Get-TestProjectInventory {
 }
 
 function Format-TestProjectsForPrompt {
-    param($Projects)
+    param(
+        $Projects,
+        [string]$TaskText = "",
+        [string[]]$Targets = @()
+    )
     if (-not $Projects -or $Projects.Count -eq 0) { return "- Keine Testprojekte erkannt." }
-    return ($Projects | ForEach-Object {
-        "- $($_.relPath) [listed=$($_.listedInSolution); type=$($_.likelyType); files=$($_.testFileCount)]"
-    }) -join "`n"
+    $items = @($Projects | ForEach-Object {
+        "$($_.relPath) [listed=$($_.listedInSolution); type=$($_.likelyType); files=$($_.testFileCount)]"
+    })
+    return Format-RelevantList -Items $items -TaskText $TaskText -Targets $Targets -MaxChars $CONST_TEST_PROJECTS_MAX_CHARS -EmptyText "- Keine Testprojekte erkannt."
 }
 
 function Get-DiscoveryVerdict {
@@ -648,17 +1308,60 @@ function Test-LowComplexityImplement {
     return $true
 }
 
+function Test-ConcreteTestTargets {
+    param([string[]]$Targets)
+    $concreteTargets = @($Targets | Where-Object {
+        $_ -and
+        $_ -notmatch '^<' -and
+        $_ -match '(\*|\\|/|\.(cs|csproj)\b)' -and
+        (Test-LikelyTestPath -Path $_)
+    })
+    return $concreteTargets.Count -gt 0
+}
+
 function Get-ModelForPlan {
     param(
         [string]$TaskClass,
         [string[]]$Targets
     )
-    if ($TaskClass -eq "DIRECT_EDIT" -or (Test-ConcreteTargets -Targets $Targets)) { return $CONST_MODEL_FAST }
+    if ($TaskClass -eq "DIRECT_EDIT") { return $CONST_MODEL_FAST }
+    if (Test-ConcreteTargets -Targets $Targets) { return $CONST_MODEL_FAST }
     return $CONST_MODEL_PLAN
 }
 
 function Get-ModelForInvestigate {
-    param()
+    param(
+        [string]$TaskClass,
+        [string[]]$Targets,
+        [int]$Attempt = 1,
+        [string]$PreviousOutput = ""
+    )
+    $hasConcreteTargets = Test-ConcreteTargets -Targets $Targets
+    if ($Attempt -gt 1 -and -not $hasConcreteTargets -and -not (Test-HasActionableSignal -Text $PreviousOutput)) {
+        return $CONST_MODEL_INVESTIGATE
+    }
+    if ($hasConcreteTargets) { return $CONST_MODEL_FAST }
+    if ($TaskClass -eq "DIRECT_EDIT" -and ($Attempt -eq 1 -or (Test-HasActionableSignal -Text $PreviousOutput))) { return $CONST_MODEL_FAST }
+    return $CONST_MODEL_INVESTIGATE
+}
+
+function Get-ModelForReproduce {
+    param(
+        [string]$TaskText = "",
+        [string[]]$Targets = @(),
+        [int]$Attempt = 1,
+        [string]$LastFailureCategory = ""
+    )
+    if ($Attempt -gt 1 -and $LastFailureCategory -and $LastFailureCategory -ne "REPRO_CALL_FAILED") {
+        return $CONST_MODEL_INVESTIGATE
+    }
+    if (Test-ConcreteTestTargets -Targets $Targets) {
+        return $CONST_MODEL_FAST
+    }
+    $taskTestTargets = @(Get-ActionableItems -Text $TaskText | Where-Object { Test-LikelyTestPath -Path $_ })
+    if ($taskTestTargets.Count -gt 0) {
+        return $CONST_MODEL_FAST
+    }
     return $CONST_MODEL_INVESTIGATE
 }
 
@@ -685,7 +1388,9 @@ function Get-ModelForRepair {
         [string]$PreviousOutput = "",
         [string]$TaskText = ""
     )
-    if ($PhaseName -in @("PLAN", "FIX_PLAN")) { return $CONST_MODEL_FAST }
+    if ($PhaseName -in @("PLAN", "FIX_PLAN")) {
+        return Get-ModelForPlan -TaskClass $TaskClass -Targets $Targets
+    }
     if ($PhaseName -eq "INVESTIGATE") {
         if (Test-HasActionableSignal -Text $PreviousOutput) { return $CONST_MODEL_FAST }
         return $CONST_MODEL_INVESTIGATE
@@ -698,7 +1403,17 @@ function Get-ModelForRepair {
 }
 
 function Get-ModelForReview {
-    param()
+    param(
+        [string[]]$ChangedFiles,
+        [string]$DiffText,
+        [string]$WarningText,
+        [bool]$ReproductionConfirmed,
+        [string]$TaskClass,
+        [bool]$ForceFullReview = $false
+    )
+    if (-not $ForceFullReview -and (Test-LowRiskReview -ChangedFiles $ChangedFiles -DiffText $DiffText -WarningText $WarningText -ReproductionConfirmed $ReproductionConfirmed -TaskClass $TaskClass)) {
+        return $CONST_MODEL_FAST
+    }
     return $CONST_MODEL_REVIEW
 }
 
@@ -775,17 +1490,23 @@ function Add-FeedbackEntry {
 }
 
 function Format-FeedbackHistory {
-    param([System.Collections.ArrayList]$History, [int]$MaxEntries = 0)
+    param(
+        [System.Collections.ArrayList]$History,
+        [int]$MaxEntries = 0,
+        [int]$MaxChars = $CONST_FEEDBACK_MAX_CHARS
+    )
     if ($History.Count -eq 0) { return "" }
     $entries = if ($MaxEntries -gt 0 -and $History.Count -gt $MaxEntries) {
         $History | Select-Object -Last $MaxEntries
     } else {
         $History
     }
+    $entryBudget = if ($entries.Count -gt 0) { [Math]::Max(220, [int][Math]::Floor($MaxChars / $entries.Count)) } else { $MaxChars }
     $parts = foreach ($entry in $entries) {
-        "--- Versuch $($entry.attempt) [$($entry.source)/$($entry.category)] ---`n$($entry.feedback)"
+        $feedbackText = Clip-Text -Text $entry.feedback -MaxChars $entryBudget -Marker "Feedback gekuerzt"
+        "--- Versuch $($entry.attempt) [$($entry.source)/$($entry.category)] ---`n$feedbackText"
     }
-    return ($parts -join "`n`n")
+    return Clip-Text -Text ($parts -join "`n`n") -MaxChars $MaxChars -Marker "Feedback-Historie gekuerzt"
 }
 
 function Get-TotalAttempts {
@@ -831,6 +1552,11 @@ function Write-ResultJson {
         $reproductionTests = $null,
         [bool]$targetedVerificationPassed = $false
     )
+    $metricsSummary = Get-PhaseMetricsSummary
+    if ($artifactRunDir) {
+        Save-JsonArtifact -Name "phase-metrics.json" -Object @($phaseMetrics) | Out-Null
+        Save-JsonArtifact -Name "metrics-summary.json" -Object $metricsSummary | Out-Null
+    }
     $result = [ordered]@{
         status = $status
         finalCategory = $finalCategory
@@ -863,6 +1589,7 @@ function Write-ResultJson {
         targetedVerificationPassed = [bool]$targetedVerificationPassed
         noChangeReason = $noChangeReason
         taskClass = $taskClass
+        metrics = $metricsSummary
     } | ConvertTo-Json -Depth 8
 
     $resultDir = Split-Path $ResultFile -Parent
@@ -882,6 +1609,7 @@ function Invoke-ClaudeWithTimeout {
         [string]$Model = ""
     )
     Ensure-DebugDir | Out-Null
+    $startedAt = Get-Date
     $tempPromptFile = Join-Path $env:TEMP "claude-develop\claude-input-$(New-Guid).md"
     $tempOutputFile = Join-Path $env:TEMP "claude-develop\claude-output-$(New-Guid).txt"
     $tempDir = Split-Path $tempPromptFile -Parent
@@ -913,6 +1641,7 @@ function Invoke-ClaudeWithTimeout {
     if (-not $completed -or $job.State -eq "Running") {
         Stop-Job $job -ErrorAction SilentlyContinue
         Remove-Job $job -Force -ErrorAction SilentlyContinue
+        $durationSeconds = ((Get-Date) - $startedAt).TotalSeconds
         Save-Artifact -Name "$PhaseName-attempt-$Attempt-prompt.md" -Content $Prompt | Out-Null
         Save-JsonArtifact -Name "$PhaseName-attempt-$Attempt-meta.json" -Object ([ordered]@{
             phase = $PhaseName
@@ -939,6 +1668,7 @@ function Invoke-ClaudeWithTimeout {
             jobState = "Running"
         }) -Subdir $debugSubdir | Out-Null
         Save-DebugText -Name "output.txt" -Content "TIMEOUT nach $TimeoutSec Sekunden" -Subdir $debugSubdir | Out-Null
+        Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $Model -Prompt $Prompt -Output "TIMEOUT nach $TimeoutSec Sekunden" -DurationSeconds $durationSeconds -Success $false -TimedOut $true -ExitCode -1
         Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
         Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
         return @{ success = $false; output = "TIMEOUT nach $TimeoutSec Sekunden"; timedOut = $true; exitCode = -1 }
@@ -964,6 +1694,7 @@ function Invoke-ClaudeWithTimeout {
         $output = "JOB_FAILED: $jobErrors"
         $exitCode = 99
     }
+    $durationSeconds = ((Get-Date) - $startedAt).TotalSeconds
 
     Save-Artifact -Name "$PhaseName-attempt-$Attempt-prompt.md" -Content $Prompt | Out-Null
     Save-JsonArtifact -Name "$PhaseName-attempt-$Attempt-meta.json" -Object ([ordered]@{
@@ -998,6 +1729,7 @@ function Invoke-ClaudeWithTimeout {
     if ($jobErrors.Trim()) {
         Save-DebugText -Name "job-errors.txt" -Content $jobErrors -Subdir $debugSubdir | Out-Null
     }
+    Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $Model -Prompt $Prompt -Output $output -DurationSeconds $durationSeconds -Success ($exitCode -eq 0) -TimedOut $false -ExitCode $exitCode
 
     Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
     Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
@@ -1068,8 +1800,12 @@ function Invoke-ClaudeReproduce {
 }
 
 function Invoke-ClaudeReview {
-    param([string]$Prompt, [string]$AttemptLabel)
-    $model = Get-ModelForReview
+    param(
+        [string]$Prompt,
+        [string]$AttemptLabel,
+        [string]$Model
+    )
+    $model = if ($Model) { $Model } else { $CONST_MODEL_REVIEW }
     Add-TimelineEvent -Phase "MODEL" -Message "REVIEW nutzt $model" -Category "REVIEW_MODEL"
     return Invoke-ClaudeWithTimeout -PhaseName "review-$AttemptLabel" -Prompt $Prompt -Model $model -Attempt 1 -ExtraArgs @(
         "--model", $model,
@@ -1363,21 +2099,9 @@ try {
     Write-DebugManifest
 
     Write-Host "[CONTEXT] Sammle Codebase-Kontext..."
-    $codebaseContext = ""
-    $claudeMdPath = Join-Path $repoRoot "CLAUDE.md"
-    if (Test-Path $claudeMdPath) {
-        $codebaseContext += "### CLAUDE.md:`n$([System.IO.File]::ReadAllText($claudeMdPath, [System.Text.Encoding]::UTF8))`n`n"
-    }
-    $slnListResult = Invoke-NativeCommand dotnet @("sln", $SolutionPath, "list")
-    if ($slnListResult.exitCode -eq 0) {
-        $codebaseContext += "### Projekte in Solution:`n$($slnListResult.output)`n`n"
-    }
-    $slnDir = Split-Path $SolutionPath -Parent
-    $treeDirs = (Get-ChildItem -Path $slnDir -Directory -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-        Select-Object -First 50 | ForEach-Object { $_.FullName }) -join "`n"
-    if ($treeDirs) {
-        $codebaseContext += "### Verzeichnisstruktur (2 Ebenen):`n$treeDirs`n"
-    }
+    $codebaseInventory = Get-CodebaseInventory -RepoRoot $repoRoot -SolutionPath $SolutionPath
+    Save-JsonArtifact -Name "codebase-inventory.json" -Object $codebaseInventory | Out-Null
+    $codebaseContext = Build-CompactCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt
     Save-Artifact -Name "context-summary.txt" -Content $codebaseContext | Out-Null
     Add-TimelineEvent -Phase "CONTEXT_SNAPSHOT" -Message "Codebase-Kontext erfasst." -Data @{ solution = $worktreeSln }
 
@@ -1393,7 +2117,6 @@ try {
 
     $testProjects = @(Get-TestProjectInventory -SolutionPath $worktreeSln -WorktreeRoot $worktreePath)
     Save-JsonArtifact -Name "test-projects.json" -Object $testProjects | Out-Null
-    $testProjectPromptText = Format-TestProjectsForPrompt -Projects $testProjects
     Add-TimelineEvent -Phase "DISCOVER" -Message "Testprojekt-Inventar erfasst." -Category "TEST_PROJECTS" -Data @{ count = $testProjects.Count }
 
     $planValidation = $null
@@ -1417,8 +2140,11 @@ try {
         $attemptsByPhase.discover = $discoverAttempt
         Write-Host "[DISCOVER] Versuch $discoverAttempt/$CONST_DISCOVER_ATTEMPTS..."
         $discoverCritiqueBlock = if ($discoverCritique) { "`nKRITIK AM VORHERIGEN DISCOVER-ERGEBNIS:`n$discoverCritique`n" } else { "" }
+        $discoverContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $planTargets
+        $discoverTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $planTargets
         $discoverPrompt = @"
 Analysiere den Task read-only und entscheide den naechsten Pipeline-Schritt. Liefere KEINEN Implementierungsplan.
+Sei knapp. Maximal 10 Zeilen. TARGET_HINTS hoechstens 3 Eintraege. RATIONALE genau 1-2 Saetze.
 
 AUFGABE:
 $taskPrompt
@@ -1427,10 +2153,10 @@ SOLUTION: $worktreeSln
 TASK_CLASS: $taskClass
 
 ERKANNTE TESTPROJEKTE:
-$testProjectPromptText
+$discoverTestProjectText
 
-CODEBASE KONTEXT:
-$codebaseContext
+KONTEXT:
+$discoverContext
 $discoverCritiqueBlock
 AUSGABEFORMAT:
 ROUTE: DIRECT_EDIT | BUGFIX_TESTABLE | BUGFIX_NONTESTABLE | UNCERTAIN
@@ -1479,10 +2205,14 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
             $currentPhase = "INVESTIGATE"
             $attemptsByPhase.investigate = $investigateAttempt
             Write-Host "[INVESTIGATE] Versuch $investigateAttempt/$CONST_INVESTIGATION_ATTEMPTS..."
-            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3
+            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 2 -MaxChars 1200
             $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
+            $investigationTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
+            $investigationContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $investigationTargets
+            $investigationTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $investigationTargets
             $investigatePrompt = @"
 Untersuche den Task read-only und entscheide, ob eine Codeaenderung noetig ist. Bewerte auch, ob eine automatisierte Bug-Reproduktion per Test sinnvoll ist.
+Sei knapp. TARGET_FILES hoechstens 5 Eintraege. ROOT_CAUSE und NEXT_ACTION jeweils maximal 2 Saetze.
 
 AUFGABE:
 $taskPrompt
@@ -1494,10 +2224,10 @@ DISCOVER:
 $discoverBlock
 
 ERKANNTE TESTPROJEKTE:
-$testProjectPromptText
+$investigationTestProjectText
 
-CODEBASE KONTEXT:
-$codebaseContext
+KONTEXT:
+$investigationContext
 
 BISHERIGES FEEDBACK:
 $historyText
@@ -1513,7 +2243,7 @@ RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <konkrete naechste Aenderung oder Begruendung>
 "@
-            $investigateModel = Get-ModelForInvestigate
+            $investigateModel = Get-ModelForInvestigate -TaskClass $taskClass -Targets @($planTargets + $discoverVerdict.targetHints) -Attempt $investigateAttempt -PreviousOutput $investigationOutput
             $investigateResult = Invoke-ClaudeInvestigate -Prompt $investigatePrompt -Model $investigateModel -Attempt $investigateAttempt
             if (-not $investigateResult.success) {
                 Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_CALL_FAILED" -Feedback $investigateResult.output
@@ -1538,7 +2268,13 @@ NEXT_ACTION:
             }
 
             if ($investigationVerdict.result -eq "NO_CHANGE") {
-                $verifyPrompt = @"
+                $noChangeAssessment = Get-NoChangeAssessment -Output $investigationOutput -Targets $investigationVerdict.targets
+                if (-not $noChangeAssessment.shouldVerify) {
+                    Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "NO_CHANGE_LOW_CONFIDENCE" -Feedback "NO_CHANGE-Claim war zu duenn oder unbrauchbar; Verify-Call wurde uebersprungen."
+                    $investigationVerdict.result = "INCONCLUSIVE"
+                    $investigationConclusion = "NO_CHANGE_LOW_CONFIDENCE"
+                } else {
+                    $verifyPrompt = @"
 Pruefe die folgende Behauptung strikt read-only: Der Task ist bereits umgesetzt.
 
 TASK:
@@ -1552,17 +2288,19 @@ RESULT: CONFIRMED | NOT_CONFIRMED
 REASON:
 <kurze Begruendung mit konkreten Dateien oder fehlenden Belegen>
 "@
-                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model (Get-ModelForInvestigate) -Attempt (80 + $investigateAttempt)
-                if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
-                    $finalStatus = "NO_CHANGE"
-                    $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
-                    $finalSummary = "Investigation ergab nach Verifikation, dass keine Codeaenderung noetig ist."
-                    $finalFeedback = $investigationOutput
-                    throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                    $verifyTargets = if ($noChangeAssessment.evidenceTargets.Count -gt 0) { @($noChangeAssessment.evidenceTargets) } else { @($investigationVerdict.targets) }
+                    $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model (Get-ModelForInvestigate -TaskClass $taskClass -Targets $verifyTargets -Attempt 2 -PreviousOutput $investigationOutput) -Attempt (80 + $investigateAttempt)
+                    if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
+                        $finalStatus = "NO_CHANGE"
+                        $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+                        $finalSummary = "Investigation ergab nach Verifikation, dass keine Codeaenderung noetig ist."
+                        $finalFeedback = $investigationOutput
+                        throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                    }
+                    Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "NO_CHANGE_NOT_CONFIRMED" -Feedback ($verifyResult.output)
+                    $investigationVerdict.result = "CHANGE_NEEDED"
+                    $investigationConclusion = "NO_CHANGE_REJECTED"
                 }
-                Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "NO_CHANGE_NOT_CONFIRMED" -Feedback ($verifyResult.output)
-                $investigationVerdict.result = "CHANGE_NEEDED"
-                $investigationConclusion = "NO_CHANGE_REJECTED"
             }
             if ($investigationVerdict.result -eq "CHANGE_NEEDED") {
                 if ($investigationVerdict.targets.Count -gt 0) {
@@ -1574,6 +2312,9 @@ REASON:
             Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_INCONCLUSIVE" -Feedback $investigationOutput
             for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
                 $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons @("Dein Output war nicht eindeutig genug, um automatisch weiterzulaufen.") -PreviousOutput $investigationOutput
+                $repairTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
+                $repairContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $repairTargets
+                $repairTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $repairTargets
                 $repairPrompt = @"
 $repairBlock
 
@@ -1586,10 +2327,10 @@ DISCOVER:
 $discoverBlock
 
 ERKANNTE TESTPROJEKTE:
-$testProjectPromptText
+$repairTestProjectText
 
-CODEBASE KONTEXT:
-$codebaseContext
+KONTEXT:
+$repairContext
 
 AUSGABEFORMAT:
 RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
@@ -1602,7 +2343,7 @@ RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <konkrete naechste Aenderung oder Begruendung>
 "@
-                $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $needsInvestigation -Targets $planTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
+                $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $needsInvestigation -Targets $repairTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
                 $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $repairModel -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
                 if (-not $repairResult.success) { continue }
                 $investigationOutput = $repairResult.output.Trim()
@@ -1652,6 +2393,7 @@ NEXT_ACTION:
         $reproductionBaselinePatch = ""
         $reproductionBaselineFiles = @()
         $reproductionTests = New-EmptyReproductionTests
+        $lastReproFailureCategory = ""
         for ($reproAttempt = 1; $reproAttempt -le $CONST_REPRODUCE_ATTEMPTS; $reproAttempt++) {
             $currentPhase = "REPRODUCE"
             $attemptsByPhase.reproduce = $reproAttempt
@@ -1662,9 +2404,11 @@ NEXT_ACTION:
             $reproductionTests = New-EmptyReproductionTests
             Reset-Worktree
             Write-Host "[REPRODUCE] Versuch $reproAttempt/$CONST_REPRODUCE_ATTEMPTS..."
-            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 4
+            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3 -MaxChars 1000
             $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
             $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "RESULT: CHANGE_NEEDED`nTARGET_FILES:`n- " + (($planTargets | Select-Object -First 5) -join "`n- ") }
+            $reproductionTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
+            $reproTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $reproductionTargets
             $reproPrompt = @"
 Versuche, den Bug ueber automatisierte Tests zu reproduzieren. Aendere in dieser Phase NUR Testdateien oder Testprojektdateien.
 
@@ -1681,7 +2425,7 @@ INVESTIGATION:
 $investigationBlock
 
 ERKANNTE TESTPROJEKTE:
-$testProjectPromptText
+$reproTestProjectText
 
 BISHERIGES FEEDBACK:
 $historyText
@@ -1706,8 +2450,10 @@ BUG_BEHAVIOR:
 RATIONALE:
 <warum der Test die Fehlfunktion abbildet oder warum keine Reproduktion gelang>
 "@
-            $reproResult = Invoke-ClaudeReproduce -Prompt $reproPrompt -Model $CONST_MODEL_IMPLEMENT -Attempt $reproAttempt
+            $reproModel = Get-ModelForReproduce -TaskText $taskPrompt -Targets $reproductionTargets -Attempt $reproAttempt -LastFailureCategory $lastReproFailureCategory
+            $reproResult = Invoke-ClaudeReproduce -Prompt $reproPrompt -Model $reproModel -Attempt $reproAttempt
             if (-not $reproResult.success) {
+                $lastReproFailureCategory = "REPRO_CALL_FAILED"
                 Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_CALL_FAILED" -Feedback $reproResult.output
                 continue
             }
@@ -1720,6 +2466,7 @@ RATIONALE:
             $changeSetValidation = Test-ReproductionChangeSet -ChangedFiles $reproChangedFiles -TestProjects $testProjects
             if (-not $changeSetValidation.valid) {
                 $invalidText = if ($changeSetValidation.invalidFiles.Count -gt 0) { $changeSetValidation.invalidFiles -join ", " } else { "keine Testdateien geaendert" }
+                $lastReproFailureCategory = "REPRO_INVALID_CHANGESET"
                 Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_INVALID_CHANGESET" -Feedback $invalidText
                 Add-TimelineEvent -Phase "REPRODUCE" -Message "Reproduktion verwarf unerlaubte Dateiaenderungen." -Category "REPRO_INVALID_CHANGESET" -Data @{ invalidFiles = $changeSetValidation.invalidFiles }
                 Reset-Worktree
@@ -1727,12 +2474,14 @@ RATIONALE:
             }
 
             if ($reproVerdict.result -ne "REPRODUCED") {
+                $lastReproFailureCategory = $reproVerdict.result
                 Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category $reproVerdict.result -Feedback $reproductionOutput
                 Reset-Worktree
                 continue
             }
 
             if (-not $reproVerdict.testFilter) {
+                $lastReproFailureCategory = "REPRO_MISSING_FILTER"
                 Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_MISSING_FILTER" -Feedback $reproductionOutput
                 Reset-Worktree
                 continue
@@ -1740,6 +2489,7 @@ RATIONALE:
 
             $reproTestTargets = Resolve-TestProjectPaths -RequestedProjects $reproVerdict.testProjects -TestProjects $testProjects
             if ($reproVerdict.testProjects.Count -gt 0 -and $reproTestTargets.Count -eq 0) {
+                $lastReproFailureCategory = "REPRO_UNKNOWN_TEST_PROJECT"
                 Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_UNKNOWN_TEST_PROJECT" -Feedback $reproductionOutput
                 Reset-Worktree
                 continue
@@ -1747,6 +2497,7 @@ RATIONALE:
             $reproVerifyResult = Invoke-TargetedTestRun -SolutionPath $worktreeSln -ProjectPaths $reproTestTargets -TestFilter $reproVerdict.testFilter -ExpectFailure $true
             Save-Artifact -Name "reproduce-v$reproAttempt-verify.txt" -Content $reproVerifyResult.output | Out-Null
             if (-not $reproVerifyResult.testFailureObserved -or $reproVerifyResult.commandError -or $reproVerifyResult.matchedNoTests) {
+                $lastReproFailureCategory = "REPRO_NOT_VERIFIED"
                 Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_NOT_VERIFIED" -Feedback $reproVerifyResult.output
                 Reset-Worktree
                 continue
@@ -1787,6 +2538,8 @@ RATIONALE:
         $replanBlock = if ($replanReason) { "`nKRITIK AM VORHERIGEN FIX-PLAN:`n$replanReason`n" } else { "" }
         $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
         $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "Keine gesonderte Investigation ausgefuehrt." }
+        $planContextTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
+        $planContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $planContextTargets
         $reproductionBlock = if ($reproductionConfirmed) {
 @"
 RESULT: REPRODUCED
@@ -1807,6 +2560,7 @@ $($reproductionTests.rationale)
         }
         $planPrompt = @"
 Erstelle jetzt den konkreten Fix-Plan auf Basis der vorhandenen Erkenntnisse. Plane nicht mehr spekulativ.
+Sei kompakt: maximal 5 Dateien oder Suchflaechen und maximal 4 Reihenfolge-Schritte.
 
 AUFGABE:
 $taskPrompt
@@ -1827,8 +2581,8 @@ $investigationBlock
 REPRODUKTION:
 $reproductionBlock
 
-CODEBASE KONTEXT:
-$codebaseContext
+KONTEXT:
+$planContext
 $replanBlock
 REGELN:
 - Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
@@ -1895,6 +2649,7 @@ Schreibe NUR den Plan.
 $repairBlock
 
 LIEFERE JETZT EINEN KORRIGIERTEN FIX-PLAN IM GEFORDERTEN FORMAT.
+Bleibe kompakt: maximal 5 Dateien oder Suchflaechen und maximal 4 Reihenfolge-Schritte.
 
 AUFGABE:
 $taskPrompt
@@ -1915,8 +2670,8 @@ $investigationBlock
 REPRODUKTION:
 $reproductionBlock
 
-CODEBASE KONTEXT:
-$codebaseContext
+KONTEXT:
+$planContext
 
 AUSGABEFORMAT:
 ## Ziel
@@ -1941,7 +2696,7 @@ Fuer jede relevante Datei oder Suchflaeche:
 investigationRequired: true|false
 Schreibe NUR den Plan.
 "@
-            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $planOutput -TaskText $taskPrompt
+            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planContextTargets -PreviousOutput $planOutput -TaskText $taskPrompt
             $repairResult = Invoke-ClaudeRepair -PhaseName "FIX_PLAN" -Prompt $repairPrompt -Model $repairModel -Attempt (190 + $planAttempt * 10 + $repairAttempt)
             if (-not $repairResult.success) { continue }
 
@@ -1974,7 +2729,7 @@ Schreibe NUR den Plan.
         $finalStatus = "FAILED"
         $finalCategory = "FIX_PLAN_INSUFFICIENT"
         $finalSummary = "Nach Discovery, Investigation und optionaler Reproduktion konnte kein belastbarer Fix-Plan erstellt werden."
-        $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory }
+        $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory -MaxChars 1200 }
         throw [System.Exception]::new("TERMINAL_FIX_PLAN_INSUFFICIENT")
     }
 
@@ -1999,7 +2754,7 @@ Schreibe NUR den Plan.
         }
         Write-Host "[IMPLEMENT] Versuch $implementAttempt/$CONST_IMPLEMENT_ATTEMPTS..."
 
-        $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 4
+        $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3 -MaxChars 1200
         $targetText = if ($planTargets.Count -gt 0) { ($planTargets | ForEach-Object { "- $_" }) -join "`n" } else { "- keine expliziten Ziele aus Plan" }
         $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "RESULT: CHANGE_NEEDED`nTARGET_FILES:`n$targetText" }
         $reproductionBlock = if ($reproductionConfirmed) {
@@ -2018,8 +2773,10 @@ $($reproductionTests.bugBehavior)
         } else {
             "Keine verifizierte Test-Reproduktion vorhanden."
         }
+        $implementPlan = Clip-Text -Text $planOutput -MaxChars 2600 -Marker "Fix-Plan gekuerzt"
         $implPrompt = @"
 Setze die Aenderung um. Du darfst nicht raten.
+Arbeite fokussiert. Oeffne nur zielrelevante Dateien. Gib am Ende nur das geforderte kurze Ergebnisformat aus.
 
 AUFGABE:
 $taskPrompt
@@ -2028,7 +2785,7 @@ SOLUTION: $worktreeSln
 TASK_CLASS: $taskClass
 
 VALIDIERTER PLAN:
-$planOutput
+$implementPlan
 
 INVESTIGATION:
 $investigationBlock
@@ -2066,17 +2823,17 @@ SUMMARY:
         }
 
         $implOutcome = Get-ImplementationOutcome -Output $implResult.output
-        [void]$implementationHistoryHashes.Add("$($implOutcome.category):$($implOutcome.hash)")
         $changedFiles = Get-ChangedFiles
         Save-Artifact -Name "implement-v$implementAttempt-changed-files.txt" -Content (($changedFiles -join "`n").Trim()) | Out-Null
 
         if ($changedFiles.Count -eq 0) {
-            $lastNoChangeReason = $implOutcome.category
-            Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Keine Datei wurde geaendert." -Category $implOutcome.category
-            Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category $implOutcome.category -Feedback $implResult.output
-
             if ($implOutcome.category -eq "NO_CHANGE_ALREADY_SATISFIED") {
-                $verifyPrompt = @"
+                $noChangeAssessment = Get-NoChangeAssessment -Output $implResult.output -Targets $planTargets
+                if (-not $noChangeAssessment.shouldVerify) {
+                    Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category "NO_CHANGE_LOW_CONFIDENCE" -Feedback "NO_CHANGE-Claim war zu duenn oder unbrauchbar; Verify-Call wurde uebersprungen."
+                    $implOutcome.category = "NO_CHANGE_UNCERTAIN"
+                } else {
+                    $verifyPrompt = @"
 Pruefe strikt read-only, ob diese Aussage stimmt: Der Task ist bereits umgesetzt.
 
 TASK:
@@ -2090,16 +2847,24 @@ RESULT: CONFIRMED | NOT_CONFIRMED
 REASON:
 <kurze Begruendung>
 "@
-                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model (Get-ModelForInvestigate) -Attempt (300 + $implementAttempt)
-                if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
-                    $finalStatus = "NO_CHANGE"
-                    $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
-                    $finalSummary = "Implementierung meldet nach Verifikation, dass der gewuenschte Zustand bereits erreicht ist."
-                    $finalFeedback = $implResult.output
-                    throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                    $verifyTargets = if ($noChangeAssessment.evidenceTargets.Count -gt 0) { @($noChangeAssessment.evidenceTargets) } else { @($planTargets) }
+                    $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model (Get-ModelForInvestigate -TaskClass $taskClass -Targets $verifyTargets -Attempt 2 -PreviousOutput $implResult.output) -Attempt (300 + $implementAttempt)
+                    if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
+                        $finalStatus = "NO_CHANGE"
+                        $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+                        $finalSummary = "Implementierung meldet nach Verifikation, dass der gewuenschte Zustand bereits erreicht ist."
+                        $finalFeedback = $implResult.output
+                        throw [System.Exception]::new("TERMINAL_NO_CHANGE")
+                    }
+                    Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category "NO_CHANGE_NOT_CONFIRMED" -Feedback ($verifyResult.output)
+                    $implOutcome.category = "NO_CHANGE_UNCERTAIN"
                 }
-                Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category "NO_CHANGE_NOT_CONFIRMED" -Feedback ($verifyResult.output)
             }
+
+            $lastNoChangeReason = $implOutcome.category
+            [void]$implementationHistoryHashes.Add("$($implOutcome.category):$($implOutcome.hash)")
+            Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Keine Datei wurde geaendert." -Category $implOutcome.category
+            Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category $implOutcome.category -Feedback $implResult.output
 
             $repairReasons = @()
             switch ($implOutcome.category) {
@@ -2118,7 +2883,7 @@ TASK:
 $taskPrompt
 
 VALIDIERTER PLAN:
-$planOutput
+$implementPlan
 
 INVESTIGATION:
 $investigationBlock
@@ -2279,47 +3044,33 @@ SUMMARY:
             $currentPhase = "REVIEW"
             $attemptsByPhase.review = [Math]::Max($attemptsByPhase.review, $reviewCycle + 1)
             $diffForReview = (Invoke-NativeCommand git @("diff", "HEAD")).output
+            $diffStatForReview = (Invoke-NativeCommand git @("diff", "--stat", "HEAD")).output
             Save-Artifact -Name "git-diff-$cycleLabel.patch" -Content $diffForReview | Out-Null
-            $historyForReview = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 4
+            $historyForReview = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3 -MaxChars $CONST_REVIEW_HISTORY_MAX_CHARS
+            $lowRiskReview = Test-LowRiskReview -ChangedFiles $changedFiles -DiffText $diffForReview -WarningText $warningText -ReproductionConfirmed $reproductionConfirmed -TaskClass $taskClass
+            $reviewPayloadInfo = Get-CompactReviewPayload -PlanText $planOutput -InvestigationText $investigationBlock -ReproductionText $reproductionBlock -DiffText $diffForReview -DiffStat $diffStatForReview -ChangedFiles $changedFiles -WarningText $warningText -HistoryText $historyForReview -LowRiskReview $lowRiskReview
+            if ($lowRiskReview -and $reviewPayloadInfo.omittedProductionHunks) {
+                $lowRiskReview = $false
+                Add-TimelineEvent -Phase "REVIEW" -Message "Kompaktes Review wurde auf FULL eskaliert, weil Produktionsdiffs gekuerzt worden waeren." -Category "REVIEW_SCOPE_ESCALATED"
+                $reviewPayloadInfo = Get-CompactReviewPayload -PlanText $planOutput -InvestigationText $investigationBlock -ReproductionText $reproductionBlock -DiffText $diffForReview -DiffStat $diffStatForReview -ChangedFiles $changedFiles -WarningText $warningText -HistoryText $historyForReview -LowRiskReview $false
+            }
+            $reviewModel = Get-ModelForReview -ChangedFiles $changedFiles -DiffText $diffForReview -WarningText $warningText -ReproductionConfirmed $reproductionConfirmed -TaskClass $taskClass -ForceFullReview:(-not $lowRiskReview)
+            $reviewPayload = $reviewPayloadInfo.payload
             $reviewPrompt = @"
 $reviewerContent
 
 ---
 
-FIX PLAN (v$planVersion):
-$planOutput
+REVIEW_SCOPE: $(if ($lowRiskReview) { "LOW_RISK_COMPACT" } else { "FULL" })
 
----
-
-INVESTIGATION:
-$investigationBlock
-
----
-
-REPRODUKTION:
-$reproductionBlock
-
----
-
-GIT DIFF DER AENDERUNGEN:
-$diffForReview
+$reviewPayload
 
 ---
 
 URSPRUENGLICHER TASK:
 $taskPrompt
-
----
-
-PREFLIGHT WARNINGS:
-$warningText
-
----
-
-BISHERIGES FEEDBACK:
-$historyForReview
 "@
-            $reviewResult = Invoke-ClaudeReview -Prompt $reviewPrompt -AttemptLabel $cycleLabel
+            $reviewResult = Invoke-ClaudeReview -Prompt $reviewPrompt -AttemptLabel $cycleLabel -Model $reviewModel
             if (-not $reviewResult.success) {
                 Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "REVIEW" -Category "REVIEW_CALL_FAILED" -Feedback $reviewResult.output
                 $reviewCycle++
@@ -2396,7 +3147,7 @@ SUMMARY:
         $finalStatus = "FAILED"
         $finalCategory = if ($lastNoChangeReason) { $lastNoChangeReason } else { "NO_CHANGE_UNCERTAIN" }
         $finalSummary = "Implementierung erzeugte keine akzeptierten Aenderungen innerhalb des Budgets."
-        $finalFeedback = if ($lastImplementOutput) { $lastImplementOutput } else { Format-FeedbackHistory -History $feedbackHistory }
+        $finalFeedback = if ($lastImplementOutput) { $lastImplementOutput } else { Format-FeedbackHistory -History $feedbackHistory -MaxChars 1200 }
     }
 
     Write-Host "[FINALIZE] $finalCategory"
