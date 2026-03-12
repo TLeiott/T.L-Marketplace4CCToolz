@@ -30,9 +30,11 @@ Plan -> Plan Validate -> Investigate -> Implement -> Change Validate -> Prefligh
 **New runtime behavior:**
 - Explicit no-op categories instead of generic `IMPL_FAIL`
 - Per-run artifacts under `.claude-develop-logs/runs/<taskName>/`
+- Per-run temp debug bundles under `%TEMP%\claude-develop\debug\<runId>\`
 - Investigation phase for ambiguous or diagnostic tasks
 - Semantic plan validation that rejects placeholder/template plans
 - Batch launchers should cap concurrency at 2 simultaneous pipelines
+- Conditional Sonnet usage for low-risk planning, implementation, and repair phases
 
 ## Prerequisites
 
@@ -69,6 +71,7 @@ Constants in `auto-develop.ps1`:
 | `CONST_MODEL_INVESTIGATE` | `claude-opus-4-6` | Model for investigation phase |
 | `CONST_MODEL_IMPLEMENT` | `claude-opus-4-6` | Model for implementation |
 | `CONST_MODEL_REVIEW` | `claude-opus-4-6` | Model for code review |
+| `CONST_MODEL_FAST` | `claude-sonnet-4-6` | Cost-saving model for low-risk phases |
 | `CONST_PLAN_ATTEMPTS` | `2` | Plan / replan attempts |
 | `CONST_INVESTIGATION_ATTEMPTS` | `2` | Investigation attempts |
 | `CONST_IMPLEMENT_ATTEMPTS` | `2` | Fresh implementation attempts |
@@ -89,7 +92,17 @@ Constants in `auto-develop.ps1`:
 - `REVIEW_DENIED_MAJOR`
 - `REVIEW_DENIED_RETHINK`
 
-The result JSON also includes `summary`, `attemptsByPhase`, `artifacts.runDir`, and `noChangeReason`.
+The result JSON also includes `summary`, `attemptsByPhase`, `artifacts.runDir`, `artifacts.debugDir`, and `noChangeReason`.
+
+## Model Selection
+
+The pipeline now chooses models per phase:
+
+- `PLAN`: Sonnet for direct edits or already-concrete file targets, Opus otherwise
+- `INVESTIGATE`: Opus
+- `IMPLEMENT`: Sonnet only when targets are concrete and the step is low-complexity
+- `REPAIR`: usually Sonnet for format/fixup loops with concrete hints
+- `REVIEW`: Opus
 
 ## Language
 

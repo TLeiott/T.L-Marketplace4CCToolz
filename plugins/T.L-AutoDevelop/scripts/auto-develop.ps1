@@ -31,6 +31,9 @@ $branchName = "auto/$TaskName"
 $currentPhase = "VALIDATE"
 $repoRoot = $null
 $artifactRunDir = $null
+$debugRunDir = $null
+$scriptStartTime = Get-Date
+$runId = $null
 $timeline = [System.Collections.ArrayList]::new()
 $feedbackHistory = [System.Collections.ArrayList]::new()
 $attemptsByPhase = [ordered]@{
@@ -80,6 +83,21 @@ function Add-TimelineEvent {
     })
 }
 
+function Get-SafeFileToken {
+    param([string]$Text)
+    if (-not $Text) { return "run" }
+    $token = $Text.Trim()
+    foreach ($char in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $token = $token.Replace($char, "-")
+    }
+    $token = $token -replace '\s+', '-'
+    $token = $token -replace '-{2,}', '-'
+    $token = $token.Trim('-')
+    if (-not $token) { return "run" }
+    if ($token.Length -gt 60) { return $token.Substring(0, 60) }
+    return $token
+}
+
 function Ensure-ArtifactDir {
     param([string]$Root)
     if (-not $artifactRunDir) {
@@ -89,6 +107,19 @@ function Ensure-ArtifactDir {
         if (-not (Test-Path $artifactRunDir)) { New-Item -ItemType Directory -Path $artifactRunDir -Force | Out-Null }
     }
     return $artifactRunDir
+}
+
+function Ensure-DebugDir {
+    if (-not $runId) {
+        $script:runId = "{0}-{1}-{2}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), (Get-SafeFileToken -Text $TaskName), ([guid]::NewGuid().ToString("N").Substring(0, 8))
+    }
+    if (-not $debugRunDir) {
+        $debugRoot = Join-Path $env:TEMP "claude-develop\debug"
+        if (-not (Test-Path $debugRoot)) { New-Item -ItemType Directory -Path $debugRoot -Force | Out-Null }
+        $script:debugRunDir = Join-Path $debugRoot $runId
+        if (-not (Test-Path $debugRunDir)) { New-Item -ItemType Directory -Path $debugRunDir -Force | Out-Null }
+    }
+    return $debugRunDir
 }
 
 function Save-Artifact {
@@ -108,6 +139,22 @@ function Save-Artifact {
     return $path
 }
 
+function Save-DebugText {
+    param(
+        [string]$Name,
+        [string]$Content,
+        [string]$Subdir = ""
+    )
+    $targetDir = Ensure-DebugDir
+    if ($Subdir) {
+        $targetDir = Join-Path $targetDir $Subdir
+        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+    }
+    $path = Join-Path $targetDir $Name
+    [System.IO.File]::WriteAllText($path, $Content, [System.Text.Encoding]::UTF8)
+    return $path
+}
+
 function Save-JsonArtifact {
     param(
         [string]$Name,
@@ -116,6 +163,55 @@ function Save-JsonArtifact {
     )
     $json = $Object | ConvertTo-Json -Depth 8
     return Save-Artifact -Name $Name -Content $json -Subdir $Subdir
+}
+
+function Save-DebugJson {
+    param(
+        [string]$Name,
+        $Object,
+        [string]$Subdir = ""
+    )
+    $json = $Object | ConvertTo-Json -Depth 8
+    return Save-DebugText -Name $Name -Content $json -Subdir $Subdir
+}
+
+function Add-DebugSnapshot {
+    param(
+        [string]$SourcePath,
+        [string]$TargetName,
+        [string]$Subdir = ""
+    )
+    if (-not $SourcePath -or -not (Test-Path $SourcePath)) { return $null }
+    $targetDir = Ensure-DebugDir
+    if ($Subdir) {
+        $targetDir = Join-Path $targetDir $Subdir
+        if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+    }
+    $targetPath = Join-Path $targetDir $TargetName
+    Copy-Item -Path $SourcePath -Destination $targetPath -Force
+    return $targetPath
+}
+
+function Write-DebugManifest {
+    $manifest = [ordered]@{
+        runId = Ensure-DebugDir | Split-Path -Leaf
+        taskName = $TaskName
+        promptFile = $PromptFile
+        solutionPath = $SolutionPath
+        resultFile = $ResultFile
+        repoRoot = $repoRoot
+        artifactRunDir = $artifactRunDir
+        debugDir = $debugRunDir
+        worktreePath = $worktreePath
+        branchName = $branchName
+        currentPhase = $currentPhase
+        processId = $PID
+        startedAt = $scriptStartTime.ToString("o")
+        updatedAt = (Get-Date).ToString("o")
+        skipRun = [bool]$SkipRun
+        allowNuget = [bool]$AllowNuget
+    }
+    Save-DebugJson -Name "manifest.json" -Object $manifest | Out-Null
 }
 
 function Normalize-Text {
@@ -130,6 +226,15 @@ function Normalize-Text {
 function Get-TextHash {
     param([string]$Text)
     return (Normalize-Text -Text $Text).GetHashCode().ToString()
+}
+
+function Test-ConcreteTargets {
+    param([string[]]$Targets)
+    if (-not $Targets -or $Targets.Count -eq 0) { return $false }
+    $concrete = @($Targets | Where-Object {
+        $_ -and $_ -notmatch '^<' -and $_ -match '(\*|\\|/|\.(razor|cs|css|js|ts|xaml|csproj)\b)'
+    })
+    return $concrete.Count -gt 0
 }
 
 function Get-ActionableItems {
@@ -152,6 +257,77 @@ function Get-ActionableItems {
 function Test-HasActionableSignal {
     param([string]$Text)
     return (Get-ActionableItems -Text $Text).Count -gt 0
+}
+
+function Test-LowComplexityImplement {
+    param(
+        [string]$TaskClass,
+        [bool]$InvestigationRequired,
+        [string[]]$Targets,
+        [string]$TaskText = "",
+        [string]$PhaseContext = ""
+    )
+    if (-not (Test-ConcreteTargets -Targets $Targets)) { return $false }
+    if ($Targets.Count -gt 3) { return $false }
+    if ($TaskClass -notin @("DIRECT_EDIT", "BUGFIX_DIAGNOSTIC")) { return $false }
+    if ($InvestigationRequired -and $TaskClass -ne "DIRECT_EDIT") { return $false }
+    $combined = "$TaskText`n$PhaseContext"
+    if ($combined -match '(?im)root cause|ursache|warum|investig|debug|analys|architektur|refactor|migration') { return $false }
+    return $true
+}
+
+function Get-ModelForPlan {
+    param(
+        [string]$TaskClass,
+        [string[]]$Targets
+    )
+    if ($TaskClass -eq "DIRECT_EDIT" -or (Test-ConcreteTargets -Targets $Targets)) { return $CONST_MODEL_FAST }
+    return $CONST_MODEL_PLAN
+}
+
+function Get-ModelForInvestigate {
+    param()
+    return $CONST_MODEL_INVESTIGATE
+}
+
+function Get-ModelForImplement {
+    param(
+        [string]$TaskClass,
+        [bool]$InvestigationRequired,
+        [string[]]$Targets,
+        [string]$TaskText = "",
+        [string]$PhaseContext = ""
+    )
+    if (Test-LowComplexityImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PhaseContext) {
+        return $CONST_MODEL_FAST
+    }
+    return $CONST_MODEL_IMPLEMENT
+}
+
+function Get-ModelForRepair {
+    param(
+        [string]$PhaseName,
+        [string]$TaskClass,
+        [bool]$InvestigationRequired,
+        [string[]]$Targets,
+        [string]$PreviousOutput = "",
+        [string]$TaskText = ""
+    )
+    if ($PhaseName -eq "PLAN") { return $CONST_MODEL_FAST }
+    if ($PhaseName -eq "INVESTIGATE") {
+        if (Test-HasActionableSignal -Text $PreviousOutput) { return $CONST_MODEL_FAST }
+        return $CONST_MODEL_INVESTIGATE
+    }
+    if ($PhaseName -eq "IMPLEMENT") {
+        return Get-ModelForImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PreviousOutput
+    }
+    if ($PhaseName -eq "REVIEW_MINOR") { return $CONST_MODEL_FAST }
+    return $CONST_MODEL_IMPLEMENT
+}
+
+function Get-ModelForReview {
+    param()
+    return $CONST_MODEL_REVIEW
 }
 
 function Get-RepairBlock {
@@ -241,6 +417,9 @@ function Write-TimelineArtifact {
     if ($artifactRunDir) {
         Save-JsonArtifact -Name "timeline.json" -Object @($timeline) | Out-Null
     }
+    if ($debugRunDir) {
+        Save-DebugJson -Name "timeline.json" -Object @($timeline) | Out-Null
+    }
 }
 
 function Write-ResultJson {
@@ -275,6 +454,7 @@ function Write-ResultJson {
         artifacts = [ordered]@{
             runDir = $artifactRunDir
             timeline = if ($artifactRunDir) { Join-Path $artifactRunDir "timeline.json" } else { "" }
+            debugDir = $debugRunDir
         }
         planVersion = $planVersion
         investigationRequired = $investigationRequired
@@ -286,6 +466,8 @@ function Write-ResultJson {
     $resultDir = Split-Path $ResultFile -Parent
     if (-not (Test-Path $resultDir)) { New-Item -ItemType Directory -Path $resultDir -Force | Out-Null }
     [System.IO.File]::WriteAllText($ResultFile, $result, [System.Text.Encoding]::UTF8)
+    Save-DebugText -Name "result.json" -Content $result | Out-Null
+    Write-DebugManifest
 }
 
 function Invoke-ClaudeWithTimeout {
@@ -297,10 +479,12 @@ function Invoke-ClaudeWithTimeout {
         [int]$Attempt = 1,
         [string]$Model = ""
     )
+    Ensure-DebugDir | Out-Null
     $tempPromptFile = Join-Path $env:TEMP "claude-develop\claude-input-$(New-Guid).md"
     $tempOutputFile = Join-Path $env:TEMP "claude-develop\claude-output-$(New-Guid).txt"
     $tempDir = Split-Path $tempPromptFile -Parent
     if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+    $debugSubdir = $PhaseName
 
     [System.IO.File]::WriteAllText($tempPromptFile, $Prompt, [System.Text.Encoding]::UTF8)
 
@@ -337,6 +521,22 @@ function Invoke-ClaudeWithTimeout {
             args = $ExtraArgs
         }) | Out-Null
         Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content "TIMEOUT nach $TimeoutSec Sekunden" | Out-Null
+        Add-DebugSnapshot -SourcePath $tempPromptFile -TargetName "prompt.md" -Subdir $debugSubdir | Out-Null
+        Save-DebugJson -Name "meta.json" -Object ([ordered]@{
+            phase = $PhaseName
+            attempt = $Attempt
+            model = $Model
+            exitCode = -1
+            timeoutSeconds = $TimeoutSec
+            args = $ExtraArgs
+            claudeExe = $claudeExe
+            workingDirectory = (Get-Location).Path
+            tempPromptFile = $tempPromptFile
+            tempOutputFile = $tempOutputFile
+            timedOut = $true
+            jobState = "Running"
+        }) -Subdir $debugSubdir | Out-Null
+        Save-DebugText -Name "output.txt" -Content "TIMEOUT nach $TimeoutSec Sekunden" -Subdir $debugSubdir | Out-Null
         Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
         Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
         return @{ success = $false; output = "TIMEOUT nach $TimeoutSec Sekunden"; timedOut = $true; exitCode = -1 }
@@ -374,6 +574,28 @@ function Invoke-ClaudeWithTimeout {
         jobFailed = $jobFailed
     }) | Out-Null
     Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content $output | Out-Null
+    Add-DebugSnapshot -SourcePath $tempPromptFile -TargetName "prompt.md" -Subdir $debugSubdir | Out-Null
+    Add-DebugSnapshot -SourcePath $tempOutputFile -TargetName "raw-output.txt" -Subdir $debugSubdir | Out-Null
+    Save-DebugJson -Name "meta.json" -Object ([ordered]@{
+        phase = $PhaseName
+        attempt = $Attempt
+        model = $Model
+        exitCode = $exitCode
+        timeoutSeconds = $TimeoutSec
+        args = $ExtraArgs
+        jobFailed = $jobFailed
+        claudeExe = $claudeExe
+        workingDirectory = (Get-Location).Path
+        tempPromptFile = $tempPromptFile
+        tempOutputFile = $tempOutputFile
+        timedOut = $false
+        promptChars = $Prompt.Length
+        outputChars = $output.Length
+    }) -Subdir $debugSubdir | Out-Null
+    Save-DebugText -Name "output.txt" -Content $output -Subdir $debugSubdir | Out-Null
+    if ($jobErrors.Trim()) {
+        Save-DebugText -Name "job-errors.txt" -Content $jobErrors -Subdir $debugSubdir | Out-Null
+    }
 
     Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
     Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
@@ -383,6 +605,7 @@ function Invoke-ClaudeWithTimeout {
 
 function Invoke-ClaudePlan {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "PLAN nutzt $Model" -Category "PLAN_MODEL"
     return Invoke-ClaudeWithTimeout -PhaseName "plan-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
         "--model", $Model,
         "--allowedTools", "Read,Glob,Grep",
@@ -392,6 +615,7 @@ function Invoke-ClaudePlan {
 
 function Invoke-ClaudeInvestigate {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "INVESTIGATE nutzt $Model" -Category "INVESTIGATE_MODEL"
     return Invoke-ClaudeWithTimeout -PhaseName "investigate-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
         "--model", $Model,
         "--allowedTools", "Read,Glob,Grep",
@@ -401,6 +625,7 @@ function Invoke-ClaudeInvestigate {
 
 function Invoke-ClaudeImplement {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "IMPLEMENT nutzt $Model" -Category "IMPLEMENT_MODEL"
     return Invoke-ClaudeWithTimeout -PhaseName "implement-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2) -ExtraArgs @(
         "--model", $Model,
         "--dangerously-skip-permissions",
@@ -411,8 +636,10 @@ function Invoke-ClaudeImplement {
 
 function Invoke-ClaudeReview {
     param([string]$Prompt, [string]$AttemptLabel)
-    return Invoke-ClaudeWithTimeout -PhaseName "review-$AttemptLabel" -Prompt $Prompt -Model $CONST_MODEL_REVIEW -Attempt 1 -ExtraArgs @(
-        "--model", $CONST_MODEL_REVIEW,
+    $model = Get-ModelForReview
+    Add-TimelineEvent -Phase "MODEL" -Message "REVIEW nutzt $model" -Category "REVIEW_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "review-$AttemptLabel" -Prompt $Prompt -Model $model -Attempt 1 -ExtraArgs @(
+        "--model", $model,
         "--allowedTools", "Read,Glob,Grep",
         "--max-turns", $CONST_MAX_TURNS_REVIEW.ToString()
     )
@@ -590,19 +817,23 @@ try {
     }
 
     $currentPhase = "WORKTREE"
+    Ensure-DebugDir | Out-Null
     $repoRoot = (Invoke-NativeCommand git @("rev-parse", "--show-toplevel")).output
     Ensure-ArtifactDir -Root $repoRoot | Out-Null
+    Write-DebugManifest
 
     $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
     $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch "^\s*$|^##" } | Select-Object -First 1).Trim()
     $taskClass = Get-TaskClass -TaskText $taskPrompt
     $investigationRequired = Test-InvestigationRequired -TaskText $taskPrompt -TaskClass $taskClass
     Save-Artifact -Name "input-task.txt" -Content $taskPrompt | Out-Null
+    Save-DebugText -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired }
 
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
     $worktreePath = Join-Path $worktreeBase $TaskName
     if (-not (Test-Path $worktreeBase)) { New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null }
+    Write-DebugManifest
 
     Write-Host "[WORKTREE] Erstelle $branchName..."
     $r = Invoke-NativeCommand git @("worktree", "add", $worktreePath, "-b", $branchName)
@@ -615,6 +846,7 @@ try {
     $targetUri = [System.Uri]::new($SolutionPath)
     $relSln = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
     $worktreeSln = Join-Path $worktreePath $relSln
+    Write-DebugManifest
 
     Write-Host "[CONTEXT] Sammle Codebase-Kontext..."
     $codebaseContext = ""
@@ -641,9 +873,8 @@ try {
     } -ArgumentList $worktreeSln
 
     Set-Location $worktreePath
-    $useFastModel = ($taskClass -eq "DIRECT_EDIT")
-    $effectiveModelPlan = if ($useFastModel) { $CONST_MODEL_FAST } else { $CONST_MODEL_PLAN }
-    $effectiveModelImplement = if ($useFastModel) { $CONST_MODEL_FAST } else { $CONST_MODEL_IMPLEMENT }
+    $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets @()
+    $effectiveModelImplement = $CONST_MODEL_IMPLEMENT
     $nugetRule = if ($AllowNuget) { "- Neue NuGet-Pakete erlaubt (nur wenn benoetigt)" } else { "- Keine neuen NuGet-Pakete" }
 
     $planValidation = $null
@@ -701,6 +932,7 @@ Fuer jede relevante Datei oder Suchflaeche:
 investigationRequired: true|false
 Schreibe NUR den Plan.
 "@
+        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets
         $planResult = Invoke-ClaudePlan -Prompt $planPrompt -Model $effectiveModelPlan -Attempt $planAttempt
         if (-not $planResult.success) {
             $replanReason = "Planaufruf fehlgeschlagen: $($planResult.output)"
@@ -764,7 +996,8 @@ Ein Satz.
 
 investigationRequired: true|false
 "@
-            $repairResult = Invoke-ClaudeRepair -PhaseName "PLAN" -Prompt $repairPrompt -Model $effectiveModelPlan -Attempt (50 + $planAttempt * 10 + $repairAttempt)
+            $repairModel = Get-ModelForRepair -PhaseName "PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $planOutput -TaskText $taskPrompt
+            $repairResult = Invoke-ClaudeRepair -PhaseName "PLAN" -Prompt $repairPrompt -Model $repairModel -Attempt (50 + $planAttempt * 10 + $repairAttempt)
             if (-not $repairResult.success) { continue }
             $planOutput = $repairResult.output.Trim()
             Save-Artifact -Name "plan-v$planAttempt-repair-$repairAttempt.txt" -Content $planOutput | Out-Null
@@ -833,7 +1066,8 @@ ROOT_CAUSE:
 NEXT_ACTION:
 <konkrete naechste Aenderung oder Begruendung>
 "@
-            $investigateResult = Invoke-ClaudeInvestigate -Prompt $investigatePrompt -Model $CONST_MODEL_INVESTIGATE -Attempt $investigateAttempt
+            $investigateModel = Get-ModelForInvestigate
+            $investigateResult = Invoke-ClaudeInvestigate -Prompt $investigatePrompt -Model $investigateModel -Attempt $investigateAttempt
             if (-not $investigateResult.success) {
                 Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_CALL_FAILED" -Feedback $investigateResult.output
                 continue
@@ -868,7 +1102,7 @@ RESULT: CONFIRMED | NOT_CONFIRMED
 REASON:
 <kurze Begruendung mit konkreten Dateien oder fehlenden Belegen>
 "@
-                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model $CONST_MODEL_INVESTIGATE -Attempt (80 + $investigateAttempt)
+                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model (Get-ModelForInvestigate) -Attempt (80 + $investigateAttempt)
                 if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
                     $finalStatus = "NO_CHANGE"
                     $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
@@ -913,7 +1147,8 @@ ROOT_CAUSE:
 NEXT_ACTION:
 <konkrete naechste Aenderung oder Begruendung>
 "@
-                $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $CONST_MODEL_INVESTIGATE -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
+                $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
+                $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $repairModel -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
                 if (-not $repairResult.success) { continue }
                 $investigationOutput = $repairResult.output.Trim()
                 Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $investigationOutput | Out-Null
@@ -1005,6 +1240,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_ALREADY_SATISFIED | NO_CHANGE_TARGET_NOT_FOUN
 SUMMARY:
 <Kurze Begruendung>
 "@
+        $effectiveModelImplement = Get-ModelForImplement -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -TaskText $taskPrompt -PhaseContext $investigationBlock
         $implResult = Invoke-ClaudeImplement -Prompt $implPrompt -Model $effectiveModelImplement -Attempt $implementAttempt
         $lastImplementOutput = $implResult.output
         if (-not $implResult.success) {
@@ -1038,7 +1274,7 @@ RESULT: CONFIRMED | NOT_CONFIRMED
 REASON:
 <kurze Begruendung>
 "@
-                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model $CONST_MODEL_INVESTIGATE -Attempt (300 + $implementAttempt)
+                $verifyResult = Invoke-ClaudeInvestigate -Prompt $verifyPrompt -Model (Get-ModelForInvestigate) -Attempt (300 + $implementAttempt)
                 if ($verifyResult.success -and $verifyResult.output -match '(?im)^RESULT\s*:\s*CONFIRMED\s*$') {
                     $finalStatus = "NO_CHANGE"
                     $finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
@@ -1079,7 +1315,8 @@ WICHTIG:
 - Liefere keine weitere vage Begruendung.
 - Aendere mindestens eine Repo-Datei oder liefere ein klar begruendetes RESULT.
 "@
-                $repairImplResult = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $repairPrompt -Model $effectiveModelImplement -Attempt (400 + $implementAttempt)
+                $repairModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $implResult.output -TaskText $taskPrompt
+                $repairImplResult = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $repairPrompt -Model $repairModel -Attempt (400 + $implementAttempt) -CanWrite
                 if ($repairImplResult.success) {
                     $implResult = $repairImplResult
                     $implOutcome = Get-ImplementationOutcome -Output $implResult.output
@@ -1115,10 +1352,13 @@ WICHTIG:
             $currentPhase = "PREFLIGHT"
             Write-Host "[PREFLIGHT] Zyklus $cycleLabel..."
             $pfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflightScript, "-SolutionPath", $worktreeSln)
+            $preflightDebugDir = Join-Path (Ensure-DebugDir) "preflight\$cycleLabel"
+            $pfArgs += @("-DebugDir", $preflightDebugDir)
             if ($SkipRun) { $pfArgs += "-SkipRun" }
             if ($AllowNuget) { $pfArgs += "-AllowNuget" }
             $preflightJson = & powershell.exe @pfArgs 2>&1 | Out-String
             Save-Artifact -Name "preflight-$cycleLabel.json" -Content $preflightJson | Out-Null
+            Save-DebugText -Name "preflight-output.json" -Content $preflightJson -Subdir "preflight\$cycleLabel" | Out-Null
             try {
                 $preflight = $preflightJson | ConvertFrom-Json
             } catch {
@@ -1159,7 +1399,8 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Kurze Begruendung>
 "@
-                $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $effectiveModelImplement -Attempt (100 + $implementAttempt * 10 + $reviewCycle)
+                $preflightFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $blockerText -TaskText $taskPrompt
+                $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $preflightFixModel -Attempt (100 + $implementAttempt * 10 + $reviewCycle)
                 if (-not $fixResult.success) {
                     Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
                 }
@@ -1248,7 +1489,8 @@ BEHEBE JETZT AUSSCHLIESSLICH DIESE MINOR-PUNKTE IM BESTEHENDEN WORKTREE.
 FEEDBACK:
 $($verdict.feedback)
 "@
-                    $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $effectiveModelImplement -Attempt (500 + $implementAttempt * 10 + $reviewCycle)
+                    $minorRescueModel = Get-ModelForRepair -PhaseName "REVIEW_MINOR" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt
+                    $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $minorRescueModel -Attempt (500 + $implementAttempt * 10 + $reviewCycle) -CanWrite
                     if ($minorRescue.success) {
                         $changedFiles = Get-ChangedFiles
                         $reviewCycle = 0
@@ -1275,7 +1517,8 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Kurze Begruendung>
 "@
-            $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $effectiveModelImplement -Attempt (200 + $implementAttempt * 10 + $reviewCycle)
+            $reviewFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt
+            $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $reviewFixModel -Attempt (200 + $implementAttempt * 10 + $reviewCycle)
             if (-not $fixResult.success) {
                 Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
             }

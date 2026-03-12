@@ -4,10 +4,32 @@ param(
     [string[]]$ChangedFiles,
     [switch]$SkipRun,
     [switch]$AllowNuget,
-    [string]$ProjectPath
+    [string]$ProjectPath,
+    [string]$DebugDir
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Ensure-DebugDir {
+    if (-not $DebugDir) { return $null }
+    if (-not (Test-Path $DebugDir)) { New-Item -ItemType Directory -Path $DebugDir -Force | Out-Null }
+    return $DebugDir
+}
+
+function Save-DebugText {
+    param([string]$Name, [string]$Content)
+    $dir = Ensure-DebugDir
+    if (-not $dir) { return $null }
+    $path = Join-Path $dir $Name
+    [System.IO.File]::WriteAllText($path, $Content, [System.Text.Encoding]::UTF8)
+    return $path
+}
+
+function Save-DebugJson {
+    param($Object, [string]$Name = 'preflight-summary.json')
+    $json = $Object | ConvertTo-Json -Depth 8
+    return Save-DebugText -Name $Name -Content $json
+}
 
 function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments)
@@ -25,6 +47,14 @@ if (-not $ChangedFiles -or $ChangedFiles.Count -eq 0) {
 
 $blockers = [System.Collections.ArrayList]::new()
 $warnings = [System.Collections.ArrayList]::new()
+$runSummary = [ordered]@{
+    solutionPath = $SolutionPath
+    projectPath = $ProjectPath
+    debugDir = (Ensure-DebugDir)
+    skipRun = [bool]$SkipRun
+    allowNuget = [bool]$AllowNuget
+    startedAt = (Get-Date).ToString('o')
+}
 
 # Phase 3.3: Add-Blocker/Add-Warning mit optionalen line + suggestion Parametern
 function Add-Blocker($check, $file, $message, [int]$line = 0, [string]$suggestion = "") {
@@ -42,8 +72,15 @@ function Add-Warning($check, $file, $message, [int]$line = 0, [string]$suggestio
 }
 
 # --- BLOCKER 1: Build ---
+$buildStarted = Get-Date
 $buildOutput = dotnet build $SolutionPath --no-restore 2>&1
-if ($LASTEXITCODE -ne 0) {
+$buildExitCode = $LASTEXITCODE
+$runSummary.build = [ordered]@{
+    exitCode = $buildExitCode
+    elapsedSeconds = [math]::Round(((Get-Date) - $buildStarted).TotalSeconds, 2)
+}
+Save-DebugText -Name 'build-output.txt' -Content (($buildOutput | Out-String).Trim()) | Out-Null
+if ($buildExitCode -ne 0) {
     $errLines = ($buildOutput | Select-String "error " | Select-Object -First 5) -join "`n"
     Add-Blocker "build" $SolutionPath "Build fehlgeschlagen: $errLines"
 }
@@ -55,17 +92,34 @@ if ($blockers.Count -gt 0 -and $blockers[0].check -eq "build") {
         blockers = @($blockers)
         warnings = @($warnings)
     }
+    $runSummary.completedAt = (Get-Date).ToString('o')
+    $runSummary.passed = $false
+    $runSummary.blockers = @($blockers)
+    $runSummary.warnings = @($warnings)
+    Save-DebugJson -Object $runSummary | Out-Null
     $result | ConvertTo-Json -Depth 5
     return
 }
 
 # --- BLOCKER 2: Run startet ---
 if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
+    $runStarted = Get-Date
+    $runErrPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stderr.txt' } else { "$env:TEMP\preflight-runerr.txt" }
+    $runOutPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stdout.txt' } else { "$env:TEMP\preflight-runout.txt" }
     $runProc = Start-Process dotnet -ArgumentList "run","--project",$ProjectPath,"--no-build" `
-        -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\preflight-runerr.txt" 2>$null
+        -PassThru -NoNewWindow -RedirectStandardError $runErrPath -RedirectStandardOutput $runOutPath 2>$null
     Start-Sleep -Seconds 5
+    $runErrText = (Get-Content $runErrPath -ErrorAction SilentlyContinue | Out-String).Trim()
+    $runOutText = (Get-Content $runOutPath -ErrorAction SilentlyContinue | Out-String).Trim()
+    $runSummary.run = [ordered]@{
+        exitCode = if ($runProc.HasExited) { $runProc.ExitCode } else { $null }
+        elapsedSeconds = [math]::Round(((Get-Date) - $runStarted).TotalSeconds, 2)
+        hasExited = [bool]$runProc.HasExited
+        stderrPath = $runErrPath
+        stdoutPath = $runOutPath
+    }
     if ($runProc.HasExited -and $runProc.ExitCode -ne 0) {
-        $runErr = Get-Content "$env:TEMP\preflight-runerr.txt" -ErrorAction SilentlyContinue | Select-Object -First 3
+        $runErr = $runErrText -split "`r?`n" | Select-Object -First 3
         $errText = ($runErr -join " ").Trim()
         if ($errText -notmatch "address already in use|port.*in use") {
             Add-Blocker "run_starts" $ProjectPath "Prozess beendet mit Code $($runProc.ExitCode): $errText"
@@ -76,7 +130,10 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
     if (-not $runProc.HasExited) {
         Stop-Process -Id $runProc.Id -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item "$env:TEMP\preflight-runerr.txt" -ErrorAction SilentlyContinue
+    if (-not $DebugDir) {
+        Remove-Item $runErrPath -ErrorAction SilentlyContinue
+        Remove-Item $runOutPath -ErrorAction SilentlyContinue
+    }
 }
 
 # Phase 5.1: dotnet test (nur wenn Test-Projekte vorhanden)
@@ -88,11 +145,23 @@ $testProjects = @(Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -Error
     })
 
 if ($testProjects.Count -gt 0) {
+    $testStarted = Get-Date
     $testResult = Invoke-NativeCommand dotnet @("test",$SolutionPath,"--no-build","--verbosity","quiet")
+    $runSummary.tests = [ordered]@{
+        exitCode = $testResult.exitCode
+        elapsedSeconds = [math]::Round(((Get-Date) - $testStarted).TotalSeconds, 2)
+        discoveredProjects = $testProjects.Count
+    }
+    Save-DebugText -Name 'test-output.txt' -Content $testResult.output | Out-Null
     if ($testResult.exitCode -ne 0) {
         $failedTests = ($testResult.output -split "`n" | Select-String "Failed\s+" | Select-Object -First 5) -join "`n"
         if (-not $failedTests) { $failedTests = ($testResult.output -split "`n" | Select-Object -Last 5) -join "`n" }
         Add-Blocker "tests" $SolutionPath "Tests fehlgeschlagen: $failedTests"
+    }
+} else {
+    $runSummary.tests = [ordered]@{
+        skipped = $true
+        discoveredProjects = 0
     }
 }
 
@@ -203,4 +272,10 @@ $result = @{
     blockers = @($blockers)
     warnings = @($warnings)
 }
+$runSummary.completedAt = (Get-Date).ToString('o')
+$runSummary.passed = $result.passed
+$runSummary.blockers = @($blockers)
+$runSummary.warnings = @($warnings)
+$runSummary.changedFilesCount = @($ChangedFiles).Count
+Save-DebugJson -Object $runSummary | Out-Null
 $result | ConvertTo-Json -Depth 5

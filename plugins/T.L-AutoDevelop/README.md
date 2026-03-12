@@ -24,8 +24,17 @@ Each run writes artifacts under `.claude-develop-logs/runs/<taskName>/` and retu
 - `summary`
 - `attemptsByPhase`
 - `artifacts.runDir`
+- `artifacts.debugDir`
 - `investigationConclusion`
 - `noChangeReason`
+
+In addition, the pipeline now mirrors low-level diagnostics into `%TEMP%\claude-develop\debug\<runId>\`, including full Claude prompt/output captures, per-phase metadata, and detailed preflight build/test/run logs.
+
+## Model Policy
+
+- `INVESTIGATE` and `REVIEW` stay on Opus
+- `PLAN` may drop to Sonnet for direct edits or already-concrete targets
+- `IMPLEMENT` and narrow repair loops may use Sonnet only when file targets are concrete and the step is low-complexity
 
 ## Requirements
 
