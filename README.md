@@ -6,7 +6,7 @@ A Claude Code plugin marketplace providing .NET development pipeline tools.
 
 ### T.L-AutoDevelop (v2.3.0) — Interactive
 
-An interactive development pipeline that orchestrates Claude Code through plan, semantic plan validation, investigation, implementation, preflight, and review — with user confirmations before each commit.
+An interactive development pipeline that orchestrates Claude Code through discovery, investigation, optional bug reproduction, fix planning, implementation, preflight, and review — with user confirmations before each commit.
 
 | Command | Description |
 |---------|-------------|
@@ -15,7 +15,7 @@ An interactive development pipeline that orchestrates Claude Code through plan, 
 
 ### T.L-AutoDevelop-Pro (v2.3.0) — Autonomous
 
-A fully autonomous development pipeline — zero confirmations. Runs plan, investigation, implement, preflight, review, and commit end-to-end unattended.
+A fully autonomous development pipeline — zero confirmations. Runs discovery, investigation, optional bug reproduction, fix planning, implement, preflight, review, and commit end-to-end unattended.
 
 | Command | Description |
 |---------|-------------|
@@ -24,15 +24,17 @@ A fully autonomous development pipeline — zero confirmations. Runs plan, inves
 
 **Pipeline Flow:**
 ```
-Plan -> Plan Validate -> Investigate -> Implement -> Change Validate -> Preflight -> Review
+Discover -> Investigate -> optional Reproduce -> Fix Plan -> Implement -> Change Validate -> Verify Repro -> Preflight -> Review
 ```
 
 **New runtime behavior:**
 - Explicit no-op categories instead of generic `IMPL_FAIL`
 - Per-run artifacts under `.claude-develop-logs/runs/<taskName>/`
 - Per-run temp debug bundles under `%TEMP%\claude-develop\debug\<runId>\`
+- Discovery-first routing before detailed planning
 - Investigation phase for ambiguous or diagnostic tasks
-- Semantic plan validation that rejects placeholder/template plans
+- Optional failing-test reproduction for testable bugfix work
+- Semantic fix-plan validation that rejects placeholder/template plans
 - Batch launchers should cap concurrency at 2 simultaneous pipelines
 - Conditional Sonnet usage for low-risk planning, implementation, and repair phases
 

@@ -13,13 +13,16 @@ $CONST_MODEL_INVESTIGATE = "claude-opus-4-6"
 $CONST_MODEL_IMPLEMENT = "claude-opus-4-6"
 $CONST_MODEL_REVIEW = "claude-opus-4-6"
 $CONST_MODEL_FAST = "claude-sonnet-4-6"
+$CONST_MAX_TURNS_DISCOVER = 20
 $CONST_MAX_TURNS_PLAN = 30
 $CONST_MAX_TURNS_INVESTIGATE = 20
 $CONST_MAX_TURNS_IMPL = 30
 $CONST_MAX_TURNS_REVIEW = 10
 $CONST_TIMEOUT_SECONDS = 900
+$CONST_DISCOVER_ATTEMPTS = 2
 $CONST_PLAN_ATTEMPTS = 2
 $CONST_INVESTIGATION_ATTEMPTS = 2
+$CONST_REPRODUCE_ATTEMPTS = 2
 $CONST_IMPLEMENT_ATTEMPTS = 2
 $CONST_REMEDIATION_ATTEMPTS = 2
 $CONST_REPAIR_ATTEMPTS = 2
@@ -37,8 +40,12 @@ $runId = $null
 $timeline = [System.Collections.ArrayList]::new()
 $feedbackHistory = [System.Collections.ArrayList]::new()
 $attemptsByPhase = [ordered]@{
+    discover = 0
     plan = 0
+    fixPlan = 0
     investigate = 0
+    reproduce = 0
+    verifyRepro = 0
     implement = 0
     remediate = 0
     review = 0
@@ -55,6 +62,25 @@ $investigationRequired = $false
 $investigationConclusion = ""
 $taskClass = "UNCERTAIN"
 $lastNoChangeReason = ""
+$discoverConclusion = ""
+$routeDecision = "UNCERTAIN"
+$testability = "UNKNOWN"
+$testProjects = @()
+$reproductionAttempted = $false
+$reproductionConfirmed = $false
+$reproductionOutput = ""
+$reproductionBaselinePatch = ""
+$reproductionBaselineFiles = @()
+$reproductionTests = [ordered]@{
+    testProjects = @()
+    testFiles = @()
+    testNames = @()
+    testFilter = ""
+    bugBehavior = ""
+    rationale = ""
+    verificationOutput = ""
+}
+$targetedVerificationPassed = $false
 
 Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
 
@@ -81,6 +107,18 @@ function Add-TimelineEvent {
         category = $Category
         data = $Data
     })
+}
+
+function New-EmptyReproductionTests {
+    return [ordered]@{
+        testProjects = @()
+        testFiles = @()
+        testNames = @()
+        testFilter = ""
+        bugBehavior = ""
+        rationale = ""
+        verificationOutput = ""
+    }
 }
 
 function Get-SafeFileToken {
@@ -210,6 +248,9 @@ function Write-DebugManifest {
         updatedAt = (Get-Date).ToString("o")
         skipRun = [bool]$SkipRun
         allowNuget = [bool]$AllowNuget
+        routeDecision = $routeDecision
+        testability = $testability
+        reproductionConfirmed = [bool]$reproductionConfirmed
     }
     Save-DebugJson -Name "manifest.json" -Object $manifest | Out-Null
 }
@@ -252,6 +293,337 @@ function Get-ActionableItems {
     foreach ($match in $replaceMatches) { [void]$items.Add($match.Value.Trim()) }
 
     return @($items | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-RelativePath {
+    param([string]$BasePath, [string]$TargetPath)
+    if (-not $BasePath -or -not $TargetPath) { return $TargetPath }
+    try {
+        $baseResolved = (Resolve-Path $BasePath).Path
+    } catch {
+        $baseResolved = $BasePath
+    }
+    try {
+        $targetResolved = (Resolve-Path $TargetPath).Path
+    } catch {
+        $targetResolved = $TargetPath
+    }
+    $baseUri = [System.Uri]::new($baseResolved.TrimEnd('\') + "\")
+    $targetUri = [System.Uri]::new($targetResolved)
+    return [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
+}
+
+function Get-SectionLines {
+    param([string]$Text, [string]$Header)
+    $lines = [System.Collections.ArrayList]::new()
+    if (-not $Text -or -not $Header) { return @($lines) }
+    $capture = $false
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match ("^\s*" + [regex]::Escape($Header) + "\s*:\s*$")) {
+            $capture = $true
+            continue
+        }
+        if ($capture -and $line -match '^[A-Z_]+\s*:') {
+            break
+        }
+        if ($capture) {
+            [void]$lines.Add($line)
+        }
+    }
+    return @($lines)
+}
+
+function Get-BulletSectionValues {
+    param([string]$Text, [string]$Header)
+    return @(Get-SectionLines -Text $Text -Header $Header |
+        ForEach-Object {
+            if ($_ -match '^\s*-\s+(.+?)\s*$') { $Matches[1].Trim() }
+        } |
+        Where-Object { $_ } |
+        Select-Object -Unique)
+}
+
+function Get-ScalarSectionText {
+    param([string]$Text, [string]$Header)
+    $sectionLines = Get-SectionLines -Text $Text -Header $Header
+    return (($sectionLines | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join "`n").Trim()
+}
+
+function Get-TestProjectInventory {
+    param(
+        [string]$SolutionPath,
+        [string]$WorktreeRoot
+    )
+    $slnDir = Split-Path $SolutionPath -Parent
+    if (-not $WorktreeRoot) { $WorktreeRoot = (Get-Location).Path }
+    $listedProjects = @{}
+    $slnListResult = Invoke-NativeCommand dotnet @("sln", $SolutionPath, "list")
+    if ($slnListResult.exitCode -eq 0) {
+        foreach ($line in ($slnListResult.output -split "`r?`n")) {
+            $trimmed = $line.Trim()
+            if (-not $trimmed -or $trimmed -match '^Project\(s\)$|^-+$') { continue }
+            $listedProjects[$trimmed.Replace("/", "\").ToLowerInvariant()] = $true
+        }
+    }
+
+    $inventory = [System.Collections.ArrayList]::new()
+    $projectFiles = Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -File -ErrorAction SilentlyContinue
+    foreach ($project in $projectFiles) {
+        try {
+            $content = [System.IO.File]::ReadAllText($project.FullName, [System.Text.Encoding]::UTF8)
+        } catch {
+            continue
+        }
+        if ($content -notmatch 'Microsoft\.NET\.Test\.Sdk|xunit|NUnit|MSTest') { continue }
+
+        $solutionRelPath = Get-RelativePath -BasePath $slnDir -TargetPath $project.FullName
+        $solutionDirRelPath = Get-RelativePath -BasePath $slnDir -TargetPath $project.Directory.FullName
+        $worktreeRelPath = Get-RelativePath -BasePath $WorktreeRoot -TargetPath $project.FullName
+        $worktreeDirRelPath = Get-RelativePath -BasePath $WorktreeRoot -TargetPath $project.Directory.FullName
+        $testFiles = @(Get-ChildItem -Path $project.Directory.FullName -Recurse -Include "*.cs" -File -ErrorAction SilentlyContinue)
+        $likelyType = if ($project.FullName -match '(?i)integration|functional|e2e') { "integration" } else { "unit" }
+        [void]$inventory.Add([ordered]@{
+            name = $project.BaseName
+            relPath = $worktreeRelPath
+            fullPath = $project.FullName
+            directoryRelPath = $worktreeDirRelPath
+            solutionRelativePath = $solutionRelPath
+            solutionRelativeDirectory = $solutionDirRelPath
+            worktreeRelativePath = $worktreeRelPath
+            worktreeRelativeDirectory = $worktreeDirRelPath
+            listedInSolution = [bool]$listedProjects.ContainsKey($solutionRelPath.ToLowerInvariant())
+            testFileCount = $testFiles.Count
+            likelyType = $likelyType
+        })
+    }
+    return @($inventory)
+}
+
+function Format-TestProjectsForPrompt {
+    param($Projects)
+    if (-not $Projects -or $Projects.Count -eq 0) { return "- Keine Testprojekte erkannt." }
+    return ($Projects | ForEach-Object {
+        "- $($_.relPath) [listed=$($_.listedInSolution); type=$($_.likelyType); files=$($_.testFileCount)]"
+    }) -join "`n"
+}
+
+function Get-DiscoveryVerdict {
+    param(
+        [string]$Output,
+        $TestProjects
+    )
+
+    $route = "UNCERTAIN"
+    if ($Output -match '(?im)^ROUTE\s*:\s*(DIRECT_EDIT|BUGFIX_TESTABLE|BUGFIX_NONTESTABLE|UNCERTAIN)\s*$') {
+        $route = $Matches[1].ToUpperInvariant()
+    }
+
+    $bugConfidence = "LOW"
+    if ($Output -match '(?im)^BUG_CONFIDENCE\s*:\s*(HIGH|MEDIUM|LOW)\s*$') {
+        $bugConfidence = $Matches[1].ToUpperInvariant()
+    }
+
+    $parsedTestability = if ($Output -match '(?im)^TESTABILITY\s*:\s*(YES|NO|UNKNOWN)\s*$') {
+        $Matches[1].ToUpperInvariant()
+    } elseif ($TestProjects.Count -eq 0) {
+        "NO"
+    } else {
+        "UNKNOWN"
+    }
+
+    $targetHints = Get-BulletSectionValues -Text $Output -Header "TARGET_HINTS"
+    if ($targetHints.Count -eq 0) {
+        $targetHints = @(Get-ActionableItems -Text $Output | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' })
+    }
+
+    $rationale = Get-ScalarSectionText -Text $Output -Header "RATIONALE"
+    $nextPhase = if ($Output -match '(?im)^NEXT_PHASE\s*:\s*(FIX_PLAN|INVESTIGATE|REPRODUCE)\s*$') {
+        $Matches[1].ToUpperInvariant()
+    } else {
+        ""
+    }
+
+    if ($TestProjects.Count -eq 0) {
+        if ($route -eq "BUGFIX_TESTABLE") { $route = "BUGFIX_NONTESTABLE" }
+        if ($parsedTestability -eq "YES") { $parsedTestability = "NO" }
+    }
+
+    if (-not $nextPhase) {
+        switch ($route) {
+            "DIRECT_EDIT" { $nextPhase = "FIX_PLAN" }
+            "BUGFIX_TESTABLE" { $nextPhase = "INVESTIGATE" }
+            "BUGFIX_NONTESTABLE" { $nextPhase = "INVESTIGATE" }
+            default { $nextPhase = "INVESTIGATE" }
+        }
+    }
+
+    return [ordered]@{
+        route = $route
+        bugConfidence = $bugConfidence
+        testability = $parsedTestability
+        targetHints = @($targetHints | Select-Object -Unique)
+        rationale = $rationale
+        nextPhase = $nextPhase
+        summary = $Output.Trim()
+    }
+}
+
+function Test-ReproductionChangeSet {
+    param(
+        [string[]]$ChangedFiles,
+        $TestProjects
+    )
+
+    $allowedPrefixes = @($TestProjects | ForEach-Object {
+        ($_.directoryRelPath.Replace("/", "\").TrimEnd('\')) + "\"
+    })
+    $allowedProjectFiles = @($TestProjects | ForEach-Object { $_.relPath.Replace("/", "\") })
+    $invalidFiles = [System.Collections.ArrayList]::new()
+
+    foreach ($file in @($ChangedFiles)) {
+        $normalized = $file.Replace("/", "\").TrimStart(@('.', '\'))
+        $allowed = $allowedProjectFiles -contains $normalized
+        if (-not $allowed) {
+            foreach ($prefix in $allowedPrefixes) {
+                if ($normalized.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $allowed = $true
+                    break
+                }
+            }
+        }
+        if (-not $allowed) {
+            [void]$invalidFiles.Add($file)
+        }
+    }
+
+    return [ordered]@{
+        valid = ($invalidFiles.Count -eq 0 -and @($ChangedFiles).Count -gt 0)
+        invalidFiles = @($invalidFiles)
+    }
+}
+
+function Get-TestFilterFromNames {
+    param([string[]]$TestNames)
+    $clauses = @()
+    foreach ($name in @($TestNames | Select-Object -First 6)) {
+        $fragment = $name.Trim()
+        if ($fragment -match '^[^(]+') { $fragment = $Matches[0].Trim() }
+        $fragment = $fragment.Replace('"', '').Trim()
+        if (-not $fragment) { continue }
+        $clauses += "FullyQualifiedName~$fragment"
+    }
+    return ($clauses -join "|")
+}
+
+function Invoke-TargetedTestRun {
+    param(
+        [string]$SolutionPath,
+        [string[]]$ProjectPaths = @(),
+        [string]$TestFilter = "",
+        [bool]$ExpectFailure = $false,
+        [switch]$NoBuild
+    )
+
+    $targets = if ($ProjectPaths -and $ProjectPaths.Count -gt 0) { @($ProjectPaths) } else { @($SolutionPath) }
+    $outputs = [System.Collections.ArrayList]::new()
+    $failureObserved = $false
+    $allPassed = $true
+    $matchedNoTests = $false
+    $commandError = $false
+    $testFailureObserved = $false
+
+    foreach ($target in $targets) {
+        $args = @("test", $target, "--verbosity", "quiet")
+        if ($NoBuild) {
+            $args += "--no-build"
+        }
+        if ($TestFilter) {
+            $args += @("--filter", $TestFilter)
+        }
+        $result = Invoke-NativeCommand dotnet $args
+        $header = "> dotnet " + ($args -join " ")
+        [void]$outputs.Add(($header + "`n" + $result.output).Trim())
+        if ($result.output -match '(?im)matched no test|no test is available') {
+            $matchedNoTests = $true
+        }
+        if ($result.output -match '(?im)project file does not exist|msbuild\s*: error|unknown switch|invalid argument') {
+            $commandError = $true
+        }
+        if ($result.output -match '(?im)\bfailed!\b|\bfailed:\s*[1-9]') {
+            $testFailureObserved = $true
+        }
+        if ($result.exitCode -ne 0) {
+            $failureObserved = $true
+            $allPassed = $false
+        }
+    }
+
+    if ($matchedNoTests -or $commandError) {
+        $allPassed = $false
+    }
+
+    return [ordered]@{
+        targets = @($targets)
+        testFilter = $TestFilter
+        output = (($outputs -join "`n`n").Trim())
+        failureObserved = [bool]$failureObserved
+        allPassed = [bool]$allPassed
+        matchedNoTests = [bool]$matchedNoTests
+        commandError = [bool]$commandError
+        testFailureObserved = [bool]$testFailureObserved
+        exitCode = if ($allPassed) { 0 } else { 1 }
+        expectFailure = [bool]$ExpectFailure
+    }
+}
+
+function Get-WorktreeFileSnapshot {
+    param([string[]]$Files)
+    $snapshot = [System.Collections.ArrayList]::new()
+    foreach ($file in @($Files | Where-Object { $_ })) {
+        $normalized = $file.Replace("/", "\")
+        $entry = [ordered]@{
+            path = $normalized
+            exists = (Test-Path $normalized)
+            content = ""
+        }
+        if ($entry.exists) {
+            $entry.content = [System.IO.File]::ReadAllText((Resolve-Path $normalized).Path, [System.Text.Encoding]::UTF8)
+        }
+        [void]$snapshot.Add($entry)
+    }
+    return @($snapshot)
+}
+
+function Restore-WorktreeBaseline {
+    param(
+        [string]$PatchContent,
+        $FileSnapshot = @()
+    )
+    Reset-Worktree
+    if ($PatchContent -and $PatchContent.Trim()) {
+        $tempDir = Join-Path $env:TEMP "claude-develop"
+        if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+        $patchFile = Join-Path $tempDir "repro-baseline-$(New-Guid).patch"
+        [System.IO.File]::WriteAllText($patchFile, $PatchContent, [System.Text.Encoding]::UTF8)
+        try {
+            $applyResult = Invoke-NativeCommand git @("apply", "--whitespace=nowarn", $patchFile)
+            if ($applyResult.exitCode -ne 0) {
+                throw [System.Exception]::new("REPRO_BASELINE_APPLY_FAILED: $($applyResult.output)")
+            }
+        } finally {
+            Remove-Item $patchFile -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($entry in @($FileSnapshot)) {
+        $targetPath = Join-Path (Get-Location).Path $entry.path
+        if ($entry.exists) {
+            $targetDir = Split-Path $targetPath -Parent
+            if ($targetDir -and -not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+            [System.IO.File]::WriteAllText($targetPath, [string]$entry.content, [System.Text.Encoding]::UTF8)
+        } elseif (Test-Path $targetPath) {
+            Remove-Item $targetPath -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Test-HasActionableSignal {
@@ -313,7 +685,7 @@ function Get-ModelForRepair {
         [string]$PreviousOutput = "",
         [string]$TaskText = ""
     )
-    if ($PhaseName -eq "PLAN") { return $CONST_MODEL_FAST }
+    if ($PhaseName -in @("PLAN", "FIX_PLAN")) { return $CONST_MODEL_FAST }
     if ($PhaseName -eq "INVESTIGATE") {
         if (Test-HasActionableSignal -Text $PreviousOutput) { return $CONST_MODEL_FAST }
         return $CONST_MODEL_INVESTIGATE
@@ -381,6 +753,9 @@ function Invoke-ClaudeRepair {
     if ($PhaseName -eq "PLAN") {
         return Invoke-ClaudePlan -Prompt $Prompt -Model $Model -Attempt $Attempt
     }
+    if ($PhaseName -eq "FIX_PLAN") {
+        return Invoke-ClaudeFixPlan -Prompt $Prompt -Model $Model -Attempt $Attempt
+    }
     return Invoke-ClaudeInvestigate -Prompt $Prompt -Model $Model -Attempt $Attempt
 }
 
@@ -413,6 +788,17 @@ function Format-FeedbackHistory {
     return ($parts -join "`n`n")
 }
 
+function Get-TotalAttempts {
+    $effectiveAttempts = [ordered]@{}
+    foreach ($entry in $attemptsByPhase.GetEnumerator()) {
+        $effectiveAttempts[$entry.Key] = $entry.Value
+    }
+    if ($effectiveAttempts.Contains("fixPlan") -and $effectiveAttempts["fixPlan"] -gt 0 -and $effectiveAttempts.Contains("plan")) {
+        $effectiveAttempts["plan"] = 0
+    }
+    return (($effectiveAttempts.Values | Measure-Object -Sum).Sum)
+}
+
 function Write-TimelineArtifact {
     if ($artifactRunDir) {
         Save-JsonArtifact -Name "timeline.json" -Object @($timeline) | Out-Null
@@ -435,7 +821,15 @@ function Write-ResultJson {
         [string]$severity = "",
         [string]$phase = "",
         [string]$investigationConclusion = "",
-        [string]$noChangeReason = ""
+        [string]$noChangeReason = "",
+        [string]$discoverConclusion = "",
+        [string]$route = "",
+        [string]$testability = "",
+        $testProjects = @(),
+        [bool]$reproductionAttempted = $false,
+        [bool]$reproductionConfirmed = $false,
+        $reproductionTests = $null,
+        [bool]$targetedVerificationPassed = $false
     )
     $result = [ordered]@{
         status = $status
@@ -449,7 +843,7 @@ function Write-ResultJson {
         taskName = $TaskName
         severity = $severity
         summary = $summary
-        attempts = ($attemptsByPhase.Values | Measure-Object -Sum).Sum
+        attempts = Get-TotalAttempts
         attemptsByPhase = $attemptsByPhase
         artifacts = [ordered]@{
             runDir = $artifactRunDir
@@ -458,7 +852,15 @@ function Write-ResultJson {
         }
         planVersion = $planVersion
         investigationRequired = $investigationRequired
+        discoverConclusion = $discoverConclusion
+        route = $route
+        testability = $testability
+        testProjects = @($testProjects)
         investigationConclusion = $investigationConclusion
+        reproductionAttempted = [bool]$reproductionAttempted
+        reproductionConfirmed = [bool]$reproductionConfirmed
+        reproductionTests = if ($reproductionTests) { $reproductionTests } else { [ordered]@{} }
+        targetedVerificationPassed = [bool]$targetedVerificationPassed
         noChangeReason = $noChangeReason
         taskClass = $taskClass
     } | ConvertTo-Json -Depth 8
@@ -603,10 +1005,30 @@ function Invoke-ClaudeWithTimeout {
     return @{ success = ($exitCode -eq 0); output = $output; timedOut = $false; exitCode = $exitCode }
 }
 
+function Invoke-ClaudeDiscover {
+    param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "DISCOVER nutzt $Model" -Category "DISCOVER_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "discover-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
+        "--model", $Model,
+        "--allowedTools", "Read,Glob,Grep",
+        "--max-turns", $CONST_MAX_TURNS_DISCOVER.ToString()
+    )
+}
+
 function Invoke-ClaudePlan {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
     Add-TimelineEvent -Phase "MODEL" -Message "PLAN nutzt $Model" -Category "PLAN_MODEL"
     return Invoke-ClaudeWithTimeout -PhaseName "plan-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
+        "--model", $Model,
+        "--allowedTools", "Read,Glob,Grep",
+        "--max-turns", $CONST_MAX_TURNS_PLAN.ToString()
+    )
+}
+
+function Invoke-ClaudeFixPlan {
+    param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "FIX_PLAN nutzt $Model" -Category "FIX_PLAN_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "fix-plan-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
         "--model", $Model,
         "--allowedTools", "Read,Glob,Grep",
         "--max-turns", $CONST_MAX_TURNS_PLAN.ToString()
@@ -627,6 +1049,17 @@ function Invoke-ClaudeImplement {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
     Add-TimelineEvent -Phase "MODEL" -Message "IMPLEMENT nutzt $Model" -Category "IMPLEMENT_MODEL"
     return Invoke-ClaudeWithTimeout -PhaseName "implement-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2) -ExtraArgs @(
+        "--model", $Model,
+        "--dangerously-skip-permissions",
+        "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
+        "--max-turns", $CONST_MAX_TURNS_IMPL.ToString()
+    )
+}
+
+function Invoke-ClaudeReproduce {
+    param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "REPRODUCE nutzt $Model" -Category "REPRODUCE_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "reproduce-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2) -ExtraArgs @(
         "--model", $Model,
         "--dangerously-skip-permissions",
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
@@ -733,13 +1166,94 @@ function Get-InvestigationVerdict {
         $result = "CHANGE_NEEDED"
     }
 
-    $targetMatches = [regex]::Matches($Output, "(?im)^-\s+(.+)$")
-    $targets = @($targetMatches | ForEach-Object { $_.Groups[1].Value.Trim() } | Where-Object { $_ })
+    $targets = Get-BulletSectionValues -Text $Output -Header "TARGET_FILES"
+    if ($targets.Count -eq 0) {
+        $targets = @(Get-ActionableItems -Text $Output | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' })
+    }
     return [ordered]@{
         result = $result
         targets = @($targets | Select-Object -Unique)
+        testability = if ($Output -match '(?im)^TESTABILITY_REASSESSMENT\s*:\s*(YES|NO|UNKNOWN)\s*$') {
+            $Matches[1].ToUpperInvariant()
+        } else {
+            "UNKNOWN"
+        }
+        nextPhase = if ($Output -match '(?im)^RECOMMENDED_NEXT_PHASE\s*:\s*(FIX_PLAN|REPRODUCE)\s*$') {
+            $Matches[1].ToUpperInvariant()
+        } else {
+            "FIX_PLAN"
+        }
         summary = $Output.Trim()
     }
+}
+
+function Get-ReproductionVerdict {
+    param([string]$Output)
+    $result = "INCONCLUSIVE"
+    if ($Output -match '(?im)^RESULT\s*:\s*(REPRODUCED|NOT_REPRODUCED|INCONCLUSIVE)\s*$') {
+        $result = $Matches[1].ToUpperInvariant()
+    }
+
+    $testNames = Get-BulletSectionValues -Text $Output -Header "TEST_NAMES"
+    $testProjects = Get-BulletSectionValues -Text $Output -Header "TEST_PROJECTS"
+    $testFiles = Get-BulletSectionValues -Text $Output -Header "TEST_FILES"
+    $testFilter = ""
+    if ($Output -match '(?im)^TEST_FILTER\s*:\s*(.+)$') {
+        $testFilter = $Matches[1].Trim()
+    }
+    if (-not $testFilter -and $testNames.Count -gt 0) {
+        $testFilter = Get-TestFilterFromNames -TestNames $testNames
+    }
+
+    return [ordered]@{
+        result = $result
+        testProjects = @($testProjects | Select-Object -Unique)
+        testFiles = @($testFiles | Select-Object -Unique)
+        testNames = @($testNames | Select-Object -Unique)
+        testFilter = $testFilter
+        bugBehavior = Get-ScalarSectionText -Text $Output -Header "BUG_BEHAVIOR"
+        rationale = Get-ScalarSectionText -Text $Output -Header "RATIONALE"
+        summary = $Output.Trim()
+    }
+}
+
+function Resolve-TestProjectPaths {
+    param(
+        [string[]]$RequestedProjects,
+        $TestProjects
+    )
+
+    $resolved = [System.Collections.ArrayList]::new()
+    foreach ($requested in @($RequestedProjects | Where-Object { $_ })) {
+        $normalized = $requested.Replace("/", "\").Trim()
+        if (-not $normalized) { continue }
+
+        $exactMatches = @($TestProjects | Where-Object {
+            $candidates = @(
+                $_.relPath,
+                $_.worktreeRelativePath,
+                $_.solutionRelativePath,
+                $_.fullPath
+            ) | Where-Object { $_ }
+            ($candidates | ForEach-Object { $_.Replace("/", "\").Trim() }) -contains $normalized
+        })
+        if ($exactMatches.Count -eq 1) {
+            [void]$resolved.Add($exactMatches[0].relPath)
+            continue
+        }
+
+        $nameMatches = @($TestProjects | Where-Object {
+            $requestedFile = [System.IO.Path]::GetFileName($normalized)
+            $_.name -eq $normalized -or
+            [System.IO.Path]::GetFileName($_.relPath) -eq $requestedFile -or
+            [System.IO.Path]::GetFileName($_.fullPath) -eq $requestedFile
+        })
+        if ($nameMatches.Count -eq 1) {
+            [void]$resolved.Add($nameMatches[0].relPath)
+        }
+    }
+
+    return @($resolved | Select-Object -Unique)
 }
 
 function Get-ImplementationOutcome {
@@ -790,7 +1304,7 @@ function Write-PipelineLog {
         task = $Task
         status = $Status
         finalCategory = $FinalCategory
-        attempts = ($attemptsByPhase.Values | Measure-Object -Sum).Sum
+        attempts = Get-TotalAttempts
         attemptsByPhase = $attemptsByPhase
         failureReasons = @($FailureReasons)
         changedFiles = @($Files)
@@ -842,7 +1356,7 @@ try {
         exit 1
     }
 
-    $baseUri = [System.Uri]::new($repoRoot.TrimEnd("\") + "\")
+    $baseUri = [System.Uri]::new($repoRoot.TrimEnd('\') + "\")
     $targetUri = [System.Uri]::new($SolutionPath)
     $relSln = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
     $worktreeSln = Join-Path $worktreePath $relSln
@@ -877,146 +1391,76 @@ try {
     $effectiveModelImplement = $CONST_MODEL_IMPLEMENT
     $nugetRule = if ($AllowNuget) { "- Neue NuGet-Pakete erlaubt (nur wenn benoetigt)" } else { "- Keine neuen NuGet-Pakete" }
 
+    $testProjects = @(Get-TestProjectInventory -SolutionPath $worktreeSln -WorktreeRoot $worktreePath)
+    Save-JsonArtifact -Name "test-projects.json" -Object $testProjects | Out-Null
+    $testProjectPromptText = Format-TestProjectsForPrompt -Projects $testProjects
+    Add-TimelineEvent -Phase "DISCOVER" -Message "Testprojekt-Inventar erfasst." -Category "TEST_PROJECTS" -Data @{ count = $testProjects.Count }
+
     $planValidation = $null
     $planOutput = ""
     $planTargets = @()
     $replanReason = ""
     $salvagedPlanTargets = @()
-    for ($planAttempt = 1; $planAttempt -le $CONST_PLAN_ATTEMPTS; $planAttempt++) {
-        $currentPhase = "PLAN"
-        $attemptsByPhase.plan = $planAttempt
-        $planVersion = $planAttempt
-        Write-Host "[PLAN] Versuch $planAttempt/$CONST_PLAN_ATTEMPTS..."
-        $replanBlock = if ($replanReason) { "`nKRITIK AM VORHERIGEN PLAN:`n$replanReason`n" } else { "" }
-        $planPrompt = @"
-Analysiere das Codebase und erstelle einen umsetzbaren Implementierungsplan.
+    $discoverOutput = ""
+    $discoverVerdict = [ordered]@{
+        route = if ($taskClass -eq "DIRECT_EDIT") { "DIRECT_EDIT" } else { "UNCERTAIN" }
+        bugConfidence = if ($taskClass -eq "DIRECT_EDIT") { "LOW" } else { "MEDIUM" }
+        testability = if ($testProjects.Count -gt 0) { "UNKNOWN" } else { "NO" }
+        targetHints = @()
+        rationale = ""
+        nextPhase = if ($taskClass -eq "DIRECT_EDIT") { "FIX_PLAN" } else { "INVESTIGATE" }
+        summary = ""
+    }
+    $discoverCritique = ""
+    for ($discoverAttempt = 1; $discoverAttempt -le $CONST_DISCOVER_ATTEMPTS; $discoverAttempt++) {
+        $currentPhase = "DISCOVER"
+        $attemptsByPhase.discover = $discoverAttempt
+        Write-Host "[DISCOVER] Versuch $discoverAttempt/$CONST_DISCOVER_ATTEMPTS..."
+        $discoverCritiqueBlock = if ($discoverCritique) { "`nKRITIK AM VORHERIGEN DISCOVER-ERGEBNIS:`n$discoverCritique`n" } else { "" }
+        $discoverPrompt = @"
+Analysiere den Task read-only und entscheide den naechsten Pipeline-Schritt. Liefere KEINEN Implementierungsplan.
 
 AUFGABE:
 $taskPrompt
 
 SOLUTION: $worktreeSln
-
 TASK_CLASS: $taskClass
-INVESTIGATION_REQUIRED_DEFAULT: $investigationRequired
+
+ERKANNTE TESTPROJEKTE:
+$testProjectPromptText
 
 CODEBASE KONTEXT:
 $codebaseContext
-$replanBlock
-REGELN:
-- Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
-- Kein throw new NotImplementedException()
-- Max 1 Top-Level Typdeklaration pro Datei (nested/partial OK)
-$nugetRule
-- Kommentare auf Deutsch, minimal
-- MessageService.ShowMessageBox statt MessageBox.Show
-- Kein Dispatcher.Invoke/BeginInvoke wenn vermeidbar
-- Wenn Ziel unklar ist: investigationRequired: true setzen und die Suchziele benennen
-
+$discoverCritiqueBlock
 AUSGABEFORMAT:
-## Ziel
-Ein Satz.
-
-## Dateien
-Fuer jede relevante Datei oder Suchflaeche:
-- Pfad: <konkreter relativer Pfad ODER Suchmuster>
-- Aktion: ERSTELLEN | AENDERN | LOESCHEN | PRUEFEN
-- Aenderungen: <konkrete erwartete Aenderung oder Untersuchung>
-
-## Reihenfolge
-1. <konkreter Schritt>
-2. <konkreter Schritt>
-
-## Einschraenkungen
-- <konkretes Risiko>
-
-investigationRequired: true|false
-Schreibe NUR den Plan.
+ROUTE: DIRECT_EDIT | BUGFIX_TESTABLE | BUGFIX_NONTESTABLE | UNCERTAIN
+BUG_CONFIDENCE: HIGH | MEDIUM | LOW
+TESTABILITY: YES | NO | UNKNOWN
+TARGET_HINTS:
+- <konkreter Pfad oder Suchmuster>
+RATIONALE:
+<kurze evidenzbasierte Begruendung>
+NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
 "@
-        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets
-        $planResult = Invoke-ClaudePlan -Prompt $planPrompt -Model $effectiveModelPlan -Attempt $planAttempt
-        if (-not $planResult.success) {
-            $replanReason = "Planaufruf fehlgeschlagen: $($planResult.output)"
-            Add-FeedbackEntry -Attempt $planAttempt -Source "PLAN" -Category "PLAN_CALL_FAILED" -Feedback $planResult.output
-            Add-TimelineEvent -Phase "PLAN" -Message "Planaufruf fehlgeschlagen." -Category "PLAN_CALL_FAILED"
+        $discoverModel = Get-ModelForPlan -TaskClass $taskClass -Targets @()
+        $discoverResult = Invoke-ClaudeDiscover -Prompt $discoverPrompt -Model $discoverModel -Attempt $discoverAttempt
+        if (-not $discoverResult.success) {
+            $discoverCritique = "Discover-Aufruf fehlgeschlagen: $($discoverResult.output)"
+            Add-FeedbackEntry -Attempt $discoverAttempt -Source "DISCOVER" -Category "DISCOVER_CALL_FAILED" -Feedback $discoverResult.output
             continue
         }
 
-        $planOutput = $planResult.output.Trim()
-        Save-Artifact -Name "plan-v$planAttempt.txt" -Content $planOutput | Out-Null
-        $planValidation = Get-PlanValidation -Plan $planOutput
-        Save-JsonArtifact -Name "plan-v$planAttempt-validation.json" -Object $planValidation | Out-Null
-        if ($planValidation.valid) {
-            $planTargets = $planValidation.targets
-            if ($planValidation.investigationRequired) { $investigationRequired = $true }
-            Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan akzeptiert." -Category "PLAN_VALID" -Data @{ targets = $planTargets; investigationRequired = $investigationRequired }
-            break
+        $discoverOutput = $discoverResult.output.Trim()
+        Save-Artifact -Name "discover-v$discoverAttempt.txt" -Content $discoverOutput | Out-Null
+        $discoverVerdict = Get-DiscoveryVerdict -Output $discoverOutput -TestProjects $testProjects
+        $routeDecision = $discoverVerdict.route
+        $testability = $discoverVerdict.testability
+        $discoverConclusion = "$routeDecision/$testability"
+        if ($discoverVerdict.targetHints.Count -gt 0) {
+            $planTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
         }
-
-        $replanReason = ($planValidation.issues -join "`n")
-        Add-FeedbackEntry -Attempt $planAttempt -Source "PLAN" -Category "PLAN_INSUFFICIENT" -Feedback $replanReason
-        Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan wurde verworfen." -Category "PLAN_INSUFFICIENT" -Data @{ issues = $planValidation.issues }
-        $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
-        if ($salvagedPlanTargets.Count -gt 0) {
-            $planTargets = @($salvagedPlanTargets | Select-Object -Unique)
-            $planValidation.valid = $true
-            Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan via Salvage fortgesetzt." -Category "PLAN_SALVAGED" -Data @{ targets = $planTargets }
-            break
-        }
-
-        for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
-            $repairBlock = Get-RepairBlock -FailureCode "PLAN_MISSING_TARGETS" -Reasons $planValidation.issues -PreviousOutput $planOutput
-            $repairPrompt = @"
-$repairBlock
-
-ERSTELLE JETZT EINEN KORRIGIERTEN PLAN FUER DENSELBEN TASK.
-
-AUFGABE:
-$taskPrompt
-
-SOLUTION: $worktreeSln
-
-CODEBASE KONTEXT:
-$codebaseContext
-
-AUSGABEFORMAT:
-## Ziel
-Ein Satz.
-
-## Dateien
-- Pfad: <konkreter relativer Pfad ODER Suchmuster>
-- Aktion: ERSTELLEN | AENDERN | LOESCHEN | PRUEFEN
-- Aenderungen: <konkrete erwartete Aenderung oder Untersuchung>
-
-## Reihenfolge
-1. <konkreter Schritt>
-2. <konkreter Schritt>
-
-## Einschraenkungen
-- <konkretes Risiko>
-
-investigationRequired: true|false
-"@
-            $repairModel = Get-ModelForRepair -PhaseName "PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $planOutput -TaskText $taskPrompt
-            $repairResult = Invoke-ClaudeRepair -PhaseName "PLAN" -Prompt $repairPrompt -Model $repairModel -Attempt (50 + $planAttempt * 10 + $repairAttempt)
-            if (-not $repairResult.success) { continue }
-            $planOutput = $repairResult.output.Trim()
-            Save-Artifact -Name "plan-v$planAttempt-repair-$repairAttempt.txt" -Content $planOutput | Out-Null
-            $planValidation = Get-PlanValidation -Plan $planOutput
-            if ($planValidation.valid) {
-                $planTargets = $planValidation.targets
-                if ($planValidation.investigationRequired) { $investigationRequired = $true }
-                Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan nach Repair akzeptiert." -Category "PLAN_REPAIRED" -Data @{ targets = $planTargets }
-                break
-            }
-            $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
-            if ($salvagedPlanTargets.Count -gt 0) {
-                $planTargets = @($salvagedPlanTargets | Select-Object -Unique)
-                $planValidation.valid = $true
-                Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan nach Repair salvaged." -Category "PLAN_SALVAGED" -Data @{ targets = $planTargets }
-                break
-            }
-        }
-        if ($planValidation.valid) { break }
+        Add-TimelineEvent -Phase "DISCOVER" -Message "Discover-Routing bestimmt." -Category $routeDecision -Data @{ testability = $testability; nextPhase = $discoverVerdict.nextPhase }
+        break
     }
 
     Write-Host "[RESTORE] Warte auf dotnet restore..."
@@ -1025,22 +1469,20 @@ investigationRequired: true|false
     Remove-Job $restoreJob -Force -ErrorAction SilentlyContinue
     Save-Artifact -Name "restore-output.txt" -Content $restoreOutput | Out-Null
 
-    if ((-not $planValidation -or -not $planValidation.valid) -and $planTargets.Count -eq 0) {
-        $investigationRequired = $true
-        Add-TimelineEvent -Phase "PLAN_VALIDATE" -Message "Plan bleibt schwach; Pipeline wechselt in autonome Investigation-Fallback." -Category "PLAN_FALLBACK"
-    }
-
     $investigationOutput = ""
-    $investigationVerdict = [ordered]@{ result = "CHANGE_NEEDED"; targets = @(); summary = "" }
+    $investigationVerdict = [ordered]@{ result = "CHANGE_NEEDED"; targets = @(); testability = "UNKNOWN"; nextPhase = "FIX_PLAN"; summary = "" }
     $investigationHashes = [System.Collections.ArrayList]::new()
-    if ($investigationRequired) {
+    $needsInvestigation = ($discoverVerdict.nextPhase -ne "FIX_PLAN")
+    $investigationRequired = $needsInvestigation
+    if ($needsInvestigation) {
         for ($investigateAttempt = 1; $investigateAttempt -le $CONST_INVESTIGATION_ATTEMPTS; $investigateAttempt++) {
             $currentPhase = "INVESTIGATE"
             $attemptsByPhase.investigate = $investigateAttempt
             Write-Host "[INVESTIGATE] Versuch $investigateAttempt/$CONST_INVESTIGATION_ATTEMPTS..."
-            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 2
+            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3
+            $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
             $investigatePrompt = @"
-Untersuche den Task read-only und entscheide, ob eine Codeaenderung noetig ist.
+Untersuche den Task read-only und entscheide, ob eine Codeaenderung noetig ist. Bewerte auch, ob eine automatisierte Bug-Reproduktion per Test sinnvoll ist.
 
 AUFGABE:
 $taskPrompt
@@ -1048,8 +1490,11 @@ $taskPrompt
 SOLUTION: $worktreeSln
 TASK_CLASS: $taskClass
 
-PLAN:
-$planOutput
+DISCOVER:
+$discoverBlock
+
+ERKANNTE TESTPROJEKTE:
+$testProjectPromptText
 
 CODEBASE KONTEXT:
 $codebaseContext
@@ -1063,6 +1508,8 @@ TARGET_FILES:
 - <konkreter Pfad oder Suchmuster>
 ROOT_CAUSE:
 <konkrete Analyse>
+TESTABILITY_REASSESSMENT: YES | NO | UNKNOWN
+RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <konkrete naechste Aenderung oder Begruendung>
 "@
@@ -1078,7 +1525,10 @@ NEXT_ACTION:
             $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
             $investigationConclusion = $investigationVerdict.result
             [void]$investigationHashes.Add((Get-TextHash -Text $investigationOutput))
-            Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation-Ergebnis: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets }
+            if ($investigationVerdict.testability -ne "UNKNOWN") {
+                $testability = $investigationVerdict.testability
+            }
+            Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation-Ergebnis: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets; nextPhase = $investigationVerdict.nextPhase }
 
             if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                 $investigationVerdict.result = "CHANGE_NEEDED"
@@ -1132,8 +1582,11 @@ LIEFERE JETZT EIN VERWERTBARES INVESTIGATION-ERGEBNIS.
 TASK:
 $taskPrompt
 
-PLAN:
-$planOutput
+DISCOVER:
+$discoverBlock
+
+ERKANNTE TESTPROJEKTE:
+$testProjectPromptText
 
 CODEBASE KONTEXT:
 $codebaseContext
@@ -1144,15 +1597,20 @@ TARGET_FILES:
 - <konkreter Pfad oder Suchmuster>
 ROOT_CAUSE:
 <konkrete Analyse>
+TESTABILITY_REASSESSMENT: YES | NO | UNKNOWN
+RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <konkrete naechste Aenderung oder Begruendung>
 "@
-                $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
+                $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $needsInvestigation -Targets $planTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
                 $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $repairModel -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
                 if (-not $repairResult.success) { continue }
                 $investigationOutput = $repairResult.output.Trim()
                 Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $investigationOutput | Out-Null
                 $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
+                if ($investigationVerdict.testability -ne "UNKNOWN") {
+                    $testability = $investigationVerdict.testability
+                }
                 if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                     $investigationVerdict.result = "CHANGE_NEEDED"
                     $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
@@ -1187,6 +1645,339 @@ NEXT_ACTION:
         }
     }
 
+    $shouldAttemptReproduction = ($testProjects.Count -gt 0) -and ($routeDecision -eq "BUGFIX_TESTABLE" -or $testability -eq "YES" -or $investigationVerdict.nextPhase -eq "REPRODUCE")
+    if ($shouldAttemptReproduction) {
+        $reproductionConfirmed = $false
+        $reproductionOutput = ""
+        $reproductionBaselinePatch = ""
+        $reproductionBaselineFiles = @()
+        $reproductionTests = New-EmptyReproductionTests
+        for ($reproAttempt = 1; $reproAttempt -le $CONST_REPRODUCE_ATTEMPTS; $reproAttempt++) {
+            $currentPhase = "REPRODUCE"
+            $attemptsByPhase.reproduce = $reproAttempt
+            $reproductionAttempted = $true
+            $reproductionOutput = ""
+            $reproductionBaselinePatch = ""
+            $reproductionBaselineFiles = @()
+            $reproductionTests = New-EmptyReproductionTests
+            Reset-Worktree
+            Write-Host "[REPRODUCE] Versuch $reproAttempt/$CONST_REPRODUCE_ATTEMPTS..."
+            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 4
+            $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
+            $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "RESULT: CHANGE_NEEDED`nTARGET_FILES:`n- " + (($planTargets | Select-Object -First 5) -join "`n- ") }
+            $reproPrompt = @"
+Versuche, den Bug ueber automatisierte Tests zu reproduzieren. Aendere in dieser Phase NUR Testdateien oder Testprojektdateien.
+
+AUFGABE:
+$taskPrompt
+
+SOLUTION: $worktreeSln
+TASK_CLASS: $taskClass
+
+DISCOVER:
+$discoverBlock
+
+INVESTIGATION:
+$investigationBlock
+
+ERKANNTE TESTPROJEKTE:
+$testProjectPromptText
+
+BISHERIGES FEEDBACK:
+$historyText
+
+REGELN:
+- KEINE Produktionsdateien aendern.
+- KEINE neuen NuGet-Pakete hinzufuegen.
+- Ziel ist ein reproduzierender Test, der vor dem Fix fehlschlaegt.
+- Wenn keine belastbare Reproduktion moeglich ist, sage das klar.
+
+AUSGABEFORMAT:
+RESULT: REPRODUCED | NOT_REPRODUCED | INCONCLUSIVE
+TEST_PROJECTS:
+- <relativer Projektpfad>
+TEST_FILES:
+- <relative Testdatei>
+TEST_NAMES:
+- <Testname oder FQN>
+TEST_FILTER: <dotnet test --filter Ausdruck>
+BUG_BEHAVIOR:
+<kurze Beschreibung der reproduzierten Fehlfunktion>
+RATIONALE:
+<warum der Test die Fehlfunktion abbildet oder warum keine Reproduktion gelang>
+"@
+            $reproResult = Invoke-ClaudeReproduce -Prompt $reproPrompt -Model $CONST_MODEL_IMPLEMENT -Attempt $reproAttempt
+            if (-not $reproResult.success) {
+                Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_CALL_FAILED" -Feedback $reproResult.output
+                continue
+            }
+
+            $reproductionOutput = $reproResult.output.Trim()
+            Save-Artifact -Name "reproduce-v$reproAttempt.txt" -Content $reproductionOutput | Out-Null
+            $reproVerdict = Get-ReproductionVerdict -Output $reproductionOutput
+            $reproChangedFiles = Get-ChangedFiles
+            Save-Artifact -Name "reproduce-v$reproAttempt-changed-files.txt" -Content (($reproChangedFiles -join "`n").Trim()) | Out-Null
+            $changeSetValidation = Test-ReproductionChangeSet -ChangedFiles $reproChangedFiles -TestProjects $testProjects
+            if (-not $changeSetValidation.valid) {
+                $invalidText = if ($changeSetValidation.invalidFiles.Count -gt 0) { $changeSetValidation.invalidFiles -join ", " } else { "keine Testdateien geaendert" }
+                Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_INVALID_CHANGESET" -Feedback $invalidText
+                Add-TimelineEvent -Phase "REPRODUCE" -Message "Reproduktion verwarf unerlaubte Dateiaenderungen." -Category "REPRO_INVALID_CHANGESET" -Data @{ invalidFiles = $changeSetValidation.invalidFiles }
+                Reset-Worktree
+                continue
+            }
+
+            if ($reproVerdict.result -ne "REPRODUCED") {
+                Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category $reproVerdict.result -Feedback $reproductionOutput
+                Reset-Worktree
+                continue
+            }
+
+            if (-not $reproVerdict.testFilter) {
+                Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_MISSING_FILTER" -Feedback $reproductionOutput
+                Reset-Worktree
+                continue
+            }
+
+            $reproTestTargets = Resolve-TestProjectPaths -RequestedProjects $reproVerdict.testProjects -TestProjects $testProjects
+            if ($reproVerdict.testProjects.Count -gt 0 -and $reproTestTargets.Count -eq 0) {
+                Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_UNKNOWN_TEST_PROJECT" -Feedback $reproductionOutput
+                Reset-Worktree
+                continue
+            }
+            $reproVerifyResult = Invoke-TargetedTestRun -SolutionPath $worktreeSln -ProjectPaths $reproTestTargets -TestFilter $reproVerdict.testFilter -ExpectFailure $true
+            Save-Artifact -Name "reproduce-v$reproAttempt-verify.txt" -Content $reproVerifyResult.output | Out-Null
+            if (-not $reproVerifyResult.testFailureObserved -or $reproVerifyResult.commandError -or $reproVerifyResult.matchedNoTests) {
+                Add-FeedbackEntry -Attempt $reproAttempt -Source "REPRODUCE" -Category "REPRO_NOT_VERIFIED" -Feedback $reproVerifyResult.output
+                Reset-Worktree
+                continue
+            }
+
+            $reproductionConfirmed = $true
+            $reproductionTests = [ordered]@{
+                testProjects = @($reproTestTargets)
+                testFiles = if ($reproVerdict.testFiles.Count -gt 0) { @($reproVerdict.testFiles) } else { @($reproChangedFiles) }
+                testNames = @($reproVerdict.testNames)
+                testFilter = $reproVerdict.testFilter
+                bugBehavior = $reproVerdict.bugBehavior
+                rationale = $reproVerdict.rationale
+                verificationOutput = $reproVerifyResult.output
+            }
+            $reproductionBaselinePatch = (Invoke-NativeCommand git @("diff", "HEAD")).output
+            $reproductionBaselineFiles = Get-WorktreeFileSnapshot -Files $reproChangedFiles
+            Save-Artifact -Name "reproduction-baseline.patch" -Content $reproductionBaselinePatch | Out-Null
+            Add-TimelineEvent -Phase "REPRODUCE" -Message "Bug-Reproduktion ueber Tests bestaetigt." -Category "REPRODUCED" -Data @{ filter = $reproductionTests.testFilter; projects = $reproductionTests.testProjects }
+            break
+        }
+        if (-not $reproductionConfirmed) {
+            $reproductionOutput = ""
+            $reproductionBaselinePatch = ""
+            $reproductionBaselineFiles = @()
+            $reproductionTests = New-EmptyReproductionTests
+            Reset-Worktree
+            Add-TimelineEvent -Phase "REPRODUCE" -Message "Keine belastbare Test-Reproduktion bestaetigt." -Category "REPRO_FAILED"
+        }
+    }
+
+    for ($planAttempt = 1; $planAttempt -le $CONST_PLAN_ATTEMPTS; $planAttempt++) {
+        $currentPhase = "FIX_PLAN"
+        $attemptsByPhase.plan = $planAttempt
+        $attemptsByPhase.fixPlan = $planAttempt
+        $planVersion = $planAttempt
+        Write-Host "[FIX_PLAN] Versuch $planAttempt/$CONST_PLAN_ATTEMPTS..."
+        $replanBlock = if ($replanReason) { "`nKRITIK AM VORHERIGEN FIX-PLAN:`n$replanReason`n" } else { "" }
+        $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
+        $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "Keine gesonderte Investigation ausgefuehrt." }
+        $reproductionBlock = if ($reproductionConfirmed) {
+@"
+RESULT: REPRODUCED
+TEST_PROJECTS:
+$(($reproductionTests.testProjects | ForEach-Object { "- $_" }) -join "`n")
+TEST_FILES:
+$(($reproductionTests.testFiles | ForEach-Object { "- $_" }) -join "`n")
+TEST_NAMES:
+$(($reproductionTests.testNames | ForEach-Object { "- $_" }) -join "`n")
+TEST_FILTER: $($reproductionTests.testFilter)
+BUG_BEHAVIOR:
+$($reproductionTests.bugBehavior)
+RATIONALE:
+$($reproductionTests.rationale)
+"@
+        } else {
+            "Keine verifizierte Test-Reproduktion vorhanden."
+        }
+        $planPrompt = @"
+Erstelle jetzt den konkreten Fix-Plan auf Basis der vorhandenen Erkenntnisse. Plane nicht mehr spekulativ.
+
+AUFGABE:
+$taskPrompt
+
+SOLUTION: $worktreeSln
+
+TASK_CLASS: $taskClass
+DISCOVER_CONCLUSION: $discoverConclusion
+ROUTE: $routeDecision
+TESTABILITY: $testability
+
+DISCOVER:
+$discoverBlock
+
+INVESTIGATION:
+$investigationBlock
+
+REPRODUKTION:
+$reproductionBlock
+
+CODEBASE KONTEXT:
+$codebaseContext
+$replanBlock
+REGELN:
+- Keine TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) Kommentare
+- Kein throw new NotImplementedException()
+- Max 1 Top-Level Typdeklaration pro Datei (nested/partial OK)
+$nugetRule
+- Kommentare auf Deutsch, minimal
+- MessageService.ShowMessageBox statt MessageBox.Show
+- Kein Dispatcher.Invoke/BeginInvoke wenn vermeidbar
+- Wenn Reproduktionstests vorhanden sind, muessen sie nach dem Fix bestehen
+
+AUSGABEFORMAT:
+## Ziel
+Ein Satz.
+
+## Dateien
+Fuer jede relevante Datei oder Suchflaeche:
+- Pfad: <konkreter relativer Pfad ODER Suchmuster>
+- Aktion: ERSTELLEN | AENDERN | LOESCHEN | PRUEFEN
+- Aenderungen: <konkrete erwartete Aenderung>
+
+## Reihenfolge
+1. <konkreter Schritt>
+2. <konkreter Schritt>
+
+## Einschraenkungen
+- <konkretes Risiko>
+
+## Reproduktionstests
+- <nur wenn vorhanden: Projekt/Datei/Test/Erwartung>
+
+investigationRequired: true|false
+Schreibe NUR den Plan.
+"@
+        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets
+        $planResult = Invoke-ClaudeFixPlan -Prompt $planPrompt -Model $effectiveModelPlan -Attempt $planAttempt
+        if (-not $planResult.success) {
+            $replanReason = "Fix-Plan-Aufruf fehlgeschlagen: $($planResult.output)"
+            Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN" -Category "FIX_PLAN_CALL_FAILED" -Feedback $planResult.output
+            Add-TimelineEvent -Phase "FIX_PLAN" -Message "Fix-Plan-Aufruf fehlgeschlagen." -Category "FIX_PLAN_CALL_FAILED"
+            continue
+        }
+
+        $planOutput = $planResult.output.Trim()
+        Save-Artifact -Name "fix-plan-v$planAttempt.txt" -Content $planOutput | Out-Null
+        $planValidation = Get-PlanValidation -Plan $planOutput
+        Save-JsonArtifact -Name "fix-plan-v$planAttempt-validation.json" -Object $planValidation | Out-Null
+        if ($planValidation.valid) {
+            $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
+            Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan akzeptiert." -Category "FIX_PLAN_VALID" -Data @{ targets = $planTargets }
+            break
+        }
+
+        $replanReason = ($planValidation.issues -join "`n")
+        Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN" -Category "FIX_PLAN_INSUFFICIENT" -Feedback $replanReason
+        Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan wurde verworfen." -Category "FIX_PLAN_INSUFFICIENT" -Data @{ issues = $planValidation.issues }
+        for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
+            $repairReasons = @($planValidation.issues)
+            if ($reproductionConfirmed) {
+                $repairReasons += "Wenn Reproduktionstests vorhanden sind, muessen sie im Plan explizit beruecksichtigt werden."
+            }
+            $repairBlock = Get-RepairBlock -FailureCode "FIX_PLAN_INSUFFICIENT" -Reasons $repairReasons -PreviousOutput $planOutput
+            $repairPrompt = @"
+$repairBlock
+
+LIEFERE JETZT EINEN KORRIGIERTEN FIX-PLAN IM GEFORDERTEN FORMAT.
+
+AUFGABE:
+$taskPrompt
+
+SOLUTION: $worktreeSln
+
+TASK_CLASS: $taskClass
+DISCOVER_CONCLUSION: $discoverConclusion
+ROUTE: $routeDecision
+TESTABILITY: $testability
+
+DISCOVER:
+$discoverBlock
+
+INVESTIGATION:
+$investigationBlock
+
+REPRODUKTION:
+$reproductionBlock
+
+CODEBASE KONTEXT:
+$codebaseContext
+
+AUSGABEFORMAT:
+## Ziel
+Ein Satz.
+
+## Dateien
+Fuer jede relevante Datei oder Suchflaeche:
+- Pfad: <konkreter relativer Pfad ODER Suchmuster>
+- Aktion: ERSTELLEN | AENDERN | LOESCHEN | PRUEFEN
+- Aenderungen: <konkrete erwartete Aenderung>
+
+## Reihenfolge
+1. <konkreter Schritt>
+2. <konkreter Schritt>
+
+## Einschraenkungen
+- <konkretes Risiko>
+
+## Reproduktionstests
+- <nur wenn vorhanden: Projekt/Datei/Test/Erwartung>
+
+investigationRequired: true|false
+Schreibe NUR den Plan.
+"@
+            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $planOutput -TaskText $taskPrompt
+            $repairResult = Invoke-ClaudeRepair -PhaseName "FIX_PLAN" -Prompt $repairPrompt -Model $repairModel -Attempt (190 + $planAttempt * 10 + $repairAttempt)
+            if (-not $repairResult.success) { continue }
+
+            $planOutput = $repairResult.output.Trim()
+            Save-Artifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt.txt" -Content $planOutput | Out-Null
+            $planValidation = Get-PlanValidation -Plan $planOutput
+            Save-JsonArtifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt-validation.json" -Object $planValidation | Out-Null
+            if ($planValidation.valid) {
+                $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
+                Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan nach Repair akzeptiert." -Category "FIX_PLAN_REPAIRED" -Data @{ targets = $planTargets }
+                break
+            }
+
+            $replanReason = ($planValidation.issues -join "`n")
+            Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN_REPAIR" -Category "FIX_PLAN_REPAIR_INSUFFICIENT" -Feedback $replanReason
+        }
+        if ($planValidation.valid) {
+            break
+        }
+        $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
+        if ($salvagedPlanTargets.Count -gt 0) {
+            $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
+            $planValidation.valid = $true
+            Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan via Salvage fortgesetzt." -Category "FIX_PLAN_SALVAGED" -Data @{ targets = $planTargets }
+            break
+        }
+    }
+
+    if ((-not $planValidation -or -not $planValidation.valid) -and $planTargets.Count -eq 0) {
+        $finalStatus = "FAILED"
+        $finalCategory = "FIX_PLAN_INSUFFICIENT"
+        $finalSummary = "Nach Discovery, Investigation und optionaler Reproduktion konnte kein belastbarer Fix-Plan erstellt werden."
+        $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory }
+        throw [System.Exception]::new("TERMINAL_FIX_PLAN_INSUFFICIENT")
+    }
+
     $implementationHistoryHashes = [System.Collections.ArrayList]::new()
     $accepted = $false
     $preflightScript = Join-Path $PSScriptRoot "preflight.ps1"
@@ -1200,12 +1991,33 @@ NEXT_ACTION:
     for ($implementAttempt = 1; $implementAttempt -le $CONST_IMPLEMENT_ATTEMPTS; $implementAttempt++) {
         $attemptsByPhase.implement = $implementAttempt
         $currentPhase = "IMPLEMENT"
-        Reset-Worktree
+        if ($reproductionConfirmed) { $targetedVerificationPassed = $false }
+        if ($reproductionConfirmed) {
+            Restore-WorktreeBaseline -PatchContent $reproductionBaselinePatch -FileSnapshot $reproductionBaselineFiles
+        } else {
+            Reset-Worktree
+        }
         Write-Host "[IMPLEMENT] Versuch $implementAttempt/$CONST_IMPLEMENT_ATTEMPTS..."
 
         $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 4
         $targetText = if ($planTargets.Count -gt 0) { ($planTargets | ForEach-Object { "- $_" }) -join "`n" } else { "- keine expliziten Ziele aus Plan" }
         $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "RESULT: CHANGE_NEEDED`nTARGET_FILES:`n$targetText" }
+        $reproductionBlock = if ($reproductionConfirmed) {
+@"
+RESULT: REPRODUCED
+TEST_PROJECTS:
+$(($reproductionTests.testProjects | ForEach-Object { "- $_" }) -join "`n")
+TEST_FILES:
+$(($reproductionTests.testFiles | ForEach-Object { "- $_" }) -join "`n")
+TEST_NAMES:
+$(($reproductionTests.testNames | ForEach-Object { "- $_" }) -join "`n")
+TEST_FILTER: $($reproductionTests.testFilter)
+BUG_BEHAVIOR:
+$($reproductionTests.bugBehavior)
+"@
+        } else {
+            "Keine verifizierte Test-Reproduktion vorhanden."
+        }
         $implPrompt = @"
 Setze die Aenderung um. Du darfst nicht raten.
 
@@ -1221,6 +2033,9 @@ $planOutput
 INVESTIGATION:
 $investigationBlock
 
+REPRODUKTION:
+$reproductionBlock
+
 ERLAUBTE ZIELDATEIEN ODER SUCHMUSTER:
 $targetText
 
@@ -1233,6 +2048,7 @@ REGELN:
 - Oeffne nur Dateien, die fuer die Ziele relevant sind.
 - Kommentare auf Deutsch, minimal.
 - Keine TODO/FIXME/HACK/Fix:/Note:-Kommentare.
+- Wenn Reproduktionstests vorhanden sind, muessen sie nach dem Fix bestehen und im Diff erhalten bleiben.
 - Nach den Aenderungen: dotnet build $worktreeSln --no-restore, Fehler sofort beheben.
 
 AUSGABEFORMAT AM ENDE:
@@ -1307,6 +2123,9 @@ $planOutput
 INVESTIGATION:
 $investigationBlock
 
+REPRODUKTION:
+$reproductionBlock
+
 ERLAUBTE ZIELDATEIEN:
 $targetText
 
@@ -1349,6 +2168,46 @@ WICHTIG:
         $reviewCycle = 0
         while ($reviewCycle -le $CONST_REMEDIATION_ATTEMPTS) {
             $cycleLabel = "i$implementAttempt-r$reviewCycle"
+            if ($reproductionConfirmed) {
+                $currentPhase = "VERIFY_REPRO"
+                $attemptsByPhase.verifyRepro = [Math]::Max($attemptsByPhase.verifyRepro, $reviewCycle + 1)
+                Write-Host "[VERIFY_REPRO] Zyklus $cycleLabel..."
+                $verifyReproTargets = if ($reproductionTests.testProjects.Count -gt 0) { @($reproductionTests.testProjects) } else { @() }
+                $verifyReproResult = Invoke-TargetedTestRun -SolutionPath $worktreeSln -ProjectPaths $verifyReproTargets -TestFilter $reproductionTests.testFilter
+                Save-Artifact -Name "verify-repro-$cycleLabel.txt" -Content $verifyReproResult.output | Out-Null
+                if (-not $verifyReproResult.allPassed) {
+                    Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "VERIFY_REPRO" -Category "REPRO_TESTS_FAILED" -Feedback $verifyReproResult.output
+                    Add-TimelineEvent -Phase "VERIFY_REPRO" -Message "Reproduktionstests schlagen noch fehl." -Category "REPRO_TESTS_FAILED"
+                    if ($reviewCycle -ge $CONST_REMEDIATION_ATTEMPTS) {
+                        $finalStatus = "FAILED"
+                        $finalCategory = "REPRO_TESTS_FAILED"
+                        $finalSummary = "Die reproduzierenden Tests wurden nicht erfolgreich repariert."
+                        $finalFeedback = $verifyReproResult.output
+                        throw [System.Exception]::new("TERMINAL_REPRO_TESTS_FAILED")
+                    }
+                    $reviewCycle++
+                    $attemptsByPhase.remediate = [Math]::Max($attemptsByPhase.remediate, $reviewCycle)
+                    $fixPrompt = @"
+Behebe ausschliesslich die folgenden fehlgeschlagenen Reproduktionstests im bestehenden Worktree.
+
+TESTFEHLER:
+$($verifyReproResult.output)
+
+AUSGABEFORMAT AM ENDE:
+RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
+SUMMARY:
+<Kurze Begruendung>
+"@
+                    $verifyFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verifyReproResult.output -TaskText $taskPrompt
+                    $verifyFixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $verifyFixModel -Attempt (90 + $implementAttempt * 10 + $reviewCycle)
+                    if (-not $verifyFixResult.success) {
+                        Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "VERIFY_REPRO_TOOL_FAILURE" -Feedback $verifyFixResult.output
+                    }
+                    $changedFiles = Get-ChangedFiles
+                    continue
+                }
+                $targetedVerificationPassed = $true
+            }
             $currentPhase = "PREFLIGHT"
             Write-Host "[PREFLIGHT] Zyklus $cycleLabel..."
             $pfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflightScript, "-SolutionPath", $worktreeSln)
@@ -1427,13 +2286,18 @@ $reviewerContent
 
 ---
 
-PLAN (v$planVersion):
+FIX PLAN (v$planVersion):
 $planOutput
 
 ---
 
 INVESTIGATION:
 $investigationBlock
+
+---
+
+REPRODUKTION:
+$reproductionBlock
 
 ---
 
@@ -1547,12 +2411,12 @@ SUMMARY:
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
     } else {
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force") | Out-Null
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
     }
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
@@ -1568,7 +2432,7 @@ SUMMARY:
             Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
             $worktreePath = $null
         }
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
     } else {
         Write-Host "[ERROR] $errMsg"
         $finalStatus = "ERROR"
@@ -1576,7 +2440,7 @@ SUMMARY:
         $finalSummary = "Unerwarteter Fehler in Phase $currentPhase."
         $finalFeedback = $errMsg
         Write-TimelineArtifact
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unerwarteter Fehler in Phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unerwarteter Fehler in Phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
     }
 } finally {
     Set-Location $originalDir -ErrorAction SilentlyContinue

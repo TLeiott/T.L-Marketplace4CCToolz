@@ -1,10 +1,10 @@
 # T.L-AutoDevelop
 
-Interactive .NET development pipeline plugin for Claude Code with explicit investigation and no-op handling.
+Interactive .NET development pipeline plugin for Claude Code with discovery-first routing, explicit investigation, optional test-backed bug reproduction, and no-op handling.
 
 ## Skills
 
-- **`/develop`** — Interactive single-task pipeline (plan, validate, investigate, implement, preflight, review) with user confirmations
+- **`/develop`** — Interactive single-task pipeline (discover, investigate, optional reproduce, fix-plan, implement, preflight, review) with user confirmations
 - **`/develop-batch`** — Interactive batch processing via git worktrees with capped parallelism and per-commit confirmations
 
 ## Agents
@@ -13,7 +13,7 @@ Interactive .NET development pipeline plugin for Claude Code with explicit inves
 
 ## Scripts
 
-- **auto-develop.ps1** — Main pipeline orchestrator. Manages git worktrees, persists per-run artifacts, validates plans semantically, runs investigation before implementation when needed, classifies no-op outcomes, and performs preflight/review remediation.
+- **auto-develop.ps1** — Main pipeline orchestrator. Manages git worktrees, persists per-run artifacts, performs discovery-first routing, investigates before optional test-backed bug reproduction, validates fix plans semantically with repair loops, classifies no-op outcomes, and performs targeted verification, preflight, and review remediation.
 - **preflight.ps1** — Deterministic validation: build check, forbidden comments, stub detection, class-per-file rule, NuGet audit, and various warnings.
 
 ## Runtime Output
@@ -25,15 +25,23 @@ Each run writes artifacts under `.claude-develop-logs/runs/<taskName>/` and retu
 - `attemptsByPhase`
 - `artifacts.runDir`
 - `artifacts.debugDir`
+- `discoverConclusion`
+- `route`
+- `testability`
+- `testProjects`
 - `investigationConclusion`
+- `reproductionAttempted`
+- `reproductionConfirmed`
+- `reproductionTests`
+- `targetedVerificationPassed`
 - `noChangeReason`
 
 In addition, the pipeline now mirrors low-level diagnostics into `%TEMP%\claude-develop\debug\<runId>\`, including full Claude prompt/output captures, per-phase metadata, and detailed preflight build/test/run logs.
 
 ## Model Policy
 
-- `INVESTIGATE` and `REVIEW` stay on Opus
-- `PLAN` may drop to Sonnet for direct edits or already-concrete targets
+- `DISCOVER`, `INVESTIGATE`, and `REVIEW` stay on Opus by default unless routing is obviously low-risk
+- `FIX_PLAN` may drop to Sonnet for direct edits or already-concrete targets
 - `IMPLEMENT` and narrow repair loops may use Sonnet only when file targets are concrete and the step is low-complexity
 
 ## Requirements
