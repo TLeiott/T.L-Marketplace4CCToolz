@@ -5,7 +5,7 @@ Interactive .NET development pipeline plugin for Claude Code with discovery-firs
 ## Skills
 
 - **`/develop`** — Interactive single-task pipeline (discover, investigate, optional reproduce, fix-plan, implement, preflight, review) with user confirmations
-- **`/develop-batch`** — Interactive batch processing via git worktrees with capped parallelism and per-commit confirmations
+- **`/develop-batch`** — Interactive batch processing via git worktrees with read-only task scheduling, statusline-aware 5h launch gating, conservative parallel waves, and per-commit confirmations
 
 ## Agents
 
@@ -14,6 +14,7 @@ Interactive .NET development pipeline plugin for Claude Code with discovery-firs
 ## Scripts
 
 - **auto-develop.ps1** — Main pipeline orchestrator. Manages git worktrees, persists per-run artifacts, performs discovery-first routing, investigates before optional test-backed bug reproduction, validates fix plans semantically with repair loops, classifies no-op outcomes, and performs targeted verification, preflight, and review remediation.
+- **claude-usage-gate.ps1** — Shared helper for batch launchers. Probes the local Claude statusline / usage cache, trusts env-expanded commands that resolve into the main Claude folder, falls back to `%USERPROFILE%\\.claude\\statusline.ps1` when present, and emits JSON even for handled unavailable states.
 - **preflight.ps1** — Deterministic validation: build check, forbidden comments, stub detection, class-per-file rule, NuGet audit, and various warnings.
 
 ## Runtime Output

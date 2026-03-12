@@ -11,7 +11,7 @@ An interactive development pipeline that orchestrates Claude Code through discov
 | Command | Description |
 |---------|-------------|
 | `/develop [task]` | Single task with user confirmations before commit |
-| `/develop-batch [tasks.md]` | Batched git-worktree pipeline with capped parallelism, confirms each commit |
+| `/develop-batch [tasks.md]` | Batched git-worktree pipeline with read-only scheduling, statusline-aware launch gating, conservative parallel waves, confirms each commit |
 
 ### T.L-AutoDevelop-Pro (v2.3.0) — Autonomous
 
@@ -20,7 +20,7 @@ A fully autonomous development pipeline — zero confirmations. Runs discovery, 
 | Command | Description |
 |---------|-------------|
 | `/TLA-develop [task]` | Single task, zero confirmations, auto-commit |
-| `/TLA-develop-batch [tasks.md]` | Batched pipeline with capped parallelism, fully automated end-to-end |
+| `/TLA-develop-batch [tasks.md]` | Batched pipeline with read-only scheduling, statusline-aware launch gating, conservative parallel waves, fully automated after startup |
 
 **Pipeline Flow:**
 ```
@@ -35,7 +35,9 @@ Discover -> Investigate -> optional Reproduce -> Fix Plan -> Implement -> Change
 - Investigation phase for ambiguous or diagnostic tasks
 - Optional failing-test reproduction for testable bugfix work
 - Semantic fix-plan validation that rejects placeholder/template plans
-- Batch launchers should cap concurrency at 2 simultaneous pipelines
+- Batch launchers now perform a read-only context pass, build conservative conflict/dependency waves, and may run up to 20 simultaneous pipelines when scopes are clearly disjoint
+- Before each new batch launch slot, the launcher probes the local Claude statusline / usage cache and pauses starts when the 5h usage window is at or above 90%
+- The usage helper accepts trusted commands from the main Claude folder, falls back to `%USERPROFILE%\\.claude\\statusline.ps1` when available, and emits JSON for handled unavailable states instead of failing the batch outright
 - Conditional Sonnet usage for low-risk planning, implementation, and repair phases
 
 ## Prerequisites
