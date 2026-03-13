@@ -4,7 +4,7 @@ A Claude Code plugin marketplace providing .NET development pipeline tools.
 
 ## What's Included
 
-### T.L-AutoDevelop (v2.3.0) — Interactive
+### T.L-AutoDevelop (v2.3.1) — Interactive
 
 An interactive development pipeline that orchestrates Claude Code through discovery, investigation, optional bug reproduction, fix planning, implementation, preflight, and review — with user confirmations before each commit.
 
@@ -13,7 +13,7 @@ An interactive development pipeline that orchestrates Claude Code through discov
 | `/develop [task]` | Single task with user confirmations before commit |
 | `/develop-batch [tasks.md]` | Batched git-worktree pipeline with read-only scheduling, statusline-aware launch gating, conservative parallel waves, confirms each commit |
 
-### T.L-AutoDevelop-Pro (v2.3.0) — Autonomous
+### T.L-AutoDevelop-Pro (v2.3.1) — Autonomous
 
 A fully autonomous development pipeline — zero confirmations. Runs discovery, investigation, optional bug reproduction, fix planning, implement, preflight, review, and commit end-to-end unattended.
 
@@ -64,6 +64,19 @@ Then install the plugin(s) you want:
 ```
 /plugin install T.L-AutoDevelop-Pro
 ```
+
+## Versioning
+
+Do not push changed plugin or marketplace content under the same version number.
+
+When a pushed change affects distributed behavior or content, bump the affected plugin version in both places:
+
+- `.claude-plugin/marketplace.json`
+- `plugins/<plugin>/.claude-plugin/plugin.json`
+
+Minimum rule: increment the patch version even for small shipped changes. If a change affects both plugins or shared packaged behavior, bump both plugin versions together.
+
+This avoids stale Claude plugin cache entries serving older skill or script files under a reused version.
 
 ## Configuration
 
