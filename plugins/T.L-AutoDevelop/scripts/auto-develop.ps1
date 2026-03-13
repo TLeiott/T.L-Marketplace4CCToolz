@@ -4,6 +4,8 @@ param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [Parameter(Mandatory)][string]$ResultFile,
     [string]$TaskName = "develop-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
+    [string]$SchedulerTaskId = "",
+    [string]$CommandType = "",
     [switch]$SkipRun,
     [switch]$AllowNuget
 )
@@ -94,6 +96,25 @@ $reproductionTests = [ordered]@{
     verificationOutput = ""
 }
 $targetedVerificationPassed = $false
+$taskPrompt = ""
+$taskLine = ""
+$planTargets = @()
+$discoverVerdict = [ordered]@{
+    route = "UNCERTAIN"
+    bugConfidence = "LOW"
+    testability = "UNKNOWN"
+    targetHints = @()
+    rationale = ""
+    nextPhase = "INVESTIGATE"
+    summary = ""
+}
+$investigationVerdict = [ordered]@{
+    result = "INCONCLUSIVE"
+    targets = @()
+    testability = "UNKNOWN"
+    nextPhase = "FIX_PLAN"
+    summary = ""
+}
 
 Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
 
@@ -129,6 +150,16 @@ function Normalize-RepoRelativePath {
         $normalized = $normalized.Substring(2)
     }
     return $normalized.TrimStart('\')
+}
+
+function Get-NormalizedPathSet {
+    param([string[]]$Paths)
+    return @(
+        @($Paths | ForEach-Object {
+            $value = Normalize-RepoRelativePath -Path ([string]$_)
+            if ($value) { $value }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
 }
 
 function Get-TaskClaimGuardrail {
@@ -956,6 +987,8 @@ function Write-DebugManifest {
     $manifest = [ordered]@{
         runId = Ensure-DebugDir | Split-Path -Leaf
         taskName = $TaskName
+        schedulerTaskId = $SchedulerTaskId
+        commandType = $CommandType
         promptFile = $PromptFile
         solutionPath = $SolutionPath
         resultFile = $ResultFile
@@ -975,6 +1008,43 @@ function Write-DebugManifest {
         reproductionConfirmed = [bool]$reproductionConfirmed
     }
     Save-DebugJson -Name "manifest.json" -Object $manifest | Out-Null
+}
+
+function Write-SchedulerSnapshot {
+    if (-not $artifactRunDir -or -not $repoRoot) { return }
+    $snapshot = [ordered]@{
+        version = 1
+        schedulerTaskId = $SchedulerTaskId
+        commandType = $CommandType
+        taskName = $TaskName
+        repoRoot = $repoRoot
+        solutionPath = $SolutionPath
+        promptFile = $PromptFile
+        resultFile = $ResultFile
+        branchName = $branchName
+        worktreePath = $worktreePath
+        currentPhase = $currentPhase
+        updatedAt = (Get-Date).ToString("o")
+        processId = $PID
+        taskLine = $taskLine
+        taskClass = $taskClass
+        route = $routeDecision
+        testability = $testability
+        discoverConclusion = $discoverConclusion
+        investigationConclusion = $investigationConclusion
+        discoverTargetHints = @(Get-NormalizedPathSet -Paths $discoverVerdict.targetHints)
+        investigationTargets = @(Get-NormalizedPathSet -Paths $investigationVerdict.targets)
+        planTargets = @(Get-NormalizedPathSet -Paths $planTargets)
+        changedFiles = @(Get-NormalizedPathSet -Paths $changedFiles)
+        finalStatus = $finalStatus
+        finalCategory = $finalCategory
+        artifacts = [ordered]@{
+            runDir = $artifactRunDir
+            debugDir = $debugRunDir
+        }
+    }
+    Save-JsonArtifact -Name "scheduler-snapshot.json" -Object $snapshot | Out-Null
+    Save-DebugJson -Name "scheduler-snapshot.json" -Object $snapshot | Out-Null
 }
 
 function Normalize-Text {
@@ -1659,6 +1729,7 @@ function Write-ResultJson {
     [System.IO.File]::WriteAllText($ResultFile, $result, [System.Text.Encoding]::UTF8)
     Save-DebugText -Name "result.json" -Content $result | Out-Null
     Write-DebugManifest
+    Write-SchedulerSnapshot
 }
 
 function Invoke-ClaudeWithTimeout {
@@ -2080,7 +2151,11 @@ function Get-ImplementationOutcome {
 function Get-ChangedFiles {
     $diffFiles = (Invoke-NativeCommand git @("diff", "--name-only", "HEAD")).output
     $untrackedFiles = (Invoke-NativeCommand git @("ls-files", "--others", "--exclude-standard")).output
-    return @(($diffFiles + "`n" + $untrackedFiles) -split "`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -Unique)
+    return @(
+        @(($diffFiles + "`n" + $untrackedFiles) -split "`r?`n" | ForEach-Object {
+            $_.Trim()
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
 }
 
 function Reset-Worktree {
@@ -2145,11 +2220,13 @@ try {
     Save-Artifact -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Save-DebugText -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired }
+    Write-SchedulerSnapshot
 
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
     $worktreePath = Join-Path $worktreeBase $TaskName
     if (-not (Test-Path $worktreeBase)) { New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null }
     Write-DebugManifest
+    Write-SchedulerSnapshot
 
     Write-Host "[WORKTREE] Erstelle $branchName..."
     $r = Invoke-NativeCommand git @("worktree", "add", $worktreePath, "-b", $branchName)
@@ -2163,6 +2240,7 @@ try {
     $relSln = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
     $worktreeSln = Join-Path $worktreePath $relSln
     Write-DebugManifest
+    Write-SchedulerSnapshot
 
     Write-Host "[CONTEXT] Sammle Codebase-Kontext..."
     $codebaseInventory = Get-CodebaseInventory -RepoRoot $repoRoot -SolutionPath $SolutionPath
@@ -2252,6 +2330,7 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
             $planTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
         }
         Add-TimelineEvent -Phase "DISCOVER" -Message "Discover-Routing bestimmt." -Category $routeDecision -Data @{ testability = $testability; nextPhase = $discoverVerdict.nextPhase }
+        Write-SchedulerSnapshot
         break
     }
 
@@ -2325,12 +2404,14 @@ NEXT_ACTION:
                 $testability = $investigationVerdict.testability
             }
             Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation-Ergebnis: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets; nextPhase = $investigationVerdict.nextPhase }
+            Write-SchedulerSnapshot
 
             if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                 $investigationVerdict.result = "CHANGE_NEEDED"
                 $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
                 $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
                 Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation wurde aus verwertbaren Hinweisen salvaged." -Category "CHANGE_NEEDED_SALVAGED" -Data @{ targets = $investigationVerdict.targets }
+                Write-SchedulerSnapshot
             }
 
             if ($investigationVerdict.result -eq "NO_CHANGE") {
@@ -2705,6 +2786,7 @@ Schreibe NUR den Plan.
         if ($planValidation.valid) {
             $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
             Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan akzeptiert." -Category "FIX_PLAN_VALID" -Data @{ targets = $planTargets }
+            Write-SchedulerSnapshot
             break
         }
 
@@ -2781,6 +2863,7 @@ Schreibe NUR den Plan.
             if ($planValidation.valid) {
                 $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
                 Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan nach Repair akzeptiert." -Category "FIX_PLAN_REPAIRED" -Data @{ targets = $planTargets }
+                Write-SchedulerSnapshot
                 break
             }
 
@@ -2795,6 +2878,7 @@ Schreibe NUR den Plan.
             $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
             $planValidation.valid = $true
             Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan via Salvage fortgesetzt." -Category "FIX_PLAN_SALVAGED" -Data @{ targets = $planTargets }
+            Write-SchedulerSnapshot
             break
         }
     }
@@ -2941,6 +3025,7 @@ REASON:
             $lastNoChangeReason = $implOutcome.category
             [void]$implementationHistoryHashes.Add("$($implOutcome.category):$($implOutcome.hash)")
             Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Keine Datei wurde geaendert." -Category $implOutcome.category
+            Write-SchedulerSnapshot
             Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category $implOutcome.category -Feedback $implResult.output
 
             $repairReasons = @()
@@ -2984,6 +3069,7 @@ WICHTIG:
                     $changedFiles = Get-ChangedFiles
                     if ($changedFiles.Count -gt 0) {
                         Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Repair-Implementierung hat Dateien geaendert." -Category "CHANGE_APPLIED"
+                        Write-SchedulerSnapshot
                     } else {
                         Add-FeedbackEntry -Attempt $implementAttempt -Source "IMPLEMENT" -Category "IMPLEMENT_REPAIR_NO_CHANGE" -Feedback $implResult.output
                     }
@@ -2991,6 +3077,7 @@ WICHTIG:
             }
             if ($changedFiles.Count -gt 0) {
                 Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "$($changedFiles.Count) Datei(en) geaendert." -Category "CHANGE_APPLIED" -Data @{ files = $changedFiles }
+                Write-SchedulerSnapshot
             } else {
             if ($implementationHistoryHashes.Count -ge 2) {
                 $lastTwo = $implementationHistoryHashes | Select-Object -Last 2
@@ -3007,6 +3094,7 @@ WICHTIG:
         }
 
         Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "$($changedFiles.Count) Datei(en) geaendert." -Category "CHANGE_APPLIED" -Data @{ files = $changedFiles }
+        Write-SchedulerSnapshot
         $reviewCycle = 0
         while ($reviewCycle -le $CONST_REMEDIATION_ATTEMPTS) {
             $cycleLabel = "i$implementAttempt-r$reviewCycle"

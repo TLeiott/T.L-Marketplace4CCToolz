@@ -1,7 +1,7 @@
 {
   "name": "T.L-AutoDevelop",
-  "version": "2.3.2",
-  "description": "Interactive .NET dev pipeline with user confirmations. Plan, implement, preflight, review for single tasks and parallel batches.",
+  "version": "3.0.0",
+  "description": "Interactive .NET dev pipeline with scheduler-managed single tasks, wave-safe merges, and parallel batches.",
   "author": {
     "name": "TLeiott",
     "url": "https://github.com/TLeiott"

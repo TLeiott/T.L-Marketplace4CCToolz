@@ -4,22 +4,22 @@ A Claude Code plugin marketplace providing .NET development pipeline tools.
 
 ## What's Included
 
-### T.L-AutoDevelop (v2.3.1) — Interactive
+### T.L-AutoDevelop (v3.0.0) — Interactive
 
 An interactive development pipeline that orchestrates Claude Code through discovery, investigation, optional bug reproduction, fix planning, implementation, preflight, and review — with user confirmations before each commit.
 
 | Command | Description |
 |---------|-------------|
-| `/develop [task]` | Single task with user confirmations before commit |
+| `/develop [task]` | Scheduler-managed single task with read-only planning, queueing, and merge-ready commit confirmation |
 | `/develop-batch [tasks.md]` | Batched git-worktree pipeline with read-only scheduling, statusline-aware launch gating, conservative parallel waves, confirms each commit |
 
-### T.L-AutoDevelop-Pro (v2.3.1) — Autonomous
+### T.L-AutoDevelop-Pro (v3.0.0) — Autonomous
 
 A fully autonomous development pipeline — zero confirmations. Runs discovery, investigation, optional bug reproduction, fix planning, implement, preflight, review, and commit end-to-end unattended.
 
 | Command | Description |
 |---------|-------------|
-| `/TLA-develop [task]` | Single task, zero confirmations, auto-commit |
+| `/TLA-develop [task]` | Scheduler-managed single task with read-only planning, queueing, and wave-safe auto-commit |
 | `/TLA-develop-batch [tasks.md]` | Batched pipeline with read-only scheduling, statusline-aware launch gating, conservative parallel waves, fully automated after startup |
 
 **Pipeline Flow:**
@@ -35,6 +35,8 @@ Discover -> Investigate -> optional Reproduce -> Fix Plan -> Implement -> Change
 - Investigation phase for ambiguous or diagnostic tasks
 - Optional failing-test reproduction for testable bugfix work
 - Semantic fix-plan validation that rejects placeholder/template plans
+- Single-task launchers now perform a read-only context pass, submit into a repo-scoped scheduler, and only merge accepted work in wave order
+- Single-task scheduler-managed runs may queue behind active work and only surface interactive commit once a task is merge-ready in sequence
 - Batch launchers now perform a read-only context pass, build conservative conflict/dependency waves, and may run up to 20 simultaneous pipelines when scopes are clearly disjoint
 - Before each new batch launch slot, the launcher probes the local Claude statusline / usage cache and pauses starts when the 5h usage window is at or above 90%
 - The usage helper accepts trusted commands from the main Claude folder, falls back to `%USERPROFILE%\\.claude\\statusline.ps1` when available, and emits JSON for handled unavailable states instead of failing the batch outright

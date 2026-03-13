@@ -6,7 +6,7 @@ Autonomous addon for [T.L-AutoDevelop](../T.L-AutoDevelop/). Zero confirmations 
 
 ## Skills
 
-- **`/TLA-develop`** — Fully autonomous single-task pipeline. No user input after launch, auto-commits on success.
+- **`/TLA-develop`** — Fully autonomous scheduler-managed single-task pipeline with read-only planning, queueing, and wave-safe auto-commit.
 - **`/TLA-develop-batch`** — Fully autonomous batched pipeline with read-only task scheduling, statusline-aware 5h launch gating, and conservative parallel waves. Auto-commits all accepted tasks, with at most one preflight question if both usage sources are unavailable.
 
 ## Differences from T.L-AutoDevelop
