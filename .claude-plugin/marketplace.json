@@ -9,13 +9,13 @@
       "name": "T.L-AutoDevelop",
       "source": "./plugins/T.L-AutoDevelop",
       "description": "Interactive .NET dev pipeline. Skills: /develop, /develop-batch. User confirms each commit.",
-      "version": "2.3.1"
+      "version": "2.3.2"
     },
     {
       "name": "T.L-AutoDevelop-Pro",
       "source": "./plugins/T.L-AutoDevelop-Pro",
       "description": "Autonomous .NET dev pipeline. Skills: /TLA-develop, /TLA-develop-batch. Zero confirmations, auto-commits.",
-      "version": "2.3.1"
+      "version": "2.3.2"
     }
   ]
 }

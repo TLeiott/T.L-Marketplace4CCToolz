@@ -17,7 +17,7 @@ $CONST_MAX_TURNS_DISCOVER = 12
 $CONST_MAX_TURNS_PLAN = 18
 $CONST_MAX_TURNS_INVESTIGATE = 14
 $CONST_MAX_TURNS_IMPL = 24
-$CONST_MAX_TURNS_REVIEW = 8
+$CONST_MAX_TURNS_REVIEW = 12
 $CONST_TIMEOUT_SECONDS = 900
 $CONST_DISCOVER_ATTEMPTS = 2
 $CONST_PLAN_ATTEMPTS = 2
@@ -104,6 +104,46 @@ function Invoke-NativeCommand {
         & $Command @Arguments 2>&1
     }
     return @{ output = ($output | Out-String).Trim(); exitCode = $LASTEXITCODE }
+}
+
+function Get-CanonicalPath {
+    param([string]$Path)
+    if (-not $Path) { return $Path }
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        $fullPath = $Path
+    }
+    try {
+        return (Get-Item -LiteralPath $fullPath -ErrorAction Stop).FullName
+    } catch {
+        return $fullPath
+    }
+}
+
+function Normalize-RepoRelativePath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    $normalized = $Path.Trim().Replace("/", "\")
+    while ($normalized.StartsWith(".\")) {
+        $normalized = $normalized.Substring(2)
+    }
+    return $normalized.TrimStart('\')
+}
+
+function Get-TaskClaimGuardrail {
+    param(
+        [string]$TaskText,
+        [bool]$ReproductionConfirmed
+    )
+    if ($ReproductionConfirmed -or -not $TaskText) { return "" }
+    if ($TaskText -notmatch '(?i)root cause|pflicht-?tests|bekannte review-blocker|nonexistent object|update-ref') { return "" }
+    return @"
+WICHTIGER GUARDRAIL:
+- Behandle Root-Cause-, Pflicht-Test- oder Review-Blocker-Behauptungen aus dem Task nur als Claims, solange keine lokale Reproduktion bestaetigt ist.
+- Erzwinge keinen Negativtest, der lokal nicht deterministisch reproduzierbar ist.
+- Wenn ein behaupteter Negativtest der lokalen Git-/Testrealitaet widerspricht, benenne das kurz und plane/implementiere nur belastbare, lokal gruene Tests.
+"@
 }
 
 function Add-TimelineEvent {
@@ -530,7 +570,7 @@ function Get-DiffBlocksByFile {
     $blocks = [System.Collections.ArrayList]::new()
     if (-not $DiffText) { return @($blocks) }
 
-    $matches = [regex]::Matches($DiffText, '(?m)^diff --git a/(?<a>.+?) b/(?<b>.+?)$')
+    $matches = [regex]::Matches($DiffText, '(?m)^diff --git a/(?<a>[^\r\n]+?) b/(?<b>[^\r\n]+?)\r?$')
     if ($matches.Count -eq 0) {
         [void]$blocks.Add([ordered]@{ path = "(patch)"; diff = $DiffText.Trim() })
         return @($blocks)
@@ -539,7 +579,7 @@ function Get-DiffBlocksByFile {
     for ($i = 0; $i -lt $matches.Count; $i++) {
         $start = $matches[$i].Index
         $end = if ($i + 1 -lt $matches.Count) { $matches[$i + 1].Index } else { $DiffText.Length }
-        $path = $matches[$i].Groups['b'].Value.Replace("/", "\")
+        $path = Normalize-RepoRelativePath -Path $matches[$i].Groups['b'].Value
         $blockText = $DiffText.Substring($start, $end - $start).Trim()
         [void]$blocks.Add([ordered]@{
             path = $path
@@ -556,16 +596,41 @@ function Get-DiffTextForFile {
         [string]$Path
     )
     if (-not $Path) { return "" }
-    $normalized = $Path.Replace("/", "\")
-    $exact = @($Blocks | Where-Object { $_.path -ieq $normalized })
+    $normalized = Normalize-RepoRelativePath -Path $Path
+    $exact = @($Blocks | Where-Object { (Normalize-RepoRelativePath -Path ([string]$_.path)) -ieq $normalized })
     if ($exact.Count -gt 0) { return [string]$exact[0].diff }
     $suffix = @($Blocks | Where-Object {
-        $candidate = [string]$_.path
+        $candidate = Normalize-RepoRelativePath -Path ([string]$_.path)
+        if (-not $candidate) { return $false }
         $candidate.EndsWith($normalized, [System.StringComparison]::OrdinalIgnoreCase) -or
         $normalized.EndsWith($candidate, [System.StringComparison]::OrdinalIgnoreCase)
     })
     if ($suffix.Count -gt 0) { return [string]$suffix[0].diff }
     return ""
+}
+
+function Get-SyntheticReviewContentForFile {
+    param([string]$Path)
+    $normalized = Normalize-RepoRelativePath -Path $Path
+    if (-not $normalized) { return "" }
+    $fullPath = Join-Path (Get-Location).Path $normalized
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { return "" }
+    try {
+        $content = [System.IO.File]::ReadAllText($fullPath, [System.Text.Encoding]::UTF8)
+    } catch {
+        try {
+            $content = [System.IO.File]::ReadAllText($fullPath)
+        } catch {
+            return ""
+        }
+    }
+    $body = $content.TrimEnd()
+    if (-not $body) { $body = "(leere Datei)" }
+    return @"
+NEW / UNTRACKED DATEI: $normalized
+DATEIINHALT:
+$body
+"@.Trim()
 }
 
 function Get-DiffHunks {
@@ -753,12 +818,14 @@ function Get-CompactReviewPayload {
         [void]$parts.Add("DIFFSTAT:`n" + (Clip-Text -Text $DiffStat -MaxChars 1200 -Marker "Diffstat gekuerzt"))
     }
     $diffBlocks = Get-DiffBlocksByFile -DiffText $DiffText
-    $preserveFullDiffs = (-not $LowRiskReview) -and $reviewFiles.Count -gt 0 -and $reviewFiles.Count -le $CONST_REVIEW_FULL_PRESERVE_MAX_FILES -and $DiffText.Length -le $CONST_REVIEW_FULL_PRESERVE_MAX_DIFF_CHARS
+    $missingDirectDiffs = @($reviewFiles | Where-Object { -not (Get-DiffTextForFile -Blocks $diffBlocks -Path $_) })
+    $preserveFullDiffs = (-not $LowRiskReview) -and $reviewFiles.Count -gt 0 -and $reviewFiles.Count -le $CONST_REVIEW_FULL_PRESERVE_MAX_FILES -and $DiffText.Length -le $CONST_REVIEW_FULL_PRESERVE_MAX_DIFF_CHARS -and $missingDirectDiffs.Count -eq 0
     if ($reviewFiles.Count -gt 0) {
         $perFileBudget = if ($preserveFullDiffs) { 0 } else { [Math]::Max(1, [int][Math]::Floor($maxDiffChars / [Math]::Max(1, $reviewFiles.Count))) }
         $fileSections = foreach ($file in $reviewFiles) {
             $fileDiff = Get-DiffTextForFile -Blocks $diffBlocks -Path $file
-            if (-not $fileDiff) { $fileDiff = "Kein Diffblock fuer diese Datei gefunden." }
+            if (-not $fileDiff) { $fileDiff = Get-SyntheticReviewContentForFile -Path $file }
+            if (-not $fileDiff) { $fileDiff = "Kein Diffblock oder Dateitext fuer diese Datei gefunden." }
             $fileKind = Get-ReviewFileKind -Path $file
             if ($preserveFullDiffs) {
                 "DATEI: $file`n$fileDiff"
@@ -953,16 +1020,8 @@ function Get-ActionableItems {
 function Get-RelativePath {
     param([string]$BasePath, [string]$TargetPath)
     if (-not $BasePath -or -not $TargetPath) { return $TargetPath }
-    try {
-        $baseResolved = (Resolve-Path $BasePath).Path
-    } catch {
-        $baseResolved = $BasePath
-    }
-    try {
-        $targetResolved = (Resolve-Path $TargetPath).Path
-    } catch {
-        $targetResolved = $TargetPath
-    }
+    $baseResolved = Get-CanonicalPath -Path $BasePath
+    $targetResolved = Get-CanonicalPath -Path $TargetPath
     $baseUri = [System.Uri]::new($baseResolved.TrimEnd('\') + "\")
     $targetUri = [System.Uri]::new($targetResolved)
     return [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
@@ -1135,13 +1194,16 @@ function Test-ReproductionChangeSet {
     )
 
     $allowedPrefixes = @($TestProjects | ForEach-Object {
-        ($_.directoryRelPath.Replace("/", "\").TrimEnd('\')) + "\"
-    })
-    $allowedProjectFiles = @($TestProjects | ForEach-Object { $_.relPath.Replace("/", "\") })
+        $prefix = Normalize-RepoRelativePath -Path $_.directoryRelPath
+        if ($prefix) { $prefix.TrimEnd('\') + "\" }
+    } | Where-Object { $_ } | Select-Object -Unique)
+    $allowedProjectFiles = @($TestProjects | ForEach-Object {
+        Normalize-RepoRelativePath -Path $_.relPath
+    } | Where-Object { $_ } | Select-Object -Unique)
     $invalidFiles = [System.Collections.ArrayList]::new()
 
     foreach ($file in @($ChangedFiles)) {
-        $normalized = $file.Replace("/", "\").TrimStart(@('.', '\'))
+        $normalized = Normalize-RepoRelativePath -Path $file
         $allowed = $allowedProjectFiles -contains $normalized
         if (-not $allowed) {
             foreach ($prefix in $allowedPrefixes) {
@@ -1817,9 +1879,10 @@ function Invoke-ClaudeReview {
 function Get-ReviewVerdict {
     param([string]$ReviewOutput)
     $lines = @($ReviewOutput -split "`n" | Where-Object { $_.Trim() -ne "" })
-    if ($lines.Count -eq 0) { return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = "Leere Review-Antwort" } }
+    if ($lines.Count -eq 0) { return @{ verdict = "INFRA_FAILURE"; severity = ""; feedback = "Leere Review-Antwort" } }
 
-    $firstLine = $lines[0].Trim().ToUpperInvariant()
+    $firstLineRaw = $lines[0].Trim()
+    $firstLine = $firstLineRaw.ToUpperInvariant()
     $feedbackText = ($lines | Select-Object -Skip 1) -join "`n"
 
     if ($firstLine -match "^ACCEPTED\b") {
@@ -1830,6 +1893,9 @@ function Get-ReviewVerdict {
     }
     if ($firstLine -match "^DENIED\b") {
         return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = $feedbackText }
+    }
+    if ($firstLineRaw -match '(?i)^error:\s*' -or $firstLineRaw -match '(?i)\bmax turns\b' -or $firstLineRaw -match '(?i)\btimeout\b' -or $firstLineRaw -match '(?i)\btimed out\b') {
+        return @{ verdict = "INFRA_FAILURE"; severity = ""; feedback = $ReviewOutput.Trim() }
     }
     return @{ verdict = "DENIED"; severity = "MAJOR"; feedback = "Reviewer-Antwort unklar (erste Zeile: '$($lines[0])')`n$ReviewOutput" }
 }
@@ -2409,11 +2475,14 @@ NEXT_ACTION:
             $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "RESULT: CHANGE_NEEDED`nTARGET_FILES:`n- " + (($planTargets | Select-Object -First 5) -join "`n- ") }
             $reproductionTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
             $reproTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $reproductionTargets
+            $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $false
             $reproPrompt = @"
 Versuche, den Bug ueber automatisierte Tests zu reproduzieren. Aendere in dieser Phase NUR Testdateien oder Testprojektdateien.
 
 AUFGABE:
 $taskPrompt
+
+$taskClaimGuardrail
 
 SOLUTION: $worktreeSln
 TASK_CLASS: $taskClass
@@ -2540,6 +2609,7 @@ RATIONALE:
         $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "Keine gesonderte Investigation ausgefuehrt." }
         $planContextTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
         $planContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $planContextTargets
+        $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $reproductionConfirmed
         $reproductionBlock = if ($reproductionConfirmed) {
 @"
 RESULT: REPRODUCED
@@ -2564,6 +2634,8 @@ Sei kompakt: maximal 5 Dateien oder Suchflaechen und maximal 4 Reihenfolge-Schri
 
 AUFGABE:
 $taskPrompt
+
+$taskClaimGuardrail
 
 SOLUTION: $worktreeSln
 
@@ -2653,6 +2725,8 @@ Bleibe kompakt: maximal 5 Dateien oder Suchflaechen und maximal 4 Reihenfolge-Sc
 
 AUFGABE:
 $taskPrompt
+
+$taskClaimGuardrail
 
 SOLUTION: $worktreeSln
 
@@ -2774,12 +2848,15 @@ $($reproductionTests.bugBehavior)
             "Keine verifizierte Test-Reproduktion vorhanden."
         }
         $implementPlan = Clip-Text -Text $planOutput -MaxChars 2600 -Marker "Fix-Plan gekuerzt"
+        $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $reproductionConfirmed
         $implPrompt = @"
 Setze die Aenderung um. Du darfst nicht raten.
 Arbeite fokussiert. Oeffne nur zielrelevante Dateien. Gib am Ende nur das geforderte kurze Ergebnisformat aus.
 
 AUFGABE:
 $taskPrompt
+
+$taskClaimGuardrail
 
 SOLUTION: $worktreeSln
 TASK_CLASS: $taskClass
@@ -3042,7 +3119,6 @@ SUMMARY:
             } else { "" }
 
             $currentPhase = "REVIEW"
-            $attemptsByPhase.review = [Math]::Max($attemptsByPhase.review, $reviewCycle + 1)
             $diffForReview = (Invoke-NativeCommand git @("diff", "HEAD")).output
             $diffStatForReview = (Invoke-NativeCommand git @("diff", "--stat", "HEAD")).output
             Save-Artifact -Name "git-diff-$cycleLabel.patch" -Content $diffForReview | Out-Null
@@ -3056,12 +3132,15 @@ SUMMARY:
             }
             $reviewModel = Get-ModelForReview -ChangedFiles $changedFiles -DiffText $diffForReview -WarningText $warningText -ReproductionConfirmed $reproductionConfirmed -TaskClass $taskClass -ForceFullReview:(-not $lowRiskReview)
             $reviewPayload = $reviewPayloadInfo.payload
+            $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $reproductionConfirmed
             $reviewPrompt = @"
 $reviewerContent
 
 ---
 
 REVIEW_SCOPE: $(if ($lowRiskReview) { "LOW_RISK_COMPACT" } else { "FULL" })
+
+$taskClaimGuardrail
 
 $reviewPayload
 
@@ -3070,15 +3149,43 @@ $reviewPayload
 URSPRUENGLICHER TASK:
 $taskPrompt
 "@
-            $reviewResult = Invoke-ClaudeReview -Prompt $reviewPrompt -AttemptLabel $cycleLabel -Model $reviewModel
-            if (-not $reviewResult.success) {
-                Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "REVIEW" -Category "REVIEW_CALL_FAILED" -Feedback $reviewResult.output
-                $reviewCycle++
-                $attemptsByPhase.remediate = [Math]::Max($attemptsByPhase.remediate, $reviewCycle)
-                continue
+            $reviewInfraAttempt = 0
+            while ($true) {
+                $reviewInfraAttempt++
+                $reviewAttemptNumber = (($reviewCycle * ($CONST_REMEDIATION_ATTEMPTS + 1)) + $reviewInfraAttempt)
+                $attemptsByPhase.review = [Math]::Max($attemptsByPhase.review, $reviewAttemptNumber)
+                $reviewAttemptLabel = if ($reviewInfraAttempt -eq 1) { $cycleLabel } else { "$cycleLabel-retry$reviewInfraAttempt" }
+                $reviewResult = Invoke-ClaudeReview -Prompt $reviewPrompt -AttemptLabel $reviewAttemptLabel -Model $reviewModel
+                if (-not $reviewResult.success) {
+                    $infraFeedback = if ($reviewResult.output) { $reviewResult.output } else { "Review-Aufruf fehlgeschlagen." }
+                    Add-FeedbackEntry -Attempt $reviewAttemptNumber -Source "REVIEW" -Category "REVIEW_INFRA_FAILURE" -Feedback $infraFeedback
+                    Add-TimelineEvent -Phase "REVIEW" -Message "Review-Infrastrukturfehler beim Aufruf." -Category "REVIEW_INFRA_FAILURE"
+                    if ($reviewInfraAttempt -ge ($CONST_REMEDIATION_ATTEMPTS + 1)) {
+                        $finalStatus = "FAILED"
+                        $finalCategory = "REVIEW_INFRA_FAILURE"
+                        $finalSummary = "Review konnte nach mehrfachen Infrastruktur-Retries nicht erfolgreich ausgefuehrt werden."
+                        $finalFeedback = $infraFeedback
+                        throw [System.Exception]::new("TERMINAL_REVIEW_INFRA_FAILURE")
+                    }
+                    continue
+                }
+
+                $verdict = Get-ReviewVerdict -ReviewOutput $reviewResult.output
+                if ($verdict.verdict -eq "INFRA_FAILURE") {
+                    Add-FeedbackEntry -Attempt $reviewAttemptNumber -Source "REVIEW" -Category "REVIEW_INFRA_FAILURE" -Feedback $verdict.feedback
+                    Add-TimelineEvent -Phase "REVIEW" -Message "Review-Infrastrukturfehler in der Antwort." -Category "REVIEW_INFRA_FAILURE"
+                    if ($reviewInfraAttempt -ge ($CONST_REMEDIATION_ATTEMPTS + 1)) {
+                        $finalStatus = "FAILED"
+                        $finalCategory = "REVIEW_INFRA_FAILURE"
+                        $finalSummary = "Review konnte nach mehrfachen Infrastruktur-Retries kein parsebares Urteil liefern."
+                        $finalFeedback = $verdict.feedback
+                        throw [System.Exception]::new("TERMINAL_REVIEW_INFRA_FAILURE")
+                    }
+                    continue
+                }
+                break
             }
 
-            $verdict = Get-ReviewVerdict -ReviewOutput $reviewResult.output
             Add-TimelineEvent -Phase "REVIEW" -Message "Review-Verdict: $($verdict.verdict)" -Category $verdict.severity
             if ($verdict.verdict -eq "ACCEPTED") {
                 $finalVerdict = "ACCEPTED"

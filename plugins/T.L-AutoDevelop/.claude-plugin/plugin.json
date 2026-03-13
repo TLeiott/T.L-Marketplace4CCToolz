@@ -1,6 +1,6 @@
 {
   "name": "T.L-AutoDevelop",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "description": "Interactive .NET dev pipeline with user confirmations. Plan, implement, preflight, review for single tasks and parallel batches.",
   "author": {
     "name": "TLeiott",
