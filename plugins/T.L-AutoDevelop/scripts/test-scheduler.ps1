@@ -64,6 +64,9 @@ function New-TestLatestRun {
         actualFiles = @()
         branchName = ""
         artifacts = $null
+        runDir = ""
+        schedulerSnapshotPath = ""
+        timelinePath = ""
     }
 }
 
@@ -1384,6 +1387,283 @@ function Test-ExternalMergeReconciliation {
     }
 }
 
+function Test-SnapshotIncludesStructuredProgress {
+    $repo = New-TestRepo
+    try {
+        $runDir = Join-Path $repo.root ".claude-develop-logs\runs\running-task"
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $runDir "scheduler-snapshot.json"), (@{
+            currentPhase = "IMPLEMENT"
+            changedFiles = @("src\\Feature.cs")
+        } | ConvertTo-Json -Depth 6), [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText((Join-Path $runDir "timeline.json"), (@(
+            @{
+                timestamp = (Get-Date).AddMinutes(-1).ToString("o")
+                phase = "IMPLEMENT"
+                message = "Repair implementation changed files."
+                category = "CHANGE_APPLIED"
+                data = @{ files = @("src\\Feature.cs") }
+            }
+        ) | ConvertTo-Json -Depth 6), [System.Text.Encoding]::UTF8)
+
+        $eventsFile = Join-Path $repo.root ".claude-develop-logs\scheduler\events.jsonl"
+        New-Item -ItemType Directory -Path (Split-Path $eventsFile -Parent) -Force | Out-Null
+        Add-Content -LiteralPath $eventsFile -Value (@{
+            timestamp = (Get-Date).ToString("o")
+            taskId = "running-progress"
+            kind = "started"
+            message = "Task pipeline started."
+            data = @{ attempt = 1; waveNumber = 1 }
+        } | ConvertTo-Json -Compress -Depth 6) -Encoding UTF8
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "running-progress"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "show progress"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "running-progress.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "running-task"
+                        resultFile = (Join-Path $repo.resultsDir "running-progress.json")
+                        processId = $PID
+                        startedAt = (Get-Date).AddMinutes(-3).ToString("o")
+                        completedAt = ""
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                        runDir = $runDir
+                        schedulerSnapshotPath = (Join-Path $runDir "scheduler-snapshot.json")
+                        timelinePath = (Join-Path $runDir "timeline.json")
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "running-progress" })[0]
+
+        Assert-True ([string]$task.progress.phaseLabel -eq "Implement") "Snapshot should expose the live worker phase label."
+        Assert-True ([string]$task.progress.latestMilestone -eq "Repair implementation changed files.") "Snapshot should expose the latest display-safe milestone."
+        Assert-True (@($task.progress.changedFilesPreview).Count -eq 1) "Snapshot should expose changed file previews."
+        Assert-True ([int]$snapshot.queueProgressSummary.runningCount -eq 1) "Snapshot should expose queue progress summary counts."
+        Assert-True (@($snapshot.runningTaskProgress).Count -eq 1) "Snapshot should expose running task progress entries."
+        Assert-True (@($snapshot.recentQueueEvents).Count -ge 1) "Snapshot should expose recent queue events."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-MalformedProgressArtifactsDoNotBreakSnapshot {
+    $repo = New-TestRepo
+    try {
+        $runDir = Join-Path $repo.root ".claude-develop-logs\runs\malformed-task"
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $runDir "scheduler-snapshot.json"), '{"currentPhase":', [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText((Join-Path $runDir "timeline.json"), '[{', [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "malformed-progress"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "fallback progress"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "malformed-progress.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "malformed-task"
+                        resultFile = (Join-Path $repo.resultsDir "malformed-progress.json")
+                        processId = $PID
+                        startedAt = (Get-Date).AddMinutes(-2).ToString("o")
+                        completedAt = ""
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = "fallback summary"
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                        runDir = $runDir
+                        schedulerSnapshotPath = (Join-Path $runDir "scheduler-snapshot.json")
+                        timelinePath = (Join-Path $runDir "timeline.json")
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "malformed-progress" })[0]
+
+        Assert-True ([string]$task.state -eq "running") "Malformed progress artifacts must not break snapshot reconciliation."
+        Assert-True ([string]$task.progress.detail -eq "fallback summary") "Malformed progress artifacts should fall back to task summary."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ProgressMilestonesTranslateToEnglish {
+    $repo = New-TestRepo
+    try {
+        $runDir = Join-Path $repo.root ".claude-develop-logs\runs\translated-task"
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $runDir "timeline.json"), (@(
+            @{
+                timestamp = (Get-Date).AddMinutes(-1).ToString("o")
+                phase = "MODEL"
+                message = "FIX_PLAN nutzt claude-sonnet"
+                category = "FIX_PLAN_MODEL"
+                data = @{}
+            }
+        ) | ConvertTo-Json -Depth 6), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "translated-progress"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "translated progress"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "translated-progress.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "translated-task"
+                        resultFile = (Join-Path $repo.resultsDir "translated-progress.json")
+                        processId = $PID
+                        startedAt = (Get-Date).AddMinutes(-1).ToString("o")
+                        completedAt = ""
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                        runDir = $runDir
+                        schedulerSnapshotPath = (Join-Path $runDir "scheduler-snapshot.json")
+                        timelinePath = (Join-Path $runDir "timeline.json")
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "translated-progress" })[0]
+
+        Assert-True ([string]$task.progress.latestMilestone -eq "FIX_PLAN uses claude-sonnet") "Surfaced progress milestones should be translated to English."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-OldFailuresDoNotReopenBreaker {
     $repo = New-TestRepo
     try {
@@ -1750,6 +2030,9 @@ Test-ManualOverridePersistsAcrossSnapshots
 Test-SharedFileWithoutConflictDoesNotRequeue
 Test-RealMergeConflictStillRetries
 Test-ExternalMergeReconciliation
+Test-SnapshotIncludesStructuredProgress
+Test-MalformedProgressArtifactsDoNotBreakSnapshot
+Test-ProgressMilestonesTranslateToEnglish
 Test-TlaMergeLockRemediation
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
