@@ -189,6 +189,8 @@ Whenever you are re-entered after one or more tasks completed, always do this in
 4. Snapshot again after `prepare-merge`.
 5. Start any newly startable tasks only after the merge situation is resolved.
 
+`nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued`, `retry_scheduled`, or `running`. The scheduler only surfaces merge turns after the whole wave is finished.
+
 Per-task merge flow:
 - If the prepared task has `sourceCommand = "develop"`, it should be in `waiting_user_test`.
 - Summarize that task and tell the user to test it now.
