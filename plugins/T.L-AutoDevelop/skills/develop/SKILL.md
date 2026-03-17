@@ -57,11 +57,22 @@ Task-file mode rules:
 - Extract individual tasks from bullet items, numbered items, or plain non-empty lines.
 - Preserve source order.
 - Ignore headings and blank lines.
+- Support optional inline annotations:
+  - `[after: <task id or earlier task number>]`
+  - `[priority: high|normal|low]`
+  - `[serial]`
+
+Semantics:
+- `[after: ...]` is a hard execution dependency, not just a planning hint.
+- Tasks declared with `[after: ...]` must run in a later wave and must not start in parallel with their dependency target.
 
 Each extracted task needs:
 - `taskText`
 - `sourceCommand = "develop"`
 - `sourceInputType = "file"` or `"inline"`
+- optional `declaredDependencies`
+- optional `declaredPriority`
+- optional `serialOnly`
 
 ## 5. Create Temp Artifacts
 
@@ -120,6 +131,9 @@ Read the returned JSON and keep:
 - `startableTaskIds`
 - `nextMergeTaskId`
 - `mergePreparedTaskId`
+- `plannerFeedbackSummary`
+- `usageProjection`
+- `circuitBreaker`
 - `unknownAutoBranches`
 
 If unknown `auto/*` branches are reported, tell the user before proceeding.
@@ -148,6 +162,7 @@ Give it:
 - the new tasks added in this invocation
 - the current running tasks
 - the current pending-merge tasks
+- recent planner feedback from `plannerFeedbackSummary`
 - the nearest relevant `CLAUDE.md`, `AGENTS.md`, and `README.md`
 - up to three additional nearby `*.md` files from relevant module or `docs/` directories
 
@@ -179,6 +194,10 @@ Tell the user:
 - which tasks were started now
 - which tasks were queued for later waves
 - whether any tasks are currently retry-scheduled
+- whether the circuit breaker is open
+- the projected queue cost from `usageProjection`
+
+If `circuitBreaker.status == "manual_override"`, report that the breaker is temporarily suppressed until `manualOverrideUntil`.
 
 ## 11. Handle Completions and Merge Turns
 
@@ -189,11 +208,12 @@ Whenever you are re-entered after one or more tasks completed, always do this in
 4. Snapshot again after `prepare-merge`.
 5. Start any newly startable tasks only after the merge situation is resolved.
 
-`nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued`, `retry_scheduled`, or `running`. The scheduler only surfaces merge turns after the whole wave is finished.
+`nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
 Per-task merge flow:
 - If the prepared task has `sourceCommand = "develop"`, it should be in `waiting_user_test`.
-- Summarize that task and tell the user to test it now.
+- Use the merge preview from the scheduler result or `mergePreparedPreview` in the snapshot.
+- Summarize the task, changed files, diff stat, review verdict, preflight status, and repro status before asking the user to test it now.
 - Ask for one of: `commit`, `abort`, `discard`, `requeue`.
 - If the prepared task has `sourceCommand = "TLA-develop"`, resolve it with `commit` immediately instead of pausing for manual testing.
 
@@ -239,6 +259,7 @@ Run the scheduler-agent planning pass whenever the queue materially changes:
 - task completion
 - retry scheduling
 - merge resolution
+- circuit-breaker clear
 
 Do not rely on stale wave assignments once the queue changes.
 

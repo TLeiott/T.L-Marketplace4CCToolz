@@ -1,6 +1,6 @@
 # scheduler.ps1 -- Repo-scoped queue scheduler for AutoDevelop v4
 param(
-    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge", "admin-edit-task")][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge", "admin-edit-task", "admin-clear-breaker")][string]$Mode,
     [string]$SolutionPath = "",
     [string]$TasksFile = "",
     [string]$PlanFile = "",
@@ -138,6 +138,7 @@ function New-EmptyState {
         createdAt = (Get-Date).ToString("o")
         updatedAt = (Get-Date).ToString("o")
         lastPlanAppliedAt = ""
+        circuitBreaker = (New-CircuitBreakerRecord)
         tasks = @()
     }
 }
@@ -164,6 +165,18 @@ function Load-State {
     }
     if (-not $state.lastPlanAppliedAt) {
         $state | Add-Member -NotePropertyName lastPlanAppliedAt -NotePropertyValue "" -Force
+    }
+    if (-not $state.circuitBreaker) {
+        $state | Add-Member -NotePropertyName circuitBreaker -NotePropertyValue (New-CircuitBreakerRecord) -Force
+    } else {
+        $breaker = New-CircuitBreakerRecord
+        foreach ($property in @("status", "openedAt", "closedAt", "scopeWave", "reasonCategory", "reasonSummary", "affectedTaskIds", "manualOverrideUntil")) {
+            if ($null -ne $state.circuitBreaker.$property) {
+                Set-ObjectProperty -Object $breaker -Name $property -Value $state.circuitBreaker.$property
+            }
+        }
+        Set-ObjectProperty -Object $breaker -Name "affectedTaskIds" -Value @(Normalize-StringArray -Value $breaker.affectedTaskIds)
+        $state | Add-Member -NotePropertyName circuitBreaker -NotePropertyValue $breaker -Force
     }
     foreach ($task in @(Get-Tasks -State $state)) {
         Ensure-TaskShape -Task $task -RepoRoot $state.repoRoot
@@ -388,6 +401,31 @@ function New-MergeRecord {
     }
 }
 
+function New-CircuitBreakerRecord {
+    return [pscustomobject]@{
+        status = "closed"
+        openedAt = ""
+        closedAt = ""
+        scopeWave = 0
+        reasonCategory = ""
+        reasonSummary = ""
+        affectedTaskIds = @()
+        manualOverrideUntil = ""
+    }
+}
+
+$script:CircuitBreakerRecentWindowMinutes = 30
+
+function Normalize-Priority {
+    param([string]$Priority)
+
+    switch (($Priority | ForEach-Object { [string]$_ }).Trim().ToLowerInvariant()) {
+        "high" { return "high" }
+        "low" { return "low" }
+        default { return "normal" }
+    }
+}
+
 function Normalize-StringArray {
     param($Value)
 
@@ -487,6 +525,23 @@ function Normalize-TaskRecord {
     if (-not $Task.plannerMetadata) {
         Set-ObjectProperty -Object $Task -Name "plannerMetadata" -Value ([pscustomobject]@{})
     }
+    if (-not $Task.plannerFeedback) {
+        Set-ObjectProperty -Object $Task -Name "plannerFeedback" -Value ([pscustomobject]@{})
+    }
+    Set-ObjectProperty -Object $Task -Name "declaredDependencies" -Value @(Normalize-StringArray -Value $Task.declaredDependencies)
+    Set-ObjectProperty -Object $Task -Name "declaredPriority" -Value (Normalize-Priority -Priority ([string]$Task.declaredPriority))
+    if ($null -eq $Task.serialOnly) {
+        Set-ObjectProperty -Object $Task -Name "serialOnly" -Value $false
+    }
+    if ($null -eq $Task.usageCostClass) {
+        Set-ObjectProperty -Object $Task -Name "usageCostClass" -Value "MEDIUM"
+    }
+    if ($null -eq $Task.usageEstimateMinutes) {
+        Set-ObjectProperty -Object $Task -Name "usageEstimateMinutes" -Value 20
+    }
+    if ($null -eq $Task.usageEstimateSource) {
+        Set-ObjectProperty -Object $Task -Name "usageEstimateSource" -Value "heuristic"
+    }
     if ($null -eq $Task.maxMergeAttempts) {
         Set-ObjectProperty -Object $Task -Name "maxMergeAttempts" -Value 3
     }
@@ -525,8 +580,15 @@ function Ensure-TaskShape {
     if ($null -eq $Task.mergeAttemptsUsed) { $Task | Add-Member -NotePropertyName mergeAttemptsUsed -NotePropertyValue 0 -Force }
     if ($null -eq $Task.mergeAttemptsRemaining) { $Task | Add-Member -NotePropertyName mergeAttemptsRemaining -NotePropertyValue 3 -Force }
     if ($null -eq $Task.blockedBy) { $Task | Add-Member -NotePropertyName blockedBy -NotePropertyValue @() -Force }
+    if ($null -eq $Task.declaredDependencies) { $Task | Add-Member -NotePropertyName declaredDependencies -NotePropertyValue @() -Force }
+    if ($null -eq $Task.declaredPriority) { $Task | Add-Member -NotePropertyName declaredPriority -NotePropertyValue "normal" -Force }
+    if ($null -eq $Task.serialOnly) { $Task | Add-Member -NotePropertyName serialOnly -NotePropertyValue $false -Force }
+    if ($null -eq $Task.usageCostClass) { $Task | Add-Member -NotePropertyName usageCostClass -NotePropertyValue "MEDIUM" -Force }
+    if ($null -eq $Task.usageEstimateMinutes) { $Task | Add-Member -NotePropertyName usageEstimateMinutes -NotePropertyValue 20 -Force }
+    if ($null -eq $Task.usageEstimateSource) { $Task | Add-Member -NotePropertyName usageEstimateSource -NotePropertyValue "heuristic" -Force }
     if ($null -eq $Task.runs) { $Task | Add-Member -NotePropertyName runs -NotePropertyValue @() -Force }
     if (-not $Task.plannerMetadata) { $Task | Add-Member -NotePropertyName plannerMetadata -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if (-not $Task.plannerFeedback) { $Task | Add-Member -NotePropertyName plannerFeedback -NotePropertyValue ([pscustomobject]@{}) -Force }
     if ($null -eq $Task.latestRun) { $Task | Add-Member -NotePropertyName latestRun -NotePropertyValue (New-LatestRunRecord) -Force }
     if (-not $Task.merge) {
         $Task | Add-Member -NotePropertyName merge -NotePropertyValue (New-MergeRecord) -Force
@@ -550,6 +612,110 @@ function Get-TaskSummaryText {
     return ""
 }
 
+function Get-UsageEstimateForTask {
+    param(
+        $State,
+        $Task
+    )
+
+    $historyMinutes = @(
+        (Get-Tasks -State $State) |
+            Where-Object {
+                $_.taskId -ne $Task.taskId -and
+                $_.latestRun.startedAt -and
+                $_.latestRun.completedAt
+            } |
+            ForEach-Object {
+                try {
+                    $start = [datetime]$_.latestRun.startedAt
+                    $end = [datetime]$_.latestRun.completedAt
+                    [int][Math]::Ceiling(($end - $start).TotalMinutes)
+                } catch {
+                }
+            } |
+            Where-Object { $_ -gt 0 }
+    )
+
+    $text = [string]$Task.taskText
+    $estimate = 20
+    $source = "heuristic"
+    if ($historyMinutes.Count -gt 0) {
+        $estimate = [int][Math]::Max(5, [Math]::Round((($historyMinutes | Measure-Object -Average).Average), 0))
+        $source = "historical"
+    } elseif ($text) {
+        $estimate = 15
+        if ($text.Length -gt 140) { $estimate = 25 }
+        if ($text -match '(?i)\b(refactor|migration|schema|review|investigate|reproduce|preflight|test)\b') { $estimate += 10 }
+        if ($text -match '(?i)\b(simple|tiny|small|minor|rename|text)\b') { $estimate = [Math]::Max(5, $estimate - 5) }
+    }
+
+    $costClass = if ($estimate -ge 35) { "HIGH" } elseif ($estimate -ge 18) { "MEDIUM" } else { "LOW" }
+
+    return [pscustomobject]@{
+        usageEstimateMinutes = [int]$estimate
+        usageEstimateSource = [string]$source
+        usageCostClass = [string]$costClass
+    }
+}
+
+function Update-TaskUsageEstimate {
+    param(
+        $State,
+        $Task
+    )
+
+    $estimate = Get-UsageEstimateForTask -State $State -Task $Task
+    $Task.usageEstimateMinutes = [int]$estimate.usageEstimateMinutes
+    $Task.usageEstimateSource = [string]$estimate.usageEstimateSource
+    $Task.usageCostClass = [string]$estimate.usageCostClass
+}
+
+function Evaluate-PlannerPrediction {
+    param(
+        [string]$RepoRoot,
+        $Task
+    )
+
+    $predictedFiles = @(Get-NormalizedPathSet -RepoRoot $RepoRoot -Paths $Task.plannerMetadata.likelyFiles)
+    $actualFiles = @(Get-NormalizedPathSet -RepoRoot $RepoRoot -Paths $Task.latestRun.actualFiles)
+    if ($predictedFiles.Count -eq 0 -and $actualFiles.Count -eq 0) {
+        return [pscustomobject]@{
+            predictionEvaluated = $false
+            predictionHitRate = 0
+            predictionNotes = "No predicted or actual files were available."
+            falsePositives = @()
+            falseNegatives = @()
+            overlap = @()
+            classification = "unknown"
+        }
+    }
+
+    $overlap = @($predictedFiles | Where-Object { $actualFiles -contains $_ } | Select-Object -Unique)
+    $falsePositives = @($predictedFiles | Where-Object { $actualFiles -notcontains $_ } | Select-Object -Unique)
+    $falseNegatives = @($actualFiles | Where-Object { $predictedFiles -notcontains $_ } | Select-Object -Unique)
+    $denominator = [Math]::Max(1, [Math]::Max($predictedFiles.Count, $actualFiles.Count))
+    $hitRate = [Math]::Round(($overlap.Count / $denominator), 2)
+    $classification = if ($hitRate -ge 0.8 -and $falseNegatives.Count -eq 0) {
+        "tight"
+    } elseif ($hitRate -ge 0.5) {
+        "acceptable"
+    } elseif ($overlap.Count -gt 0) {
+        "broad"
+    } else {
+        "missed"
+    }
+
+    return [pscustomobject]@{
+        predictionEvaluated = $true
+        predictionHitRate = $hitRate
+        predictionNotes = "Predicted $($predictedFiles.Count) file(s), actual $($actualFiles.Count) file(s), overlap $($overlap.Count)."
+        falsePositives = @($falsePositives)
+        falseNegatives = @($falseNegatives)
+        overlap = @($overlap)
+        classification = $classification
+    }
+}
+
 function ConvertTo-TaskSnapshot {
     param($Task)
 
@@ -562,9 +728,15 @@ function ConvertTo-TaskSnapshot {
         waveNumber = [int]$Task.waveNumber
         submissionOrder = [int]$Task.submissionOrder
         blockedBy = @($Task.blockedBy)
+        declaredDependencies = @($Task.declaredDependencies)
+        declaredPriority = [string]$Task.declaredPriority
+        serialOnly = [bool]$Task.serialOnly
         attemptsUsed = [int]$Task.attemptsUsed
         attemptsRemaining = [int]$Task.attemptsRemaining
         retryScheduled = [bool]$Task.retryScheduled
+        usageCostClass = [string]$Task.usageCostClass
+        usageEstimateMinutes = [int]$Task.usageEstimateMinutes
+        usageEstimateSource = [string]$Task.usageEstimateSource
         maxMergeAttempts = [int]$Task.maxMergeAttempts
         mergeAttemptsUsed = [int]$Task.mergeAttemptsUsed
         mergeAttemptsRemaining = [int]$Task.mergeAttemptsRemaining
@@ -577,6 +749,7 @@ function ConvertTo-TaskSnapshot {
         noChangeReason = [string]$Task.latestRun.noChangeReason
         actualFiles = @($Task.latestRun.actualFiles)
         plannerMetadata = $Task.plannerMetadata
+        plannerFeedback = $Task.plannerFeedback
         merge = $Task.merge
         resultFile = [string]$Task.resultFile
     }
@@ -638,6 +811,172 @@ function Get-SubmissionOrder {
     return ((@($tasks | ForEach-Object { [int]$_.submissionOrder } | Measure-Object -Maximum).Maximum) + 1)
 }
 
+function Get-TaskFailureCategory {
+    param($Task)
+
+    $text = (([string]$Task.latestRun.finalCategory) + " " + ([string]$Task.merge.reason) + " " + ([string]$Task.latestRun.feedback)).ToLowerInvariant()
+    if (-not $text.Trim()) { return "" }
+    if ($text -match 'nuget|restore|package') { return "restore_infra" }
+    if ($text -match 'msb3021|msb3027|lock|locked|access to the path|used by another process') { return "locked_environment" }
+    if ($text -match 'build failed|compile|cs\d{4}|msbuild') { return "build_infra" }
+    if ($text -match 'test|xunit|nunit|mstest') { return "test_infra" }
+    if ($text -match 'merge conflict|actual_overlap|overlap') { return "merge_conflict" }
+    if ($text -match 'dirty_worktree|repository worktree is not clean|git') { return "repo_state" }
+    if ($text -match 'reconcile|scheduler|planner') { return "scheduler_state" }
+    if ($text -match 'review_denied') { return "review_denied" }
+    return "unknown"
+}
+
+function Get-TaskCompletionTimestamp {
+    param($Task)
+
+    $value = if ($Task.latestRun.completedAt) { [string]$Task.latestRun.completedAt } else { "" }
+    if (-not $value) { return $null }
+    try {
+        return [datetime]$value
+    } catch {
+        return $null
+    }
+}
+
+function Get-TaskSuccessTimestamp {
+    param($Task)
+
+    if ($Task.state -notin @("pending_merge", "merge_prepared", "waiting_user_test", "merged", "completed_no_change")) {
+        return $null
+    }
+    return (Get-TaskCompletionTimestamp -Task $Task)
+}
+
+function Get-RecentFailureCandidates {
+    param($State)
+
+    $cutoff = (Get-Date).AddMinutes(-$script:CircuitBreakerRecentWindowMinutes)
+    return @(
+        (Get-Tasks -State $State) |
+            Where-Object { $_.state -in @("retry_scheduled", "merge_retry_scheduled", "completed_failed_terminal") } |
+            ForEach-Object {
+                $completedAt = Get-TaskCompletionTimestamp -Task $_
+                if ($null -eq $completedAt -or $completedAt -lt $cutoff) { return }
+                $category = Get-TaskFailureCategory -Task $_
+                if (-not $category -or $category -eq "review_denied") { return }
+                [pscustomobject]@{
+                    taskId = [string]$_.taskId
+                    waveNumber = [int]$_.waveNumber
+                    category = $category
+                    completedAt = $completedAt
+                }
+            } |
+            Where-Object { $_ }
+    )
+}
+
+function Get-CircuitBreakerSummary {
+    param($State)
+
+    if (-not $State.circuitBreaker) {
+        $State | Add-Member -NotePropertyName circuitBreaker -NotePropertyValue (New-CircuitBreakerRecord) -Force
+    }
+
+    $overrideUntil = [datetime]::MinValue
+    if ($State.circuitBreaker.manualOverrideUntil) {
+        try { $overrideUntil = [datetime]$State.circuitBreaker.manualOverrideUntil } catch { }
+    }
+    if ($overrideUntil -gt (Get-Date)) {
+        return [pscustomobject]@{
+            status = "manual_override"
+            openedAt = [string]$State.circuitBreaker.openedAt
+            closedAt = if ($State.circuitBreaker.closedAt) { [string]$State.circuitBreaker.closedAt } else { (Get-Date).ToString("o") }
+            scopeWave = 0
+            reasonCategory = if ($State.circuitBreaker.reasonCategory) { [string]$State.circuitBreaker.reasonCategory } else { "manual_override" }
+            reasonSummary = "Manual circuit-breaker override is active."
+            affectedTaskIds = if ($State.circuitBreaker.affectedTaskIds) { @(Normalize-StringArray -Value $State.circuitBreaker.affectedTaskIds) } else { @() }
+            manualOverrideUntil = [string]$State.circuitBreaker.manualOverrideUntil
+        }
+    }
+
+    $retryCandidates = @(Get-RecentFailureCandidates -State $State)
+
+    $waveGroups = @(
+        $retryCandidates |
+            Group-Object waveNumber, category |
+            Where-Object { $_.Count -ge 3 -and [int]$_.Group[0].waveNumber -gt 0 }
+    )
+    if ($waveGroups.Count -gt 0) {
+        foreach ($waveGroup in $waveGroups) {
+            $group = @($waveGroup.Group | Sort-Object completedAt)
+            $earliestFailure = $group[0].completedAt
+            $waveSuccessAfterFailure = @(
+                (Get-Tasks -State $State) |
+                    Where-Object { [int]$_.waveNumber -eq [int]$group[0].waveNumber } |
+                    ForEach-Object { Get-TaskSuccessTimestamp -Task $_ } |
+                    Where-Object { $null -ne $_ -and $_ -gt $earliestFailure }
+            )
+            if ($waveSuccessAfterFailure.Count -gt 0) { continue }
+            return [pscustomobject]@{
+                status = "wave_open"
+                openedAt = if ($State.circuitBreaker.openedAt -and $State.circuitBreaker.status -eq "wave_open") { [string]$State.circuitBreaker.openedAt } else { (Get-Date).ToString("o") }
+                closedAt = ""
+                scopeWave = [int]$group[0].waveNumber
+                reasonCategory = [string]$group[0].category
+                reasonSummary = "Recent correlated failures opened the wave breaker."
+                affectedTaskIds = @($group | ForEach-Object { [string]$_.taskId })
+                manualOverrideUntil = ""
+            }
+        }
+    }
+
+    $sessionGroups = @(
+        $retryCandidates |
+            Group-Object category |
+            Where-Object { $_.Count -ge 4 }
+    )
+    if ($sessionGroups.Count -gt 0) {
+        foreach ($sessionGroup in $sessionGroups) {
+            $group = @($sessionGroup.Group | Sort-Object completedAt)
+            $earliestFailure = $group[0].completedAt
+            $successAfterFailure = @(
+                (Get-Tasks -State $State) |
+                    ForEach-Object { Get-TaskSuccessTimestamp -Task $_ } |
+                    Where-Object { $null -ne $_ -and $_ -gt $earliestFailure }
+            )
+            if ($successAfterFailure.Count -gt 0) { continue }
+            return [pscustomobject]@{
+                status = "session_open"
+                openedAt = if ($State.circuitBreaker.openedAt -and $State.circuitBreaker.status -eq "session_open") { [string]$State.circuitBreaker.openedAt } else { (Get-Date).ToString("o") }
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = [string]$group[0].category
+                reasonSummary = "Recent correlated failures opened the session breaker."
+                affectedTaskIds = @($group | ForEach-Object { [string]$_.taskId })
+                manualOverrideUntil = ""
+            }
+        }
+    }
+
+    $closed = New-CircuitBreakerRecord
+    $closed.closedAt = (Get-Date).ToString("o")
+    return $closed
+}
+
+function Update-CircuitBreakerState {
+    param(
+        $State,
+        [string]$EventsFile = ""
+    )
+
+    $previousStatus = if ($State.circuitBreaker) { [string]$State.circuitBreaker.status } else { "closed" }
+    $summary = Get-CircuitBreakerSummary -State $State
+    $State.circuitBreaker = $summary
+
+    if ($EventsFile -and $summary.status -ne $previousStatus) {
+        $kind = if ($summary.status -eq "closed") { "circuit_breaker_closed" } else { "circuit_breaker_opened" }
+        Append-StateEvent -EventsFile $EventsFile -TaskId "" -Kind $kind -Message $summary.reasonSummary -Data $summary
+    }
+
+    return $summary
+}
+
 function Get-CurrentExecutionWave {
     param($State)
     $active = @((Get-Tasks -State $State) | Where-Object {
@@ -663,6 +1002,9 @@ function Get-TasksInWave {
 
 function Get-StartableTaskIds {
     param($State)
+    $breaker = Get-CircuitBreakerSummary -State $State
+    if ($breaker.status -notin @("closed", "manual_override")) { return @() }
+
     $waveNumber = Get-CurrentExecutionWave -State $State
     if ($waveNumber -le 0) { return @() }
 
@@ -674,10 +1016,29 @@ function Get-StartableTaskIds {
         return @()
     }
 
+    $taskIndex = @{}
+    foreach ($candidate in @(Get-Tasks -State $State)) {
+        $taskIndex[[string]$candidate.taskId] = $candidate
+    }
+
     return @(
         @($waveTasks | Where-Object {
-            [int]$_.waveNumber -eq $waveNumber -and (Is-QueueState -State $_.state)
-        } | Sort-Object submissionOrder | ForEach-Object { [string]$_.taskId })
+            if ([int]$_.waveNumber -ne $waveNumber -or -not (Is-QueueState -State $_.state)) { return $false }
+            foreach ($dependencyId in @($_.blockedBy)) {
+                $dependencyTask = $taskIndex[[string]$dependencyId]
+                if ($null -eq $dependencyTask) { return $false }
+                if ($dependencyTask.state -notin @("merged", "completed_no_change")) { return $false }
+            }
+            return $true
+        } | Sort-Object @{ Expression = {
+                switch ([string]$_.declaredPriority) {
+                    "high" { 0 }
+                    "normal" { 1 }
+                    "low" { 2 }
+                    default { 1 }
+                }
+            }
+        }, submissionOrder | ForEach-Object { [string]$_.taskId })
     )
 }
 
@@ -1004,7 +1365,8 @@ function Invoke-MergeBuildAttempt {
 function Apply-PipelineResultToTask {
     param(
         $Task,
-        $PipelineResult
+        $PipelineResult,
+        [string]$RepoRoot = ""
     )
 
     Set-ObjectProperty -Object $Task -Name "latestRun" -Value (Normalize-LatestRun -LatestRun $Task.latestRun -ResultFile ([string]$Task.resultFile))
@@ -1032,6 +1394,9 @@ function Apply-PipelineResultToTask {
         artifacts = $PipelineResult.artifacts
     }
     $Task.runs = @($Task.runs) + @($runRecord)
+    if ($RepoRoot) {
+        Set-ObjectProperty -Object $Task -Name "plannerFeedback" -Value (Evaluate-PlannerPrediction -RepoRoot $RepoRoot -Task $Task)
+    }
 
     switch ([string]$PipelineResult.status) {
         "ACCEPTED" {
@@ -1066,7 +1431,10 @@ function Apply-PipelineResultToTask {
 }
 
 function Reconcile-TaskState {
-    param($Task)
+    param(
+        $Task,
+        [string]$RepoRoot = ""
+    )
 
     if (-not (Is-RunningState -State $Task.state)) {
         return
@@ -1079,7 +1447,7 @@ function Reconcile-TaskState {
 
     $pipelineResult = Read-JsonFile -Path $Task.latestRun.resultFile
     if ($pipelineResult) {
-        Apply-PipelineResultToTask -Task $Task -PipelineResult $pipelineResult
+        Apply-PipelineResultToTask -Task $Task -PipelineResult $pipelineResult -RepoRoot $RepoRoot
         return
     }
 
@@ -1096,7 +1464,7 @@ function Reconcile-State {
     foreach ($task in @(Get-Tasks -State $State)) {
         try {
             Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
-            Reconcile-TaskState -Task $task
+            Reconcile-TaskState -Task $task -RepoRoot $State.repoRoot
             Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
             Write-TaskResultFile -Task $task
         } catch {
@@ -1127,6 +1495,9 @@ function New-TaskRecord {
     $resolvedPromptFile = if ($InputTask.promptFile) { Get-CanonicalPath -Path ([string]$InputTask.promptFile) } else { "" }
     $resolvedPlanFile = if ($InputTask.planFile) { Get-CanonicalPath -Path ([string]$InputTask.planFile) } else { "" }
     $resultFile = if ($InputTask.resultFile) { Get-CanonicalPath -Path ([string]$InputTask.resultFile) } else { Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $taskId }
+    $declaredPriority = Normalize-Priority -Priority ([string]$InputTask.declaredPriority)
+    $declaredDependencies = @(Normalize-StringArray -Value $InputTask.declaredDependencies)
+    $serialOnly = [bool]$InputTask.serialOnly
 
     return [pscustomobject]@{
         taskId = $taskId
@@ -1141,6 +1512,12 @@ function New-TaskRecord {
         submissionOrder = $SubmissionOrder
         waveNumber = if ($InputTask.waveNumber) { [int]$InputTask.waveNumber } else { 0 }
         blockedBy = @()
+        declaredDependencies = @($declaredDependencies)
+        declaredPriority = $declaredPriority
+        serialOnly = $serialOnly
+        usageCostClass = "MEDIUM"
+        usageEstimateMinutes = 20
+        usageEstimateSource = "heuristic"
         maxAttempts = 3
         attemptsUsed = 0
         attemptsRemaining = 3
@@ -1152,6 +1529,7 @@ function New-TaskRecord {
         mergeState = ""
         state = "queued"
         plannerMetadata = if ($InputTask.plannerMetadata) { $InputTask.plannerMetadata } else { [pscustomobject]@{} }
+        plannerFeedback = [pscustomobject]@{}
         latestRun = (New-LatestRunRecord -ResultFile $resultFile)
         runs = @()
         merge = (New-MergeRecord)
@@ -1264,6 +1642,99 @@ function Get-AutoDevelopScriptPath {
     return (Join-Path (Split-Path -Path $PSCommandPath -Parent) "auto-develop.ps1")
 }
 
+function Get-UsageProjection {
+    param($State)
+
+    $currentWave = Get-CurrentExecutionWave -State $State
+    $nextWaveTasks = if ($currentWave -gt 0) {
+        @((Get-Tasks -State $State) | Where-Object {
+            [int]$_.waveNumber -eq $currentWave -and $_.state -in @("queued", "retry_scheduled")
+        })
+    } else {
+        @()
+    }
+    $queueTasks = @((Get-Tasks -State $State) | Where-Object { $_.state -in @("queued", "retry_scheduled") })
+    $runningTasks = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "running" })
+
+    $sumMinutes = {
+        param($Tasks)
+        return [int](@($Tasks | ForEach-Object { [int]$_.usageEstimateMinutes } | Measure-Object -Sum).Sum)
+    }
+
+    $nextWaveMinutes = & $sumMinutes $nextWaveTasks
+    $fullQueueMinutes = & $sumMinutes $queueTasks
+    $runningMinutes = & $sumMinutes $runningTasks
+    $risk = if ($fullQueueMinutes -ge 120) { "HIGH" } elseif ($fullQueueMinutes -ge 45) { "MEDIUM" } else { "LOW" }
+
+    return [pscustomobject]@{
+        currentWave = $currentWave
+        runningEstimatedMinutes = $runningMinutes
+        nextWaveEstimatedMinutes = $nextWaveMinutes
+        fullQueueEstimatedMinutes = $fullQueueMinutes
+        projectedRisk = $risk
+        recommendedApprovalScope = if ($risk -eq "HIGH") { "next_wave_only" } else { "current_plan" }
+    }
+}
+
+function Get-PlannerFeedbackSummary {
+    param($State)
+
+    $evaluated = @(
+        (Get-Tasks -State $State) |
+            Where-Object { $_.plannerFeedback -and $_.plannerFeedback.predictionEvaluated } |
+            Sort-Object submissionOrder |
+            Select-Object -Last 20
+    )
+    $hitRates = @($evaluated | ForEach-Object { [double]$_.plannerFeedback.predictionHitRate })
+    return [pscustomobject]@{
+        evaluatedTasks = $evaluated.Count
+        averageHitRate = if ($hitRates.Count -gt 0) { [Math]::Round((($hitRates | Measure-Object -Average).Average), 2) } else { 0 }
+        tightCount = @($evaluated | Where-Object { $_.plannerFeedback.classification -eq "tight" }).Count
+        acceptableCount = @($evaluated | Where-Object { $_.plannerFeedback.classification -eq "acceptable" }).Count
+        broadCount = @($evaluated | Where-Object { $_.plannerFeedback.classification -eq "broad" }).Count
+        missedCount = @($evaluated | Where-Object { $_.plannerFeedback.classification -eq "missed" }).Count
+        recent = @($evaluated | ForEach-Object {
+            [pscustomobject]@{
+                taskId = [string]$_.taskId
+                hitRate = [double]$_.plannerFeedback.predictionHitRate
+                classification = [string]$_.plannerFeedback.classification
+                notes = [string]$_.plannerFeedback.predictionNotes
+            }
+        })
+    }
+}
+
+function Get-TaskMergePreview {
+    param(
+        [string]$RepoRoot,
+        $Task
+    )
+
+    $result = Read-JsonFile -Path ([string]$Task.latestRun.resultFile)
+    $branchName = [string]$Task.latestRun.branchName
+    $diffStat = ""
+    if ($branchName) {
+        $diffResult = Invoke-NativeCommand -Command "git" -Arguments @("diff", "--stat", "HEAD..$branchName") -WorkingDirectory $RepoRoot
+        if ($diffResult.exitCode -eq 0) {
+            $diffStat = [string]$diffResult.output
+        }
+    }
+
+    return [pscustomobject]@{
+        taskSummary = Get-TaskSummaryText -Task $Task
+        actualFiles = @($Task.latestRun.actualFiles | Select-Object -First 10)
+        diffStat = $diffStat
+        reviewVerdict = if ($Task.latestRun.finalStatus -eq "ACCEPTED") { "APPROVED" } elseif ($Task.latestRun.finalStatus) { [string]$Task.latestRun.finalStatus } else { "" }
+        reviewSeverity = if ($result -and $result.severity) { [string]$result.severity } else { "" }
+        reviewSummary = [string]$Task.latestRun.summary
+        preflightPassed = [bool]($Task.latestRun.finalStatus -eq "ACCEPTED")
+        preflightBlockerCount = 0
+        preflightWarningCount = 0
+        reproVerified = [bool]($result -and $result.reproductionConfirmed)
+        artifactsAvailable = [bool]($Task.latestRun.artifacts)
+    }
+}
+
 function Get-SnapshotPayload {
     param(
         $State,
@@ -1274,6 +1745,9 @@ function Get-SnapshotPayload {
     $unknownBranches = Get-UnknownAutoBranches -RepoRoot $State.repoRoot -KnownBranches $knownBranches
     $nextMergeTask = Get-NextMergeCandidate -State $State
     $mergePreparedTask = Get-MergePreparedTask -State $State
+    $breaker = Update-CircuitBreakerState -State $State
+    $usageProjection = Get-UsageProjection -State $State
+    $plannerFeedbackSummary = Get-PlannerFeedbackSummary -State $State
 
     return [pscustomobject]@{
         repoRoot = $State.repoRoot
@@ -1288,7 +1762,11 @@ function Get-SnapshotPayload {
         startableTaskIds = @(Get-StartableTaskIds -State $State)
         nextMergeTaskId = if ($nextMergeTask) { [string]$nextMergeTask.taskId } else { "" }
         mergePreparedTaskId = if ($mergePreparedTask) { [string]$mergePreparedTask.taskId } else { "" }
+        mergePreparedPreview = if ($mergePreparedTask) { Get-TaskMergePreview -RepoRoot $State.repoRoot -Task $mergePreparedTask } else { $null }
         unknownAutoBranches = @($unknownBranches)
+        plannerFeedbackSummary = $plannerFeedbackSummary
+        usageProjection = $usageProjection
+        circuitBreaker = $breaker
         schedulerHealthy = (@($ReconcileErrors).Count -eq 0)
         reconcileErrors = @($ReconcileErrors)
     }
@@ -1302,6 +1780,7 @@ function Snapshot-Queue {
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
         $reconcileErrors = @(Reconcile-State -State $state -EventsFile $context.paths.eventsFile)
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
         return (Get-SnapshotPayload -State $state -ReconcileErrors $reconcileErrors)
     } finally {
@@ -1335,6 +1814,7 @@ function Register-Tasks {
                 throw "Task '$($task.taskId)' references a solution that does not exist: $($task.solutionPath)"
             }
             Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+            Update-TaskUsageEstimate -State $state -Task $task
             if (Get-TaskById -State $state -TaskId $task.taskId) {
                 throw "Task id '$($task.taskId)' is already registered."
             }
@@ -1345,6 +1825,7 @@ function Register-Tasks {
             $submissionOrder += 1
         }
 
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
 
         return [pscustomobject]@{
@@ -1385,10 +1866,37 @@ function Apply-Plan {
             if ($assignment.plannedState -and (Is-QueueState -State $task.state)) {
                 $task.state = [string]$assignment.plannedState
             }
+            Update-TaskUsageEstimate -State $state -Task $task
             Write-TaskResultFile -Task $task
         }
 
+        foreach ($task in @(Get-Tasks -State $state | Where-Object { -not (Is-TerminalState -State $_.state) })) {
+            foreach ($dependencyId in @($task.declaredDependencies)) {
+                $dependencyTask = Get-TaskById -State $state -TaskId ([string]$dependencyId)
+                if (-not $dependencyTask) {
+                    throw "Plan rejected because task '$($task.taskId)' declares unknown dependency '$dependencyId'."
+                }
+                if ([int]$task.waveNumber -le [int]$dependencyTask.waveNumber) {
+                    throw "Plan rejected because task '$($task.taskId)' does not respect declared dependency '$dependencyId'."
+                }
+                if (@($task.blockedBy) -notcontains [string]$dependencyTask.taskId) {
+                    Set-ObjectProperty -Object $task -Name "blockedBy" -Value (@(@($task.blockedBy) + @([string]$dependencyTask.taskId) | Select-Object -Unique))
+                }
+            }
+            if ([bool]$task.serialOnly) {
+                $sameWave = @((Get-Tasks -State $state) | Where-Object {
+                    $_.taskId -ne $task.taskId -and
+                    -not (Is-TerminalState -State $_.state) -and
+                    [int]$_.waveNumber -eq [int]$task.waveNumber
+                })
+                if ($sameWave.Count -gt 0) {
+                    throw "Plan rejected because serial-only task '$($task.taskId)' shares wave $($task.waveNumber)."
+                }
+            }
+        }
+
         $state.lastPlanAppliedAt = (Get-Date).ToString("o")
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
         Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId "" -Kind "plan_applied" -Message "Planner output applied." -Data @{
             summary = [string]$planPayload.summary
@@ -1453,6 +1961,7 @@ function Run-Task {
             -ProcessId $PID `
             -StartedAt ((Get-Date).ToString("o"))
         Write-TaskResultFile -Task $task
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
         Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "started" -Message "Task pipeline started." -Data @{ attempt = $attemptNumber; waveNumber = $task.waveNumber }
     } finally {
@@ -1497,14 +2006,19 @@ function Run-Task {
             throw "Task '$TaskId' disappeared during execution."
         }
         Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
-        Apply-PipelineResultToTask -Task $task -PipelineResult $pipelineResult
+        Apply-PipelineResultToTask -Task $task -PipelineResult $pipelineResult -RepoRoot $context.repoRoot
+        Update-TaskUsageEstimate -State $state -Task $task
         Write-TaskResultFile -Task $task
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
         Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "completed" -Message "Task pipeline finished." -Data @{
             attempt = $attemptNumber
             finalStatus = [string]$task.latestRun.finalStatus
             finalCategory = [string]$task.latestRun.finalCategory
             state = [string]$task.state
+        }
+        if ($task.plannerFeedback.predictionEvaluated) {
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "planner_feedback" -Message "Planner prediction compared against actual files." -Data $task.plannerFeedback
         }
 
         return [pscustomobject]@{
@@ -1586,6 +2100,7 @@ function Prepare-Merge {
         if ($overlap.Count -gt 0) {
             Get-RetryableResult -Task $selectedTask -Reason ("ACTUAL_OVERLAP: " + ($overlap -join ", "))
             Write-TaskResultFile -Task $selectedTask
+            $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
             Save-State -StateFile $context.paths.stateFile -State $state
             Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_retry" -Message "Task rescheduled after actual file overlap was detected." -Data @{ overlap = @($overlap) }
             return [pscustomobject]@{
@@ -1682,6 +2197,7 @@ function Prepare-Merge {
         }
 
         Write-TaskResultFile -Task $selectedTask
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
 
         return [pscustomobject]@{
@@ -1691,6 +2207,7 @@ function Prepare-Merge {
             lockFailureDetected = [bool]$mergeResult.lockFailureDetected
             lockRemediationAttempted = [bool]$mergeResult.lockRemediationAttempted
             killedProcesses = @($mergeResult.killedProcesses)
+            mergePreview = if ($mergeResult.success) { Get-TaskMergePreview -RepoRoot $context.repoRoot -Task $selectedTask } else { $null }
             snapshot = Get-SnapshotPayload -State $state
         }
     } finally {
@@ -1748,6 +2265,7 @@ function Admin-Edit-Task {
 
         Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
         Write-TaskResultFile -Task $task
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
         Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "admin_edit" -Message "Task edited by admin command." -Data $updates
 
@@ -1875,6 +2393,7 @@ function Resolve-Merge {
         }
 
         Write-TaskResultFile -Task $task
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
         Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "merge_resolved" -Message ([string]$operation.reason) -Data @{
             decision = $Decision
@@ -1888,6 +2407,31 @@ function Resolve-Merge {
             reason = [string]$operation.reason
             commitMessage = [string]$task.merge.commitMessage
             commitSha = [string]$task.merge.commitSha
+            snapshot = Get-SnapshotPayload -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+function Admin-Clear-Breaker {
+    param([string]$ResolvedSolutionPath)
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $state.circuitBreaker = New-CircuitBreakerRecord
+        $state.circuitBreaker.status = "manual_override"
+        $state.circuitBreaker.reasonCategory = "manual_override"
+        $state.circuitBreaker.reasonSummary = "Manual circuit-breaker override is active."
+        $state.circuitBreaker.closedAt = (Get-Date).ToString("o")
+        $state.circuitBreaker.manualOverrideUntil = (Get-Date).AddMinutes(10).ToString("o")
+        Save-State -StateFile $context.paths.stateFile -State $state
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId "" -Kind "circuit_breaker_cleared" -Message "Circuit breaker manually cleared." -Data $state.circuitBreaker
+
+        return [pscustomobject]@{
+            circuitBreaker = $state.circuitBreaker
             snapshot = Get-SnapshotPayload -State $state
         }
     } finally {
@@ -1927,6 +2471,10 @@ switch ($Mode) {
     }
     "admin-edit-task" {
         Write-JsonOutput -Object (Admin-Edit-Task -ResolvedSolutionPath $resolvedSolutionPath -ResolvedEditFile $resolvedEditFile)
+        break
+    }
+    "admin-clear-breaker" {
+        Write-JsonOutput -Object (Admin-Clear-Breaker -ResolvedSolutionPath $resolvedSolutionPath)
         break
     }
 }
