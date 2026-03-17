@@ -142,6 +142,8 @@ Whenever you re-enter after task completion:
 Use a normal English merge commit message that describes the actual change.
 Do not use squash wording.
 
+For `TLA-develop`, if merge preparation fails only because local dev hosts are locking build outputs, the scheduler may automatically `taskkill` the blocking Visual Studio / IIS Express style processes once and retry the merge build.
+
 If `prepare-merge` fails:
 - let the scheduler requeue the task if attempts remain
 - report the failure briefly

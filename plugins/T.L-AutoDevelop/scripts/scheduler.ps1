@@ -18,12 +18,14 @@ function Invoke-NativeCommand {
         [string]$WorkingDirectory = ""
     )
 
+    $resolvedCommand = Resolve-NativeCommandName -Command $Command
+
     $output = if ($WorkingDirectory) {
         & {
             $ErrorActionPreference = "Continue"
             Push-Location $WorkingDirectory
             try {
-                & $Command @Arguments 2>&1
+                & $resolvedCommand @Arguments 2>&1
             } finally {
                 Pop-Location
             }
@@ -31,7 +33,7 @@ function Invoke-NativeCommand {
     } else {
         & {
             $ErrorActionPreference = "Continue"
-            & $Command @Arguments 2>&1
+            & $resolvedCommand @Arguments 2>&1
         }
     }
 
@@ -39,6 +41,27 @@ function Invoke-NativeCommand {
         output = ($output | Out-String).Trim()
         exitCode = $LASTEXITCODE
     }
+}
+
+function Resolve-NativeCommandName {
+    param([string]$Command)
+
+    switch ($Command.ToLowerInvariant()) {
+        "git" {
+            if ($env:AUTODEV_GIT_COMMAND) { return $env:AUTODEV_GIT_COMMAND }
+            break
+        }
+        "dotnet" {
+            if ($env:AUTODEV_DOTNET_COMMAND) { return $env:AUTODEV_DOTNET_COMMAND }
+            break
+        }
+        "taskkill" {
+            if ($env:AUTODEV_TASKKILL_COMMAND) { return $env:AUTODEV_TASKKILL_COMMAND }
+            break
+        }
+    }
+
+    return $Command
 }
 
 function Write-JsonOutput {
@@ -770,6 +793,171 @@ function Get-RetryableResult {
     $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
 }
 
+function Get-LockFailureInfo {
+    param([string]$BuildOutput)
+
+    $text = [string]$BuildOutput
+    $pids = [System.Collections.ArrayList]::new()
+    foreach ($match in [regex]::Matches($text, '(?i)\bPID\s*(\d+)\b|\((?:PID|pid)\s*(\d+)\)')) {
+        $value = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+        if ($value) {
+            $pidValue = 0
+            if ([int]::TryParse($value, [ref]$pidValue) -and $pids -notcontains $pidValue) {
+                [void]$pids.Add($pidValue)
+            }
+        }
+    }
+
+    $paths = [System.Collections.ArrayList]::new()
+    foreach ($match in [regex]::Matches($text, '([A-Za-z]:\\[^"\r\n]+?\.(?:dll|exe|pdb))')) {
+        $pathValue = [string]$match.Groups[1].Value
+        if ($pathValue -and $paths -notcontains $pathValue) {
+            [void]$paths.Add($pathValue)
+        }
+    }
+
+    $processHints = [System.Collections.ArrayList]::new()
+    if ($text -match '(?i)Visual Studio|devenv(?:\.exe)?') { [void]$processHints.Add("devenv") }
+    if ($text -match '(?i)IIS Express|iisexpress(?:\.exe)?') { [void]$processHints.Add("iisexpress") }
+    if ($text -match '(?i)\bdotnet(?:\.exe)?\b') { [void]$processHints.Add("dotnet") }
+
+    $isLockFailure =
+        ($text -match '(?i)\bMSB3027\b') -or
+        ($text -match '(?i)\bMSB3021\b') -or
+        ($text -match '(?i)because it is being used by another process') -or
+        ($text -match '(?i)unable to copy file') -or
+        ($text -match '(?i)access to the path') -or
+        ($text -match '(?i)file is locked')
+
+    return [pscustomobject]@{
+        isLockFailure = [bool]$isLockFailure
+        processIds = @($pids)
+        processHints = @($processHints | Select-Object -Unique)
+        lockedPaths = @($paths)
+        output = $text
+    }
+}
+
+function Get-LockCandidateProcesses {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath,
+        $LockInfo
+    )
+
+    if ($env:AUTODEV_TEST_PROCESS_CANDIDATES) {
+        try {
+            $payload = $env:AUTODEV_TEST_PROCESS_CANDIDATES | ConvertFrom-Json
+            return @($payload)
+        } catch {
+        }
+    }
+
+    $allowedNames = @("devenv", "iisexpress")
+    if (@($LockInfo.processHints) -contains "dotnet") {
+        $allowedNames += "dotnet"
+    }
+
+    $candidates = [System.Collections.ArrayList]::new()
+    if (@($LockInfo.processIds).Count -gt 0) {
+        foreach ($pid in @($LockInfo.processIds)) {
+            try {
+                $process = Get-Process -Id ([int]$pid) -ErrorAction Stop
+                $name = [string]$process.ProcessName
+                if ($allowedNames -contains $name.ToLowerInvariant()) {
+                    [void]$candidates.Add([pscustomobject]@{
+                        id = [int]$process.Id
+                        processName = $name
+                    })
+                }
+            } catch {
+            }
+        }
+    }
+
+    if ($candidates.Count -gt 0) {
+        return @($candidates | Sort-Object processName, id)
+    }
+
+    foreach ($name in $allowedNames | Select-Object -Unique) {
+        foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+            [void]$candidates.Add([pscustomobject]@{
+                id = [int]$process.Id
+                processName = [string]$process.ProcessName
+            })
+        }
+    }
+
+    return @($candidates | Sort-Object processName, id -Unique)
+}
+
+function Invoke-TlaLockRemediation {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath,
+        $LockInfo
+    )
+
+    $candidates = @(Get-LockCandidateProcesses -RepoRoot $RepoRoot -SolutionPath $SolutionPath -LockInfo $LockInfo)
+    $killedProcesses = [System.Collections.ArrayList]::new()
+
+    foreach ($candidate in $candidates) {
+        $killResult = Invoke-NativeCommand -Command "taskkill" -Arguments @("/PID", ([string]$candidate.id), "/T", "/F")
+        [void]$killedProcesses.Add([pscustomobject]@{
+            id = [int]$candidate.id
+            processName = [string]$candidate.processName
+            exitCode = [int]$killResult.exitCode
+            output = [string]$killResult.output
+        })
+    }
+
+    return [pscustomobject]@{
+        attempted = ($candidates.Count -gt 0)
+        candidates = @($candidates)
+        killedProcesses = @($killedProcesses)
+    }
+}
+
+function Invoke-MergeBuildAttempt {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath,
+        [string]$BranchName
+    )
+
+    $mergeCommand = Invoke-NativeCommand -Command "git" -Arguments @("merge", "--no-commit", "--no-ff", $BranchName) -WorkingDirectory $RepoRoot
+    if ($mergeCommand.exitCode -ne 0) {
+        Undo-MergeAttempt -RepoRoot $RepoRoot
+        return [pscustomobject]@{
+            success = $false
+            phase = "merge"
+            output = [string]$mergeCommand.output
+            reason = if ($mergeCommand.output) { [string]$mergeCommand.output } else { "Merge conflict." }
+        }
+    }
+
+    $buildCommand = Invoke-NativeCommand -Command "dotnet" -Arguments @("build", $SolutionPath, "--no-restore") -WorkingDirectory $RepoRoot
+    if ($buildCommand.exitCode -ne 0) {
+        $lockInfo = Get-LockFailureInfo -BuildOutput ([string]$buildCommand.output)
+        Undo-MergeAttempt -RepoRoot $RepoRoot
+        return [pscustomobject]@{
+            success = $false
+            phase = "build"
+            output = [string]$buildCommand.output
+            reason = if ($buildCommand.output) { [string]$buildCommand.output } else { "Build failed after merge preparation." }
+            lockInfo = $lockInfo
+        }
+    }
+
+    return [pscustomobject]@{
+        success = $true
+        phase = "build"
+        output = [string]$buildCommand.output
+        reason = "Merge prepared successfully."
+        lockInfo = (Get-LockFailureInfo -BuildOutput "")
+    }
+}
+
 function Apply-PipelineResultToTask {
     param(
         $Task,
@@ -1271,6 +1459,9 @@ function Prepare-Merge {
     $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
     $selectedTask = $null
     $mergeResult = $null
+    $lockRemediationAttempted = $false
+    $killedProcesses = @()
+    $lockFailureDetected = $false
 
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
@@ -1343,27 +1534,47 @@ function Prepare-Merge {
     }
 
     $branchName = [string]$selectedTask.latestRun.branchName
-    $mergeCommand = Invoke-NativeCommand -Command "git" -Arguments @("merge", "--no-commit", "--no-ff", $branchName) -WorkingDirectory $context.repoRoot
-    if ($mergeCommand.exitCode -ne 0) {
-        Undo-MergeAttempt -RepoRoot $context.repoRoot
-        $mergeResult = [pscustomobject]@{
-            success = $false
-            reason = if ($mergeCommand.output) { $mergeCommand.output } else { "Merge conflict." }
+    $mergeAttempt = Invoke-MergeBuildAttempt -RepoRoot $context.repoRoot -SolutionPath $selectedTask.solutionPath -BranchName $branchName
+    $lockFailureDetected = [bool]($mergeAttempt.lockInfo -and $mergeAttempt.lockInfo.isLockFailure)
+
+    if (
+        (-not $mergeAttempt.success) -and
+        $mergeAttempt.phase -eq "build" -and
+        $lockFailureDetected -and
+        $selectedTask.sourceCommand -eq "TLA-develop"
+    ) {
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_lock_detected" -Message "Lock-style build failure detected during autonomous merge preparation." -Data @{
+            processIds = @($mergeAttempt.lockInfo.processIds)
+            processHints = @($mergeAttempt.lockInfo.processHints)
+            lockedPaths = @($mergeAttempt.lockInfo.lockedPaths)
         }
-    } else {
-        $buildCommand = Invoke-NativeCommand -Command "dotnet" -Arguments @("build", $selectedTask.solutionPath, "--no-restore") -WorkingDirectory $context.repoRoot
-        if ($buildCommand.exitCode -ne 0) {
-            Undo-MergeAttempt -RepoRoot $context.repoRoot
-            $mergeResult = [pscustomobject]@{
-                success = $false
-                reason = if ($buildCommand.output) { $buildCommand.output } else { "Build failed after merge preparation." }
-            }
-        } else {
-            $mergeResult = [pscustomobject]@{
-                success = $true
-                reason = "Merge prepared successfully."
-            }
+
+        $remediation = Invoke-TlaLockRemediation -RepoRoot $context.repoRoot -SolutionPath $selectedTask.solutionPath -LockInfo $mergeAttempt.lockInfo
+        $lockRemediationAttempted = [bool]$remediation.attempted
+        $killedProcesses = @($remediation.killedProcesses)
+
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_lock_remediation" -Message "Autonomous merge lock remediation attempted." -Data @{
+            attempted = $lockRemediationAttempted
+            candidates = @($remediation.candidates)
+            killedProcesses = @($killedProcesses)
         }
+
+        if ($lockRemediationAttempted) {
+            $mergeAttempt = Invoke-MergeBuildAttempt -RepoRoot $context.repoRoot -SolutionPath $selectedTask.solutionPath -BranchName $branchName
+            $lockFailureDetected = [bool]($mergeAttempt.lockInfo -and $mergeAttempt.lockInfo.isLockFailure)
+        }
+    }
+
+    $mergeResult = [pscustomobject]@{
+        success = [bool]$mergeAttempt.success
+        reason = [string]$mergeAttempt.reason
+        lockFailureDetected = $lockFailureDetected
+        lockRemediationAttempted = $lockRemediationAttempted
+        killedProcesses = @($killedProcesses)
+    }
+
+    if ((-not $mergeResult.success) -and $lockRemediationAttempted) {
+        $mergeResult.reason = "Build failed after autonomous lock remediation. $([string]$mergeAttempt.reason)".Trim()
     }
 
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
@@ -1400,6 +1611,9 @@ function Prepare-Merge {
             task = ConvertTo-TaskSnapshot -Task $selectedTask
             prepared = [bool]$mergeResult.success
             reason = [string]$mergeResult.reason
+            lockFailureDetected = [bool]$mergeResult.lockFailureDetected
+            lockRemediationAttempted = [bool]$mergeResult.lockRemediationAttempted
+            killedProcesses = @($mergeResult.killedProcesses)
             snapshot = Get-SnapshotPayload -State $state
         }
     } finally {

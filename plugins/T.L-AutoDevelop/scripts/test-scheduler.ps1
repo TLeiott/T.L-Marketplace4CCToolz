@@ -122,6 +122,93 @@ function Write-StateFile {
     [System.IO.File]::WriteAllText($StateFile, ($State | ConvertTo-Json -Depth 32), [System.Text.Encoding]::UTF8)
 }
 
+function Invoke-WithEnvironment {
+    param(
+        [hashtable]$Variables,
+        [scriptblock]$ScriptBlock
+    )
+
+    $original = @{}
+    foreach ($entry in $Variables.GetEnumerator()) {
+        $original[$entry.Key] = [System.Environment]::GetEnvironmentVariable($entry.Key, "Process")
+        [System.Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, "Process")
+    }
+
+    try {
+        & $ScriptBlock
+    } finally {
+        foreach ($entry in $Variables.GetEnumerator()) {
+            [System.Environment]::SetEnvironmentVariable($entry.Key, $original[$entry.Key], "Process")
+        }
+    }
+}
+
+function New-MockCommandSet {
+    param([string]$Root)
+
+    $mockDir = Join-Path $Root "mock-bin"
+    New-Item -ItemType Directory -Path $mockDir -Force | Out-Null
+
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "git.cmd"), '@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0git-behavior.ps1" %*', [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "dotnet.cmd"), '@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0dotnet-behavior.ps1" %*', [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "taskkill.cmd"), '@powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0taskkill-behavior.ps1" %*', [System.Text.Encoding]::ASCII)
+
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "git-behavior.ps1"), @'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_GIT_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_GIT_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -ge 2 -and $Args[0] -eq 'rev-parse' -and $Args[1] -eq '--show-toplevel') {
+    Write-Output $env:AUTODEV_TEST_REPO_ROOT
+    exit 0
+}
+if ($Args.Count -ge 2 -and $Args[0] -eq 'rev-parse' -and $Args[1] -eq 'HEAD') {
+    Write-Output '1111111111111111111111111111111111111111'
+    exit 0
+}
+if ($Args.Count -ge 1 -and $Args[0] -in @('branch','status','merge','reset','commit')) {
+    exit 0
+}
+exit 0
+'@, [System.Text.Encoding]::UTF8)
+
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "dotnet-behavior.ps1"), @'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$countFile = $env:AUTODEV_TEST_DOTNET_COUNT_FILE
+$count = 0
+if ($countFile -and (Test-Path -LiteralPath $countFile)) {
+    $count = [int](Get-Content -LiteralPath $countFile -Raw)
+}
+$count++
+if ($countFile) {
+    Set-Content -LiteralPath $countFile -Value $count -Encoding UTF8
+}
+if ($count -eq 1) {
+    Write-Output "error MSB3027: Could not copy `"bin\Debug\net8.0\Hmd.Docs.dll`" because it is being used by another process."
+    Write-Output "error MSB3021: Access to the path `"bin\Debug\net8.0\Hmd.Docs.dll`" is denied."
+    exit 1
+}
+Write-Output 'Build succeeded.'
+exit 0
+'@, [System.Text.Encoding]::UTF8)
+
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "taskkill-behavior.ps1"), @'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+if ($env:AUTODEV_TEST_TASKKILL_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_TASKKILL_LOG -Value ($Args -join ' ') -Encoding UTF8
+}
+Write-Output 'SUCCESS: Sent termination signal.'
+exit 0
+'@, [System.Text.Encoding]::UTF8)
+
+    return [pscustomobject]@{
+        git = (Join-Path $mockDir "git.cmd")
+        dotnet = (Join-Path $mockDir "dotnet.cmd")
+        taskkill = (Join-Path $mockDir "taskkill.cmd")
+    }
+}
+
 function Test-CompletedAtRoundTrip {
     $repo = New-TestRepo
     try {
@@ -384,9 +471,87 @@ function Test-NextMergeGate {
     }
 }
 
+function Test-TlaMergeLockRemediation {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root
+        $dotnetCountFile = Join-Path $repo.root "dotnet-count.txt"
+        $taskkillLog = Join-Path $repo.root "taskkill.log"
+        $gitLog = Join-Path $repo.root "git.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "tla-merge"
+                    sourceCommand = "TLA-develop"
+                    sourceInputType = "inline"
+                    taskText = "merge autonomously"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "tla-merge.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "tla-tla-merge-a1" -ResultFile (Join-Path $repo.tasksDir "tla-merge-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/tla-merge"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_DOTNET_COUNT_FILE = $dotnetCountFile
+            AUTODEV_TEST_TASKKILL_LOG = $taskkillLog
+            AUTODEV_TEST_GIT_LOG = $gitLog
+            AUTODEV_TEST_PROCESS_CANDIDATES = (@(
+                @{ id = 1111; processName = "devenv" },
+                @{ id = 2222; processName = "iisexpress" }
+            ) | ConvertTo-Json -Depth 8 -Compress)
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $true) "TLA prepare-merge should succeed after lock remediation."
+        Assert-True ($prepareResult.lockRemediationAttempted -eq $true) "TLA prepare-merge should attempt lock remediation on MSB3027/MSB3021 failures."
+        Assert-True (@($prepareResult.killedProcesses).Count -eq 2) "TLA lock remediation should taskkill the mocked Visual Studio and IIS Express processes."
+        Assert-True ([string]$prepareResult.task.state -eq "merge_prepared") "Successful TLA prepare-merge should end in merge_prepared state."
+
+        $taskkillEntries = @(Get-Content -LiteralPath $taskkillLog)
+        Assert-True ($taskkillEntries.Count -eq 2) "taskkill should be called once per candidate process."
+        Assert-True ((Get-Content -LiteralPath $dotnetCountFile -Raw).Trim() -eq "2") "dotnet build should be retried once after taskkill remediation."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-CompletedAtRoundTrip
 Test-SnapshotResilience
 Test-BlockedByNormalization
 Test-NextMergeGate
+Test-TlaMergeLockRemediation
 
 Write-Host "Scheduler regression checks passed."
