@@ -97,7 +97,7 @@ function Invoke-CommandText {
             success = $false
             exitCode = -1
             output = ''
-            error = 'Kein Kommando uebergeben.'
+            error = 'No command was provided.'
         }
     }
 
@@ -222,12 +222,12 @@ function Get-StatusLineCommandInfo {
         if ($overrideResult) {
             return New-CommandInfoResult -Command $overrideResult.command -ResolvedPath $overrideResult.resolvedPath -CommandSource $overrideResult.commandSource
         }
-        Add-UniqueError -Errors $errors -Message 'StatusLineCommandOverride verweist nicht sicher auf den Haupt-Claude-Ordner.'
+        Add-UniqueError -Errors $errors -Message 'StatusLineCommandOverride does not safely resolve into the main Claude directory.'
         return New-CommandInfoResult
     }
 
     if (-not (Test-Path -LiteralPath $effectiveSettingsPath)) {
-        Add-UniqueError -Errors $errors -Message "settings.json nicht gefunden: $effectiveSettingsPath"
+        Add-UniqueError -Errors $errors -Message "settings.json was not found: $effectiveSettingsPath"
         if ($resolvedDefaultStatusLinePath) {
             return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
         }
@@ -237,7 +237,7 @@ function Get-StatusLineCommandInfo {
     try {
         $settings = Get-Content -LiteralPath $effectiveSettingsPath -Raw | ConvertFrom-Json
     } catch {
-        Add-UniqueError -Errors $errors -Message "settings.json konnte nicht gelesen werden: $($_.Exception.Message)"
+        Add-UniqueError -Errors $errors -Message "settings.json could not be read: $($_.Exception.Message)"
         if ($resolvedDefaultStatusLinePath) {
             return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
         }
@@ -245,7 +245,7 @@ function Get-StatusLineCommandInfo {
     }
 
     if ($settings.statusLine.type -ne 'command') {
-        Add-UniqueError -Errors $errors -Message 'statusLine.type ist nicht "command".'
+        Add-UniqueError -Errors $errors -Message 'statusLine.type is not "command".'
         if ($resolvedDefaultStatusLinePath) {
             return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
         }
@@ -266,7 +266,7 @@ function Get-StatusLineCommandInfo {
         return New-CommandInfoResult -Command $trustedCommand.command -ResolvedPath $trustedCommand.resolvedPath -CommandSource $trustedCommand.commandSource
     }
 
-    Add-UniqueError -Errors $errors -Message 'statusLine.command verweist nicht sicher auf eine Datei im Haupt-Claude-Ordner.'
+    Add-UniqueError -Errors $errors -Message 'statusLine.command does not safely resolve to a file inside the main Claude directory.'
     if ($resolvedDefaultStatusLinePath) {
         return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
     }
@@ -307,7 +307,7 @@ function Get-UsageCacheState {
     $errors = New-OrderedList
     $effectiveCachePath = Get-EffectiveUsageCachePath -BaseClaudeHome $BaseClaudeHome
     if (-not (Test-Path -LiteralPath $effectiveCachePath)) {
-        Add-UniqueError -Errors $errors -Message "Usage-Cache nicht gefunden: $effectiveCachePath"
+        Add-UniqueError -Errors $errors -Message "Usage cache was not found: $effectiveCachePath"
         return [ordered]@{
             available = $false
             fiveHourUtilization = $null
@@ -320,7 +320,7 @@ function Get-UsageCacheState {
     try {
         $cache = Get-Content -LiteralPath $effectiveCachePath -Raw | ConvertFrom-Json
     } catch {
-        Add-UniqueError -Errors $errors -Message "Usage-Cache konnte nicht gelesen werden: $($_.Exception.Message)"
+        Add-UniqueError -Errors $errors -Message "Usage cache could not be read: $($_.Exception.Message)"
         return [ordered]@{
             available = $false
             fiveHourUtilization = $null
@@ -335,7 +335,7 @@ function Get-UsageCacheState {
         try {
             $fiveHourResetAt = [DateTimeOffset]::Parse([string]$cache.five_hour.resets_at)
         } catch {
-            Add-UniqueError -Errors $errors -Message 'five_hour.resets_at konnte nicht geparst werden.'
+            Add-UniqueError -Errors $errors -Message 'five_hour.resets_at could not be parsed.'
         }
     }
 
@@ -356,7 +356,7 @@ function Get-StatusLineState {
 
     $errors = New-OrderedList
     if ($SkipStatusLineCommand) {
-        Add-UniqueError -Errors $errors -Message 'Statusline-Kommando wurde per Parameter uebersprungen.'
+        Add-UniqueError -Errors $errors -Message 'The statusline command was skipped via parameter.'
         return [ordered]@{
             available = $false
             rawStatusline = ''
@@ -394,7 +394,7 @@ function Get-StatusLineState {
     $invokeResult = Invoke-CommandText -CommandText $commandInfo.command -InputText (Get-MockStatusLinePayload)
     if (-not $invokeResult.success) {
         $errorText = if ($invokeResult.error) { $invokeResult.error } else { "ExitCode=$($invokeResult.exitCode)" }
-        Add-UniqueError -Errors $errors -Message "Statusline-Kommando fehlgeschlagen: $errorText"
+        Add-UniqueError -Errors $errors -Message "Statusline command failed: $errorText"
         return [ordered]@{
             available = $false
             rawStatusline = $invokeResult.output
@@ -412,7 +412,7 @@ function Get-StatusLineState {
     $cleanText = Strip-AnsiText -Text $invokeResult.output
     $segmentMatch = [regex]::Match($cleanText, '(?is)\b5h\b(?<segment>.*?)(?:\|\s*7d\b|$)')
     if (-not $segmentMatch.Success) {
-        Add-UniqueError -Errors $errors -Message '5h-Segment im Statusline-Output nicht gefunden.'
+        Add-UniqueError -Errors $errors -Message 'The 5h segment was not found in the statusline output.'
         return [ordered]@{
             available = $false
             rawStatusline = $invokeResult.output
@@ -430,7 +430,7 @@ function Get-StatusLineState {
     $segmentText = $segmentMatch.Groups['segment'].Value
     $percentMatch = [regex]::Match($segmentText, '(?is)(?<percent>\d{1,3}(?:[.,]\d+)?)%')
     if (-not $percentMatch.Success) {
-        Add-UniqueError -Errors $errors -Message '5h-Prozentwert im Statusline-Output nicht gefunden.'
+        Add-UniqueError -Errors $errors -Message 'The 5h percentage value was not found in the statusline output.'
         return [ordered]@{
             available = $false
             rawStatusline = $invokeResult.output

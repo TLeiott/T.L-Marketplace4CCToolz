@@ -1,4 +1,4 @@
-# preflight.ps1 — Deterministische Code-Pruefungen fuer auto-develop Pipeline
+# preflight.ps1 -- Deterministic validation checks for the AutoDevelop pipeline
 param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [string[]]$ChangedFiles,
@@ -40,7 +40,7 @@ function Invoke-NativeCommand {
     return @{ output = ($output | Out-String).Trim(); exitCode = $LASTEXITCODE }
 }
 
-# Geaenderte Dateien ermitteln falls nicht uebergeben
+# Determine changed files when they are not provided explicitly
 if (-not $ChangedFiles -or $ChangedFiles.Count -eq 0) {
     $ChangedFiles = @((Invoke-NativeCommand git @("diff","--name-only","HEAD")).output -split "`n" | Where-Object { $_.Trim() -ne "" })
 }
@@ -56,7 +56,7 @@ $runSummary = [ordered]@{
     startedAt = (Get-Date).ToString('o')
 }
 
-# Phase 3.3: Add-Blocker/Add-Warning mit optionalen line + suggestion Parametern
+# Add blocker and warning entries with optional line and suggestion metadata
 function Add-Blocker($check, $file, $message, [int]$line = 0, [string]$suggestion = "") {
     $entry = @{ check = $check; file = $file; message = $message }
     if ($line -gt 0) { $entry.line = $line }
@@ -82,10 +82,10 @@ $runSummary.build = [ordered]@{
 Save-DebugText -Name 'build-output.txt' -Content (($buildOutput | Out-String).Trim()) | Out-Null
 if ($buildExitCode -ne 0) {
     $errLines = ($buildOutput | Select-String "error " | Select-Object -First 5) -join "`n"
-    Add-Blocker "build" $SolutionPath "Build fehlgeschlagen: $errLines"
+    Add-Blocker "build" $SolutionPath "Build failed: $errLines"
 }
 
-# Phase 5.4: Fruehes Return nach Build-Fehler — restliche Checks ueberspringen
+# Stop early after a build failure and skip the remaining checks
 if ($blockers.Count -gt 0 -and $blockers[0].check -eq "build") {
     $result = @{
         passed   = $false
@@ -101,7 +101,7 @@ if ($blockers.Count -gt 0 -and $blockers[0].check -eq "build") {
     return
 }
 
-# --- BLOCKER 2: Run startet ---
+# --- BLOCKER 2: Application starts ---
 if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
     $runStarted = Get-Date
     $runErrPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stderr.txt' } else { "$env:TEMP\preflight-runerr.txt" }
@@ -122,9 +122,9 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
         $runErr = $runErrText -split "`r?`n" | Select-Object -First 3
         $errText = ($runErr -join " ").Trim()
         if ($errText -notmatch "address already in use|port.*in use") {
-            Add-Blocker "run_starts" $ProjectPath "Prozess beendet mit Code $($runProc.ExitCode): $errText"
+            Add-Blocker "run_starts" $ProjectPath "Process exited with code $($runProc.ExitCode): $errText"
         } else {
-            Add-Warning "run_starts" $ProjectPath "Port belegt (parallel): $errText"
+            Add-Warning "run_starts" $ProjectPath "Port already in use (parallel run): $errText"
         }
     }
     if (-not $runProc.HasExited) {
@@ -136,7 +136,7 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
     }
 }
 
-# Phase 5.1: dotnet test (nur wenn Test-Projekte vorhanden)
+# Run dotnet test only when test projects are present
 $slnDir = Split-Path $SolutionPath -Parent
 $testProjects = @(Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue |
     Where-Object {
@@ -156,7 +156,7 @@ if ($testProjects.Count -gt 0) {
     if ($testResult.exitCode -ne 0) {
         $failedTests = ($testResult.output -split "`n" | Select-String "Failed\s+" | Select-Object -First 5) -join "`n"
         if (-not $failedTests) { $failedTests = ($testResult.output -split "`n" | Select-Object -Last 5) -join "`n" }
-        Add-Blocker "tests" $SolutionPath "Tests fehlgeschlagen: $failedTests"
+        Add-Blocker "tests" $SolutionPath "Tests failed: $failedTests"
     }
 } else {
     $runSummary.tests = [ordered]@{
@@ -167,7 +167,7 @@ if ($testProjects.Count -gt 0) {
 
 $changedCs = $ChangedFiles | Where-Object { $_ -match '\.cs$' -and (Test-Path $_) }
 $changedCsproj = $ChangedFiles | Where-Object { $_ -match '\.csproj$' -and (Test-Path $_) }
-# Phase 5.3: XAML-Dateien
+# XAML files
 $changedXaml = $ChangedFiles | Where-Object { $_ -match '\.xaml$' -and (Test-Path $_) }
 
 foreach ($file in $changedCs) {
@@ -177,63 +177,63 @@ foreach ($file in $changedCs) {
     if (-not $content) { continue }
     $lines = $content -split "`n"
 
-    # --- BLOCKER 3: Verbotene Kommentare (Phase 3.3: mit Zeilennummern) ---
+    # --- BLOCKER 3: Forbidden comments ---
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -imatch '//\s*(Fix:|TODO|FIXME|HACK|Note:|Hinweis\s*\(DE\))') {
             $lineText = $lines[$i].Trim()
             if ($lineText.Length -gt 80) { $lineText = $lineText.Substring(0, 80) + "..." }
-            Add-Blocker "forbidden_comments" $file "L$($i+1): $lineText" -line ($i+1) -suggestion "Kommentar entfernen oder umformulieren"
+            Add-Blocker "forbidden_comments" $file "L$($i+1): $lineText" -line ($i+1) -suggestion "Remove or rewrite the comment"
         }
     }
 
-    # --- BLOCKER 4: Stub-Patterns (Phase 3.3: mit Zeilennummern) ---
+    # --- BLOCKER 4: Stub patterns ---
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match 'throw\s+new\s+NotImplementedException\s*\(\s*\)') {
-            Add-Blocker "stub_pattern" $file "L$($i+1): throw new NotImplementedException()" -line ($i+1) -suggestion "Implementierung vervollstaendigen"
+            Add-Blocker "stub_pattern" $file "L$($i+1): throw new NotImplementedException()" -line ($i+1) -suggestion "Complete the implementation"
         }
     }
 
-    # --- BLOCKER 5: Klasse-pro-Datei (Phase 5.2: indentation-aware, distinct names) ---
+    # --- BLOCKER 5: One top-level type per file ---
     $typeMatches = @($lines | Select-String -Pattern '^\s{0,4}(public|internal|private|protected)?\s*(sealed|abstract|static|partial)?\s*(class|record|struct|interface)\s+(\w+)' -AllMatches)
     $typeNames = @($typeMatches | ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[4].Value } | Sort-Object -Unique)
     if ($typeNames.Count -gt 1) {
-        Add-Blocker "class_per_file" $file "$($typeNames.Count) Top-Level Typen: $($typeNames -join ', ')" -suggestion "Jeden Typ in eigene Datei verschieben"
+        Add-Blocker "class_per_file" $file "$($typeNames.Count) top-level types: $($typeNames -join ', ')" -suggestion "Move each type into its own file"
     }
 
-    # --- WARNING 7: Try-Catch Spam ---
+    # --- WARNING 7: Too many catch blocks ---
     $catchCount = ([regex]::Matches($content, '\bcatch\s*[\({]')).Count
     if ($catchCount -gt 3) {
-        Add-Warning "try_catch_spam" $file "$catchCount catch-Bloecke" -suggestion "Fehlerbehandlung vereinfachen"
+        Add-Warning "try_catch_spam" $file "$catchCount catch blocks" -suggestion "Simplify error handling"
     }
 
-    # --- WARNING 8: Datei zu lang ---
+    # --- WARNING 8: File too long ---
     if ($lines -and $lines.Count -gt 500) {
-        Add-Warning "file_length" $file "$($lines.Count) Zeilen" -suggestion "Datei aufteilen"
+        Add-Warning "file_length" $file "$($lines.Count) lines" -suggestion "Split the file"
     }
 
-    # --- WARNING 9: Dispatcher-Nutzung ---
+    # --- WARNING 9: Dispatcher usage ---
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match 'Dispatcher\.(Invoke|BeginInvoke)') {
-            Add-Warning "dispatcher_usage" $file "Dispatcher.Invoke/BeginInvoke" -line ($i+1) -suggestion "Dispatcher vermeiden"
-            break  # nur einmal pro Datei warnen
-        }
-    }
-
-    # --- WARNING 10: MessageBox Missbrauch ---
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match 'MessageBox\.Show' -and $content -notmatch 'MessageService') {
-            Add-Warning "messagebox_misuse" $file "MessageBox.Show ohne MessageService" -line ($i+1) -suggestion "MessageService.ShowMessageBox verwenden"
+            Add-Warning "dispatcher_usage" $file "Dispatcher.Invoke/BeginInvoke" -line ($i+1) -suggestion "Avoid the dispatcher when possible"
             break
         }
     }
 
-    # --- WARNING 11: Secret Patterns ---
+    # --- WARNING 10: MessageBox misuse ---
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'MessageBox\.Show' -and $content -notmatch 'MessageService') {
+            Add-Warning "messagebox_misuse" $file "MessageBox.Show used without MessageService" -line ($i+1) -suggestion "Use MessageService.ShowMessageBox"
+            break
+        }
+    }
+
+    # --- WARNING 11: Secret patterns ---
     if ($content -match '(connectionstring|password|apikey|secret)\s*=\s*"[^"]{8,}"') {
-        Add-Warning "secret_pattern" $file "Moeglicherweise hartcodierte Zugangsdaten"
+        Add-Warning "secret_pattern" $file "Potential hard-coded credential"
     }
 }
 
-# --- BLOCKER 6: NuGet Audit (uebersprungen wenn AllowNuget gesetzt) ---
+# --- BLOCKER 6: NuGet audit (skipped when AllowNuget is set) ---
 if (-not $AllowNuget) { foreach ($csproj in $changedCsproj) {
     $currentPkgs = (Select-String -Path $csproj -Pattern '<PackageReference\s+Include="([^"]+)"' -AllMatches).Matches |
         ForEach-Object { $_.Groups[1].Value }
@@ -247,11 +247,11 @@ if (-not $AllowNuget) { foreach ($csproj in $changedCsproj) {
     } catch {}
     $newPkgs = $currentPkgs | Where-Object { $_ -notin $basePkgs }
     foreach ($pkg in $newPkgs) {
-        Add-Blocker "nuget_audit" $csproj "Neues NuGet-Paket ohne Freigabe: $pkg" -suggestion "NuGet-Paket entfernen"
+        Add-Blocker "nuget_audit" $csproj "New NuGet package without approval: $pkg" -suggestion "Remove the NuGet package"
     }
 } }  # Ende foreach + Ende if AllowNuget
 
-# Phase 5.3: XAML-Validierung
+# XAML validation
 foreach ($file in $changedXaml) {
     try {
         $xamlContent = [System.IO.File]::ReadAllText((Resolve-Path $file).Path, [System.Text.Encoding]::UTF8)
@@ -262,11 +262,11 @@ foreach ($file in $changedXaml) {
         if ($errMsg -match '(?:Zeile|[Ll]ine)\s+(\d+)') {
             $xamlLine = [int]$Matches[1]
         }
-        Add-Blocker "xaml_parse" $file "XAML Parse-Fehler: $errMsg" -line $xamlLine
+        Add-Blocker "xaml_parse" $file "XAML parse error: $errMsg" -line $xamlLine
     }
 }
 
-# Ergebnis als JSON ausgeben
+# Emit the result as JSON
 $result = @{
     passed   = ($blockers.Count -eq 0)
     blockers = @($blockers)
