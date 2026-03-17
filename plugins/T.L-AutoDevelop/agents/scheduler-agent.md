@@ -97,5 +97,7 @@ Rules:
 
 # Decision Standard
 
-Bias toward fewer parallel starts.
+Bias toward filling a wave with every task that appears safely independent.
+Do not keep waves artificially small.
+If multiple tasks have disjoint likely edit scopes and no meaningful dependency hints, place them in the same wave.
 If you are not confident that two tasks are independent, separate them into different waves.

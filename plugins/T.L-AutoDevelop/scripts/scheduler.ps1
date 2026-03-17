@@ -141,6 +141,9 @@ function Load-State {
     if (-not $state.lastPlanAppliedAt) {
         $state | Add-Member -NotePropertyName lastPlanAppliedAt -NotePropertyValue "" -Force
     }
+    foreach ($task in @(Get-Tasks -State $state)) {
+        Ensure-TaskShape -Task $task -RepoRoot $state.repoRoot
+    }
     return $state
 }
 
@@ -212,6 +215,16 @@ function Read-JsonFile {
         return $null
     }
     return ($content | ConvertFrom-Json)
+}
+
+function Set-ObjectProperty {
+    param(
+        $Object,
+        [string]$Name,
+        $Value
+    )
+
+    $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
 }
 
 function Get-TaskById {
@@ -307,6 +320,158 @@ function Get-DefaultTaskResultPath {
     return (Join-Path $paths.resultsDir "$TaskId.json")
 }
 
+function New-LatestRunRecord {
+    param(
+        [int]$AttemptNumber = 0,
+        [string]$TaskName = "",
+        [string]$ResultFile = "",
+        [int]$ProcessId = 0,
+        [string]$StartedAt = "",
+        [string]$CompletedAt = ""
+    )
+
+    return [pscustomobject]@{
+        attemptNumber = $AttemptNumber
+        taskName = $TaskName
+        resultFile = $ResultFile
+        processId = $ProcessId
+        startedAt = $StartedAt
+        completedAt = $CompletedAt
+        finalStatus = ""
+        finalCategory = ""
+        summary = ""
+        feedback = ""
+        noChangeReason = ""
+        actualFiles = @()
+        branchName = ""
+        artifacts = $null
+    }
+}
+
+function New-MergeRecord {
+    return [pscustomobject]@{
+        state = ""
+        preparedAt = ""
+        commitMessage = ""
+        commitSha = ""
+        reason = ""
+        branchName = ""
+    }
+}
+
+function Normalize-StringArray {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return @()
+    }
+
+    $items = if ($Value -is [string]) {
+        @($Value)
+    } elseif ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [pscustomobject])) {
+        @($Value)
+    } else {
+        @($Value)
+    }
+
+    return @(
+        $items |
+            ForEach-Object { [string]$_ } |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ } |
+            Select-Object -Unique
+    )
+}
+
+function Normalize-LatestRun {
+    param(
+        $LatestRun,
+        [string]$ResultFile = ""
+    )
+
+    $normalized = New-LatestRunRecord -ResultFile $ResultFile
+    if ($LatestRun) {
+        foreach ($property in @(
+            "attemptNumber",
+            "taskName",
+            "resultFile",
+            "processId",
+            "startedAt",
+            "completedAt",
+            "finalStatus",
+            "finalCategory",
+            "summary",
+            "feedback",
+            "noChangeReason",
+            "branchName",
+            "artifacts"
+        )) {
+            if ($null -ne $LatestRun.$property) {
+                Set-ObjectProperty -Object $normalized -Name $property -Value $LatestRun.$property
+            }
+        }
+        Set-ObjectProperty -Object $normalized -Name "actualFiles" -Value (Normalize-StringArray -Value $LatestRun.actualFiles)
+    }
+    if ($ResultFile -and -not $normalized.resultFile) {
+        Set-ObjectProperty -Object $normalized -Name "resultFile" -Value $ResultFile
+    }
+    return $normalized
+}
+
+function Normalize-RunRecords {
+    param($Runs)
+
+    $normalizedRuns = @()
+    foreach ($run in @($Runs)) {
+        if (-not $run) { continue }
+        $normalizedRuns += [pscustomobject]@{
+            attemptNumber = if ($null -ne $run.attemptNumber) { [int]$run.attemptNumber } else { 0 }
+            finalStatus = [string]$run.finalStatus
+            finalCategory = [string]$run.finalCategory
+            summary = [string]$run.summary
+            feedback = [string]$run.feedback
+            noChangeReason = [string]$run.noChangeReason
+            actualFiles = @(Normalize-StringArray -Value $run.actualFiles)
+            branchName = [string]$run.branchName
+            resultFile = [string]$run.resultFile
+            completedAt = [string]$run.completedAt
+            artifacts = $run.artifacts
+        }
+    }
+    return @($normalizedRuns)
+}
+
+function Normalize-TaskRecord {
+    param(
+        $Task,
+        [string]$RepoRoot
+    )
+
+    if (-not $Task) { return }
+
+    if (-not $Task.resultFile) {
+        Set-ObjectProperty -Object $Task -Name "resultFile" -Value (Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $Task.taskId)
+    }
+
+    Set-ObjectProperty -Object $Task -Name "blockedBy" -Value @(Normalize-StringArray -Value $Task.blockedBy)
+    Set-ObjectProperty -Object $Task -Name "runs" -Value @(Normalize-RunRecords -Runs $Task.runs)
+    if (-not $Task.plannerMetadata) {
+        Set-ObjectProperty -Object $Task -Name "plannerMetadata" -Value ([pscustomobject]@{})
+    }
+    Set-ObjectProperty -Object $Task -Name "latestRun" -Value (Normalize-LatestRun -LatestRun $Task.latestRun -ResultFile ([string]$Task.resultFile))
+    if (-not $Task.merge) {
+        Set-ObjectProperty -Object $Task -Name "merge" -Value (New-MergeRecord)
+    } else {
+        $merge = New-MergeRecord
+        foreach ($property in @("state", "preparedAt", "commitMessage", "commitSha", "reason", "branchName")) {
+            if ($null -ne $Task.merge.$property) {
+                Set-ObjectProperty -Object $merge -Name $property -Value $Task.merge.$property
+            }
+        }
+        Set-ObjectProperty -Object $Task -Name "merge" -Value $merge
+    }
+}
+
 function Ensure-TaskShape {
     param(
         $Task,
@@ -318,19 +483,12 @@ function Ensure-TaskShape {
     if ($null -eq $Task.attemptsRemaining) { $Task | Add-Member -NotePropertyName attemptsRemaining -NotePropertyValue ([Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)) -Force }
     if ($null -eq $Task.retryScheduled) { $Task | Add-Member -NotePropertyName retryScheduled -NotePropertyValue $false -Force }
     if ($null -eq $Task.waitingUserTest) { $Task | Add-Member -NotePropertyName waitingUserTest -NotePropertyValue $false -Force }
-    if (-not $Task.blockedBy) { $Task | Add-Member -NotePropertyName blockedBy -NotePropertyValue @() -Force }
-    if (-not $Task.runs) { $Task | Add-Member -NotePropertyName runs -NotePropertyValue @() -Force }
+    if ($null -eq $Task.blockedBy) { $Task | Add-Member -NotePropertyName blockedBy -NotePropertyValue @() -Force }
+    if ($null -eq $Task.runs) { $Task | Add-Member -NotePropertyName runs -NotePropertyValue @() -Force }
     if (-not $Task.plannerMetadata) { $Task | Add-Member -NotePropertyName plannerMetadata -NotePropertyValue ([pscustomobject]@{}) -Force }
-    if (-not $Task.latestRun) { $Task | Add-Member -NotePropertyName latestRun -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if ($null -eq $Task.latestRun) { $Task | Add-Member -NotePropertyName latestRun -NotePropertyValue (New-LatestRunRecord) -Force }
     if (-not $Task.merge) {
-        $Task | Add-Member -NotePropertyName merge -NotePropertyValue ([pscustomobject]@{
-            state = ""
-            preparedAt = ""
-            commitMessage = ""
-            commitSha = ""
-            reason = ""
-            branchName = ""
-        }) -Force
+        $Task | Add-Member -NotePropertyName merge -NotePropertyValue (New-MergeRecord) -Force
     }
     if (-not $Task.resultFile) {
         $Task | Add-Member -NotePropertyName resultFile -NotePropertyValue (Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $Task.taskId) -Force
@@ -341,6 +499,7 @@ function Ensure-TaskShape {
     if (-not $Task.mergeState) {
         $Task | Add-Member -NotePropertyName mergeState -NotePropertyValue "" -Force
     }
+    Normalize-TaskRecord -Task $Task -RepoRoot $RepoRoot
 }
 
 function Get-TaskSummaryText {
@@ -617,15 +776,16 @@ function Apply-PipelineResultToTask {
         $PipelineResult
     )
 
-    $Task.latestRun.finalStatus = [string]$PipelineResult.status
-    $Task.latestRun.finalCategory = [string]$PipelineResult.finalCategory
-    $Task.latestRun.summary = [string]$PipelineResult.summary
-    $Task.latestRun.feedback = [string]$PipelineResult.feedback
-    $Task.latestRun.noChangeReason = [string]$PipelineResult.noChangeReason
-    $Task.latestRun.actualFiles = @($PipelineResult.files)
-    $Task.latestRun.branchName = [string]$PipelineResult.branch
-    $Task.latestRun.artifacts = $PipelineResult.artifacts
-    $Task.latestRun.completedAt = (Get-Date).ToString("o")
+    Set-ObjectProperty -Object $Task -Name "latestRun" -Value (Normalize-LatestRun -LatestRun $Task.latestRun -ResultFile ([string]$Task.resultFile))
+    Set-ObjectProperty -Object $Task.latestRun -Name "finalStatus" -Value ([string]$PipelineResult.status)
+    Set-ObjectProperty -Object $Task.latestRun -Name "finalCategory" -Value ([string]$PipelineResult.finalCategory)
+    Set-ObjectProperty -Object $Task.latestRun -Name "summary" -Value ([string]$PipelineResult.summary)
+    Set-ObjectProperty -Object $Task.latestRun -Name "feedback" -Value ([string]$PipelineResult.feedback)
+    Set-ObjectProperty -Object $Task.latestRun -Name "noChangeReason" -Value ([string]$PipelineResult.noChangeReason)
+    Set-ObjectProperty -Object $Task.latestRun -Name "actualFiles" -Value @(Normalize-StringArray -Value $PipelineResult.files)
+    Set-ObjectProperty -Object $Task.latestRun -Name "branchName" -Value ([string]$PipelineResult.branch)
+    Set-ObjectProperty -Object $Task.latestRun -Name "artifacts" -Value $PipelineResult.artifacts
+    Set-ObjectProperty -Object $Task.latestRun -Name "completedAt" -Value ((Get-Date).ToString("o"))
 
     $runRecord = [pscustomobject]@{
         attemptNumber = [int]$Task.attemptsUsed
@@ -696,12 +856,31 @@ function Reconcile-TaskState {
 }
 
 function Reconcile-State {
-    param($State)
+    param(
+        $State,
+        [string]$EventsFile = ""
+    )
+
+    $errors = @()
     foreach ($task in @(Get-Tasks -State $State)) {
-        Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
-        Reconcile-TaskState -Task $task
-        Write-TaskResultFile -Task $task
+        try {
+            Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
+            Reconcile-TaskState -Task $task
+            Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
+            Write-TaskResultFile -Task $task
+        } catch {
+            $errorRecord = [pscustomobject]@{
+                taskId = [string]$task.taskId
+                phase = "reconcile"
+                message = $_.Exception.Message
+            }
+            $errors += $errorRecord
+            if ($EventsFile) {
+                Append-StateEvent -EventsFile $EventsFile -TaskId ([string]$task.taskId) -Kind "reconcile_error" -Message "Task reconciliation failed." -Data $errorRecord
+            }
+        }
     }
+    return @($errors)
 }
 
 function New-TaskRecord {
@@ -738,16 +917,9 @@ function New-TaskRecord {
         mergeState = ""
         state = "queued"
         plannerMetadata = if ($InputTask.plannerMetadata) { $InputTask.plannerMetadata } else { [pscustomobject]@{} }
-        latestRun = [pscustomobject]@{}
+        latestRun = (New-LatestRunRecord -ResultFile $resultFile)
         runs = @()
-        merge = [pscustomobject]@{
-            state = ""
-            preparedAt = ""
-            commitMessage = ""
-            commitSha = ""
-            reason = ""
-            branchName = ""
-        }
+        merge = (New-MergeRecord)
     }
 }
 
@@ -848,7 +1020,10 @@ function Get-AutoDevelopScriptPath {
 }
 
 function Get-SnapshotPayload {
-    param($State)
+    param(
+        $State,
+        [object[]]$ReconcileErrors = @()
+    )
 
     $knownBranches = Get-KnownBranches -State $State
     $unknownBranches = Get-UnknownAutoBranches -RepoRoot $State.repoRoot -KnownBranches $knownBranches
@@ -868,6 +1043,8 @@ function Get-SnapshotPayload {
         nextMergeTaskId = if ($nextMergeTask) { [string]$nextMergeTask.taskId } else { "" }
         mergePreparedTaskId = if ($mergePreparedTask) { [string]$mergePreparedTask.taskId } else { "" }
         unknownAutoBranches = @($unknownBranches)
+        schedulerHealthy = (@($ReconcileErrors).Count -eq 0)
+        reconcileErrors = @($ReconcileErrors)
     }
 }
 
@@ -878,9 +1055,9 @@ function Snapshot-Queue {
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
-        Reconcile-State -State $state
+        $reconcileErrors = @(Reconcile-State -State $state -EventsFile $context.paths.eventsFile)
         Save-State -StateFile $context.paths.stateFile -State $state
-        return (Get-SnapshotPayload -State $state)
+        return (Get-SnapshotPayload -State $state -ReconcileErrors $reconcileErrors)
     } finally {
         Release-Lock -LockHandle $lock
     }
@@ -898,7 +1075,7 @@ function Register-Tasks {
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
-        Reconcile-State -State $state
+        $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
 
         $submissionOrder = Get-SubmissionOrder -State $state
         $registered = [System.Collections.ArrayList]::new()
@@ -940,7 +1117,7 @@ function Apply-Plan {
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
-        Reconcile-State -State $state
+        $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
 
         foreach ($assignment in $assignments) {
             if (-not $assignment.taskId) { continue }
@@ -949,7 +1126,7 @@ function Apply-Plan {
             if (Is-TerminalState -State $task.state) { continue }
 
             if ($assignment.waveNumber) { $task.waveNumber = [int]$assignment.waveNumber }
-            $task.blockedBy = if ($assignment.blockedBy) { @($assignment.blockedBy) } else { @() }
+            Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $assignment.blockedBy))
             if ($assignment.plannerMetadata) {
                 $task.plannerMetadata = $assignment.plannerMetadata
             }
@@ -995,7 +1172,7 @@ function Run-Task {
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
-        Reconcile-State -State $state
+        $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
         $task = Get-TaskById -State $state -TaskId $TaskId
         if (-not $task) {
             throw "Task '$TaskId' was not found."
@@ -1015,21 +1192,12 @@ function Run-Task {
         $task.attemptsRemaining = [Math]::Max(0, [int]$task.maxAttempts - [int]$task.attemptsUsed)
         $attemptNumber = [int]$task.attemptsUsed
         $pipelineResultPath = Join-Path $context.paths.tasksDir "$TaskId-attempt-$attemptNumber-result.json"
-        $task.latestRun = [pscustomobject]@{
-            attemptNumber = $attemptNumber
-            taskName = Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -AttemptNumber $attemptNumber
-            resultFile = $pipelineResultPath
-            processId = $PID
-            startedAt = (Get-Date).ToString("o")
-            finalStatus = ""
-            finalCategory = ""
-            summary = ""
-            feedback = ""
-            noChangeReason = ""
-            actualFiles = @()
-            branchName = ""
-            artifacts = $null
-        }
+        $task.latestRun = New-LatestRunRecord `
+            -AttemptNumber $attemptNumber `
+            -TaskName (Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -AttemptNumber $attemptNumber) `
+            -ResultFile $pipelineResultPath `
+            -ProcessId $PID `
+            -StartedAt ((Get-Date).ToString("o"))
         Write-TaskResultFile -Task $task
         Save-State -StateFile $context.paths.stateFile -State $state
         Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "started" -Message "Task pipeline started." -Data @{ attempt = $attemptNumber; waveNumber = $task.waveNumber }
@@ -1107,7 +1275,7 @@ function Prepare-Merge {
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
-        Reconcile-State -State $state
+        $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
 
         $alreadyPrepared = Get-MergePreparedTask -State $state
         if ($alreadyPrepared -and ((-not $TaskId) -or [string]$alreadyPrepared.taskId -ne $TaskId)) {
@@ -1251,7 +1419,7 @@ function Resolve-Merge {
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
-        Reconcile-State -State $state
+        $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
         $task = Get-TaskById -State $state -TaskId $TaskId
         if (-not $task) {
             throw "Task '$TaskId' was not found."

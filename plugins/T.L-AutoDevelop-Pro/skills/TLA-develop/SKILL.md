@@ -137,6 +137,8 @@ Whenever you re-enter after task completion:
 5. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
 6. After each merge, snapshot again and start any newly startable tasks.
 
+`nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued`, `retry_scheduled`, or `running`. The scheduler only surfaces merge turns after the whole wave is finished.
+
 Use a normal English merge commit message that describes the actual change.
 Do not use squash wording.
 
