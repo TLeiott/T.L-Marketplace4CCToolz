@@ -820,7 +820,7 @@ function Get-TaskFailureCategory {
     if ($text -match 'msb3021|msb3027|lock|locked|access to the path|used by another process') { return "locked_environment" }
     if ($text -match 'build failed|compile|cs\d{4}|msbuild') { return "build_infra" }
     if ($text -match 'test|xunit|nunit|mstest') { return "test_infra" }
-    if ($text -match 'merge conflict|actual_overlap|overlap') { return "merge_conflict" }
+    if ($text -match 'merge conflict') { return "merge_conflict" }
     if ($text -match 'dirty_worktree|repository worktree is not clean|git') { return "repo_state" }
     if ($text -match 'reconcile|scheduler|planner') { return "scheduler_state" }
     if ($text -match 'review_denied') { return "review_denied" }
@@ -1088,42 +1088,28 @@ function Get-UnknownAutoBranches {
     )
 }
 
-function Get-MergedFilesBeforeTask {
-    param(
-        $State,
-        $Task
-    )
-
-    $files = [System.Collections.ArrayList]::new()
-    foreach ($candidate in @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)) {
-        if ([int]$candidate.waveNumber -gt [int]$Task.waveNumber) { break }
-        if ([int]$candidate.waveNumber -eq [int]$Task.waveNumber -and [int]$candidate.submissionOrder -ge [int]$Task.submissionOrder) { break }
-        if ($candidate.state -ne "merged") { continue }
-        foreach ($file in @(Get-NormalizedPathSet -RepoRoot $State.repoRoot -Paths $candidate.latestRun.actualFiles)) {
-            if ($files -notcontains $file) {
-                [void]$files.Add($file)
-            }
-        }
-    }
-    return @($files)
-}
-
-function Test-ActualOverlap {
-    param(
-        $State,
-        $Task
-    )
-
-    $currentFiles = @(Get-NormalizedPathSet -RepoRoot $State.repoRoot -Paths $Task.latestRun.actualFiles)
-    if ($currentFiles.Count -eq 0) { return @() }
-    $previousFiles = @(Get-MergedFilesBeforeTask -State $State -Task $Task)
-    return @($currentFiles | Where-Object { $previousFiles -contains $_ } | Select-Object -Unique)
-}
-
 function Invoke-GitCleanCheck {
     param([string]$RepoRoot)
     $status = Invoke-NativeCommand -Command "git" -Arguments @("status", "--porcelain") -WorkingDirectory $RepoRoot
     return (-not $status.output)
+}
+
+function Test-BranchMergedIntoHead {
+    param(
+        [string]$RepoRoot,
+        [string]$BranchName
+    )
+
+    if (-not $BranchName) { return $false }
+
+    $verifyBranch = Invoke-NativeCommand -Command "git" -Arguments @("rev-parse", "--verify", $BranchName) -WorkingDirectory $RepoRoot
+    if ($verifyBranch.exitCode -ne 0 -or -not $verifyBranch.output) {
+        return $false
+    }
+
+    $sha = [string]$verifyBranch.output
+    $ancestor = Invoke-NativeCommand -Command "git" -Arguments @("merge-base", "--is-ancestor", $sha, "HEAD") -WorkingDirectory $RepoRoot
+    return ($ancestor.exitCode -eq 0)
 }
 
 function Undo-MergeAttempt {
@@ -1436,6 +1422,23 @@ function Reconcile-TaskState {
         [string]$RepoRoot = ""
     )
 
+    if ($RepoRoot -and $Task.state -in @("pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test")) {
+        $branchName = [string]$Task.latestRun.branchName
+        if ($branchName -and (Invoke-GitCleanCheck -RepoRoot $RepoRoot) -and (Test-BranchMergedIntoHead -RepoRoot $RepoRoot -BranchName $branchName)) {
+            $headSha = Invoke-NativeCommand -Command "git" -Arguments @("rev-parse", "HEAD") -WorkingDirectory $RepoRoot
+            $Task.state = "merged"
+            $Task.retryScheduled = $false
+            $Task.waitingUserTest = $false
+            $Task.mergeState = "merged"
+            $Task.merge.state = "merged"
+            $Task.merge.commitSha = if ($headSha.exitCode -eq 0) { [string]$headSha.output } else { [string]$Task.merge.commitSha }
+            if (-not $Task.merge.reason) {
+                $Task.merge.reason = "Merged externally and reconciled from git state."
+            }
+            return
+        }
+    }
+
     if (-not (Is-RunningState -State $Task.state)) {
         return
     }
@@ -1463,9 +1466,16 @@ function Reconcile-State {
     $errors = @()
     foreach ($task in @(Get-Tasks -State $State)) {
         try {
+            $previousState = [string]$task.state
             Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
             Reconcile-TaskState -Task $task -RepoRoot $State.repoRoot
             Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
+            if ($EventsFile -and $previousState -in @("pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test") -and [string]$task.state -eq "merged") {
+                Append-StateEvent -EventsFile $EventsFile -TaskId ([string]$task.taskId) -Kind "external_merge_detected" -Message "Task was marked merged because its branch is already reachable from HEAD." -Data @{
+                    branchName = [string]$task.latestRun.branchName
+                    previousState = $previousState
+                }
+            }
             Write-TaskResultFile -Task $task
         } catch {
             $errorRecord = [pscustomobject]@{
@@ -2096,20 +2106,6 @@ function Prepare-Merge {
             }
         }
 
-        $overlap = @(Test-ActualOverlap -State $state -Task $selectedTask)
-        if ($overlap.Count -gt 0) {
-            Get-RetryableResult -Task $selectedTask -Reason ("ACTUAL_OVERLAP: " + ($overlap -join ", "))
-            Write-TaskResultFile -Task $selectedTask
-            $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
-            Save-State -StateFile $context.paths.stateFile -State $state
-            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_retry" -Message "Task rescheduled after actual file overlap was detected." -Data @{ overlap = @($overlap) }
-            return [pscustomobject]@{
-                task = ConvertTo-TaskSnapshot -Task $selectedTask
-                blocked = $false
-                reason = "Task was requeued because the merged files overlap."
-                snapshot = Get-SnapshotPayload -State $state
-            }
-        }
     } finally {
         Release-Lock -LockHandle $lock
     }

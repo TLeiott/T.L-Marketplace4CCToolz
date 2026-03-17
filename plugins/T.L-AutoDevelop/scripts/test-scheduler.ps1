@@ -190,7 +190,49 @@ if ($Args.Count -ge 2 -and $Args[0] -eq 'rev-parse' -and $Args[1] -eq 'HEAD') {
     Write-Output '1111111111111111111111111111111111111111'
     exit 0
 }
-if ($Args.Count -ge 1 -and $Args[0] -in @('branch','status','merge','reset','commit')) {
+if ($Args.Count -ge 3 -and $Args[0] -eq 'rev-parse' -and $Args[1] -eq '--verify') {
+    $branch = $Args[2]
+    $known = @()
+    if ($env:AUTODEV_TEST_BRANCH_SHA_MAP) {
+        try { $known = @((ConvertFrom-Json $env:AUTODEV_TEST_BRANCH_SHA_MAP).psobject.Properties) } catch { $known = @() }
+    }
+    $sha = ''
+    foreach ($entry in $known) {
+        if ([string]$entry.Name -eq $branch) {
+            $sha = [string]$entry.Value
+            break
+        }
+    }
+    if ($sha) {
+        Write-Output $sha
+        exit 0
+    }
+    exit 1
+}
+if ($Args.Count -ge 4 -and $Args[0] -eq 'merge-base' -and $Args[1] -eq '--is-ancestor') {
+    $ancestorSha = $Args[2]
+    $merged = @()
+    if ($env:AUTODEV_TEST_MERGED_SHAS) {
+        try { $merged = @((ConvertFrom-Json $env:AUTODEV_TEST_MERGED_SHAS)) } catch { $merged = @() }
+    }
+    if ($merged -contains $ancestorSha) { exit 0 }
+    exit 1
+}
+if ($Args.Count -ge 1 -and $Args[0] -eq 'merge') {
+    if ($env:AUTODEV_TEST_GIT_MERGE_BEHAVIOR -eq 'conflict') {
+        Write-Output 'CONFLICT (content): Merge conflict'
+        exit 1
+    }
+    exit 0
+}
+if ($Args.Count -ge 1 -and $Args[0] -eq 'status') {
+    if ($env:AUTODEV_TEST_GIT_STATUS_OUTPUT) {
+        Write-Output $env:AUTODEV_TEST_GIT_STATUS_OUTPUT
+        exit 0
+    }
+    exit 0
+}
+if ($Args.Count -ge 1 -and $Args[0] -in @('branch','reset','commit')) {
     exit 0
 }
 exit 0
@@ -202,6 +244,13 @@ exit 0
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
 Write-Output "error CS1002: ; expected"
 exit 1
+'@
+        }
+        "success" {
+@'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+Write-Output 'Build succeeded.'
+exit 0
 '@
         }
         default {
@@ -1029,6 +1078,312 @@ function Test-CircuitBreakerBlocksStarts {
     }
 }
 
+function Test-SharedFileWithoutConflictDoesNotRequeue {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "success"
+        $gitLog = Join-Path $repo.root "git-shared-file.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "merged-css"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "panel colors"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "merged-css.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "merged"
+                    state = "merged"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "merged-css"
+                        resultFile = ""
+                        processId = 0
+                        startedAt = (Get-Date).AddMinutes(-20).ToString("o")
+                        completedAt = (Get-Date).AddMinutes(-15).ToString("o")
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "IMPLEMENTED"
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @("app.css")
+                        branchName = "auto/merged-css"
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "pending-css"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "editor transition"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "pending-css.json")
+                    submissionOrder = 2
+                    waveNumber = 2
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "pending-css"
+                        resultFile = ""
+                        processId = 0
+                        startedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                        completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "IMPLEMENTED"
+                        summary = "editor transition"
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @("app.css")
+                        branchName = "auto/pending-css"
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_GIT_LOG = $gitLog
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $true) "Shared-file edits without a real merge conflict should still prepare successfully."
+        Assert-True ([string]$prepareResult.task.state -in @("waiting_user_test","merge_prepared")) "Shared-file non-conflicts should not be requeued."
+        Assert-True ([string]$prepareResult.reason -notmatch "overlap") "Shared-file non-conflicts should not report overlap requeue reasons."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RealMergeConflictStillRetries {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "conflict-task"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "conflict task"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "conflict-task.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "conflict-task"
+                        resultFile = ""
+                        processId = 0
+                        startedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                        completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "IMPLEMENTED"
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @("app.css")
+                        branchName = "auto/conflict-task"
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_GIT_MERGE_BEHAVIOR = "conflict"
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $false) "Real git merge conflicts should still fail merge preparation."
+        Assert-True ([string]$prepareResult.task.state -eq "retry_scheduled") "Real git merge conflicts should still trigger worker retry scheduling."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ExternalMergeReconciliation {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "externally-merged"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "already merged"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "externally-merged.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "externally-merged"
+                        resultFile = ""
+                        processId = 0
+                        startedAt = (Get-Date).AddMinutes(-20).ToString("o")
+                        completedAt = (Get-Date).AddMinutes(-15).ToString("o")
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "IMPLEMENTED"
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @("app.css")
+                        branchName = "auto/external"
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_BRANCH_SHA_MAP = (@{ "auto/external" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } | ConvertTo-Json -Compress)
+            AUTODEV_TEST_MERGED_SHAS = (@("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") | ConvertTo-Json -Compress)
+        }
+
+        $snapshot = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        }
+
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "externally-merged" })[0]
+        Assert-True ([string]$task.state -eq "merged") "Snapshot reconciliation should mark externally merged task branches as merged."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-OldFailuresDoNotReopenBreaker {
     $repo = New-TestRepo
     try {
@@ -1392,6 +1747,9 @@ Test-RetryDoesNotBlockMerge
 Test-CircuitBreakerBlocksStarts
 Test-OldFailuresDoNotReopenBreaker
 Test-ManualOverridePersistsAcrossSnapshots
+Test-SharedFileWithoutConflictDoesNotRequeue
+Test-RealMergeConflictStillRetries
+Test-ExternalMergeReconciliation
 Test-TlaMergeLockRemediation
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
