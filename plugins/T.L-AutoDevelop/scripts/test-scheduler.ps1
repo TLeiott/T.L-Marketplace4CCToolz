@@ -458,6 +458,37 @@ function Test-SnapshotResilience {
     }
 }
 
+function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
+    $scriptPath = 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1'
+    $promptFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md'
+    $solutionPath = 'D:\Repos\My Repo\My Solution.slnx'
+    $resultFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json'
+    $taskName = 'develop-task-a1'
+    $taskId = 'task-spaces'
+    $commandType = 'develop'
+
+    $quote = {
+        param([string]$Value)
+        if ($null -eq $Value) { return "''" }
+        return "'" + ([string]$Value).Replace("'", "''") + "'"
+    }
+
+    $commandText = @"
+$ErrorActionPreference = 'Stop'
+& $(& $quote $scriptPath) -PromptFile $(& $quote $promptFile) -SolutionPath $(& $quote $solutionPath) -ResultFile $(& $quote $resultFile) -TaskName $(& $quote $taskName) -SchedulerTaskId $(& $quote $taskId) -CommandType $(& $quote $commandType)
+exit `$LASTEXITCODE
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
+
+    $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(([string]$encoded).Trim()))
+
+    Assert-True ($decoded -match [regex]::Escape($scriptPath)) "Encoded worker launch must preserve the full spaced script path."
+    Assert-True ($decoded -match [regex]::Escape($promptFile)) "Encoded worker launch must preserve the full spaced prompt path."
+    Assert-True ($decoded -match [regex]::Escape($solutionPath)) "Encoded worker launch must preserve the full spaced solution path."
+    Assert-True ($decoded -match [regex]::Escape($resultFile)) "Encoded worker launch must preserve the full spaced result path."
+    Assert-True ($decoded -notmatch '-File\s+C:\\Users\\Example') "Encoded worker launch must not rely on a raw -File argument that can split at spaces."
+}
+
 function Test-BlockedByNormalization {
     $repo = New-TestRepo
     try {
@@ -2018,6 +2049,7 @@ function Test-AdminEditTask {
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-SnapshotResilience
+Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied

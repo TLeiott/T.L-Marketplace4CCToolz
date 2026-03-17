@@ -2063,6 +2063,43 @@ function Get-AutoDevelopScriptPath {
     return (Join-Path (Split-Path -Path $PSCommandPath -Parent) "auto-develop.ps1")
 }
 
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([string]$Value)
+
+    if ($null -eq $Value) { return "''" }
+    return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+function Get-EncodedWorkerLaunchCommand {
+    param(
+        [string]$ScriptPath,
+        [string]$PromptFile,
+        [string]$SolutionPath,
+        [string]$ResultFile,
+        [string]$TaskName,
+        [string]$SchedulerTaskId,
+        [string]$CommandType,
+        [bool]$AllowNuget
+    )
+
+    $scriptLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $ScriptPath
+    $promptLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $PromptFile
+    $solutionLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SolutionPath
+    $resultLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $ResultFile
+    $taskNameLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $TaskName
+    $taskIdLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SchedulerTaskId
+    $commandTypeLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $CommandType
+    $allowNugetFragment = if ($AllowNuget) { " -AllowNuget" } else { "" }
+
+    $commandText = @"
+$ErrorActionPreference = 'Stop'
+& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
+exit `$LASTEXITCODE
+"@
+
+    return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
+}
+
 function Get-UsageProjection {
     param($State)
 
@@ -2449,20 +2486,21 @@ function Run-Task {
         Release-Lock -LockHandle $lock
     }
 
+    $encodedCommand = Get-EncodedWorkerLaunchCommand `
+        -ScriptPath $autoDevelopScript `
+        -PromptFile ([string]$task.promptFile) `
+        -SolutionPath ([string]$task.solutionPath) `
+        -ResultFile $pipelineResultPath `
+        -TaskName ([string]$task.latestRun.taskName) `
+        -SchedulerTaskId ([string]$task.taskId) `
+        -CommandType ([string]$task.sourceCommand) `
+        -AllowNuget ([bool]$task.allowNuget)
+
     $arguments = @(
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
-        "-File", $autoDevelopScript,
-        "-PromptFile", $task.promptFile,
-        "-SolutionPath", $task.solutionPath,
-        "-ResultFile", $pipelineResultPath,
-        "-TaskName", $task.latestRun.taskName,
-        "-SchedulerTaskId", $task.taskId,
-        "-CommandType", $task.sourceCommand
+        "-EncodedCommand", $encodedCommand
     )
-    if ([bool]$task.allowNuget) {
-        $arguments += "-AllowNuget"
-    }
 
     $workerOutputFile = Join-Path $context.paths.tasksDir "$TaskId-attempt-$attemptNumber-stdout.log"
     $workerErrorFile = Join-Path $context.paths.tasksDir "$TaskId-attempt-$attemptNumber-stderr.log"
