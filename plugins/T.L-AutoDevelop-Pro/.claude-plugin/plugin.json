@@ -1,7 +1,7 @@
 {
   "name": "T.L-AutoDevelop-Pro",
-  "version": "3.0.0",
-  "description": "Autonomous addon for T.L-AutoDevelop with scheduler-managed single tasks and wave-safe auto-commit. Requires T.L-AutoDevelop.",
+  "version": "4.0.1",
+  "description": "Autonomous addon for T.L-AutoDevelop with queue-aware scheduling, task-file intake, retries, and automatic normal merges.",
   "author": {
     "name": "TLeiott",
     "url": "https://github.com/TLeiott"

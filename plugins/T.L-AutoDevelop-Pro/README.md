@@ -1,27 +1,32 @@
 # T.L-AutoDevelop-Pro
 
-Autonomous addon for [T.L-AutoDevelop](../T.L-AutoDevelop/). Zero confirmations — auto-commits on success without user input.
+Autonomous queue-aware orchestration built on top of [T.L-AutoDevelop](../T.L-AutoDevelop/).
 
-**Requires T.L-AutoDevelop** (all engine scripts and agents live there).
+## Command
 
-## Skills
+- `/TLA-develop [task text or path-to-task-file]`
 
-- **`/TLA-develop`** — Fully autonomous scheduler-managed single-task pipeline with read-only planning, queueing, and wave-safe auto-commit.
-- **`/TLA-develop-batch`** — Fully autonomous batched pipeline with read-only task scheduling, statusline-aware 5h launch gating, and conservative parallel waves. Auto-commits all accepted tasks, with at most one preflight question if both usage sources are unavailable.
+## What V4 Changes
 
-## Differences from T.L-AutoDevelop
+- uses the same shared scheduler queue as `/develop`
+- accepts either a direct task text or a file containing multiple tasks
+- uses the same read-only Scheduler-Agent wave planning model
+- starts autonomous worker pipes in conservative parallel waves
+- prepares merges with normal merge semantics
+- commits prepared merges automatically after validation succeeds
 
-| Feature | T.L-AutoDevelop | T.L-AutoDevelop-Pro |
-|---------|-----------------|---------------------|
-| Pipeline engine | Included | Uses T.L-AutoDevelop's |
-| Reviewer agent | Included | Uses T.L-AutoDevelop's |
-| Commit on ACCEPTED | Asks user first | Auto-commits |
-| User confirmations | Yes | None |
-| Investigation / no-op logic | Included | Uses T.L-AutoDevelop's |
+## Depends On
+
+`T.L-AutoDevelop` provides the shared scripts and agents:
+- `scheduler.ps1`
+- `auto-develop.ps1`
+- `scheduler-agent`
+- `reviewer`
+- usage gate and preflight helpers
 
 ## Requirements
 
-- **T.L-AutoDevelop** plugin installed
+- T.L-AutoDevelop installed
 - Windows (PowerShell 5.1+)
 - .NET SDK
 - Git

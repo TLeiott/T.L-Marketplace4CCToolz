@@ -1,16 +1,12 @@
-# scheduler.ps1 -- Repo-scoped single-task scheduler for wave-managed AutoDevelop runs
+# scheduler.ps1 -- Repo-scoped queue scheduler for AutoDevelop v4
 param(
-    [Parameter(Mandatory)][ValidateSet("submit-single", "run-single", "resolve-interactive")][string]$Mode,
-    [string]$CommandType = "develop",
-    [string]$PromptFile = "",
-    [string]$PlanFile = "",
+    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge")][string]$Mode,
     [string]$SolutionPath = "",
-    [string]$ResultFile = "",
+    [string]$TasksFile = "",
+    [string]$PlanFile = "",
     [string]$TaskId = "",
     [string]$Decision = "",
-    [string]$CommitMessage = "",
-    [switch]$AllowNuget,
-    [switch]$UsageGateDisabled
+    [string]$CommitMessage = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +17,7 @@ function Invoke-NativeCommand {
         [string[]]$Arguments,
         [string]$WorkingDirectory = ""
     )
+
     $output = if ($WorkingDirectory) {
         & {
             $ErrorActionPreference = "Continue"
@@ -37,6 +34,7 @@ function Invoke-NativeCommand {
             & $Command @Arguments 2>&1
         }
     }
+
     return [pscustomobject]@{
         output = ($output | Out-String).Trim()
         exitCode = $LASTEXITCODE
@@ -45,17 +43,34 @@ function Invoke-NativeCommand {
 
 function Write-JsonOutput {
     param($Object)
-    $Object | ConvertTo-Json -Depth 20
+    $Object | ConvertTo-Json -Depth 32
+}
+
+function Ensure-Directory {
+    param([string]$Path)
+    if ($Path -and -not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Ensure-ParentDirectory {
+    param([string]$Path)
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent) {
+        Ensure-Directory -Path $parent
+    }
 }
 
 function Get-CanonicalPath {
     param([string]$Path)
     if (-not $Path) { return "" }
+
     try {
         $fullPath = [System.IO.Path]::GetFullPath($Path)
     } catch {
         $fullPath = $Path
     }
+
     try {
         return (Get-Item -LiteralPath $fullPath -ErrorAction Stop).FullName
     } catch {
@@ -63,107 +78,92 @@ function Get-CanonicalPath {
     }
 }
 
-function Ensure-Directory {
-    param([string]$Path)
-    if ($Path -and -not (Test-Path $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
-    }
-}
-
-function Ensure-ParentDirectory {
-    param([string]$Path)
-    $parent = Split-Path $Path -Parent
-    if ($parent) { Ensure-Directory -Path $parent }
-}
-
-function Normalize-RepoRelativePath {
-    param([string]$Path)
-    if (-not $Path) { return "" }
-    $normalized = $Path.Trim().Replace("/", "\")
-    while ($normalized.StartsWith(".\")) {
-        $normalized = $normalized.Substring(2)
-    }
-    return $normalized.TrimStart('\').Trim()
-}
-
-function Get-NormalizedPathSet {
-    param([string[]]$Paths)
-    return @(
-        @($Paths | ForEach-Object {
-            $value = Normalize-RepoRelativePath -Path ([string]$_)
-            if ($value) { $value }
-        } | Where-Object { $_ } | Select-Object -Unique)
-    )
-}
-
 function Get-CanonicalRepoRoot {
-    param([string]$SolutionPath)
-    $solutionDir = Split-Path (Get-CanonicalPath -Path $SolutionPath) -Parent
-    $result = Invoke-NativeCommand git @("rev-parse", "--show-toplevel") $solutionDir
-    if ($result.exitCode -ne 0 -or -not $result.output) {
-        throw "Kein Git-Repository fuer Solution gefunden: $SolutionPath"
+    param([string]$ResolvedSolutionPath)
+    if (-not $ResolvedSolutionPath) {
+        throw "A solution path is required to resolve the repository root."
     }
-    return (Get-CanonicalPath -Path $result.output)
-}
 
-function Get-RepoHash {
-    param([string]$RepoRoot)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($RepoRoot.ToLowerInvariant())
-        $hash = $sha.ComputeHash($bytes)
-        return -join ($hash | ForEach-Object { $_.ToString("x2") } | Select-Object -First 12)
-    } finally {
-        $sha.Dispose()
+    $solutionDir = Split-Path -Path $ResolvedSolutionPath -Parent
+    $result = Invoke-NativeCommand -Command "git" -Arguments @("rev-parse", "--show-toplevel") -WorkingDirectory $solutionDir
+    if ($result.exitCode -ne 0 -or -not $result.output) {
+        throw "Could not resolve the git repository root for solution '$ResolvedSolutionPath'."
     }
+
+    return (Get-CanonicalPath -Path $result.output)
 }
 
 function Get-StatePaths {
     param([string]$RepoRoot)
-    $repoHash = Get-RepoHash -RepoRoot $RepoRoot
-    $baseDir = Join-Path $env:TEMP "claude-develop\scheduler\$repoHash"
+    $baseDir = Join-Path $RepoRoot ".claude-develop-logs\scheduler"
     return [pscustomobject]@{
-        repoHash = $repoHash
         baseDir = $baseDir
         stateFile = Join-Path $baseDir "state.json"
         eventsFile = Join-Path $baseDir "events.jsonl"
         lockFile = Join-Path $baseDir "state.lock"
+        tasksDir = Join-Path $baseDir "tasks"
+        resultsDir = Join-Path $baseDir "results"
     }
 }
 
 function New-EmptyState {
-    param([string]$RepoRoot, [string]$RepoHash)
+    param([string]$RepoRoot)
     return [pscustomobject]@{
-        version = 1
+        version = 4
         repoRoot = $RepoRoot
-        repoHash = $RepoHash
         createdAt = (Get-Date).ToString("o")
         updatedAt = (Get-Date).ToString("o")
+        lastPlanAppliedAt = ""
         tasks = @()
     }
 }
 
 function Load-State {
-    param([string]$StateFile, [string]$RepoRoot, [string]$RepoHash)
-    if (-not (Test-Path $StateFile)) {
-        return New-EmptyState -RepoRoot $RepoRoot -RepoHash $RepoHash
+    param(
+        [string]$StateFile,
+        [string]$RepoRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $StateFile)) {
+        return (New-EmptyState -RepoRoot $RepoRoot)
     }
-    $state = Get-Content $StateFile -Raw | ConvertFrom-Json
-    if (-not $state.tasks) { $state | Add-Member -NotePropertyName tasks -NotePropertyValue @() -Force }
-    if (-not $state.repoRoot) { $state | Add-Member -NotePropertyName repoRoot -NotePropertyValue $RepoRoot -Force }
-    if (-not $state.repoHash) { $state | Add-Member -NotePropertyName repoHash -NotePropertyValue $RepoHash -Force }
+
+    $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+    if (-not $state.tasks) {
+        $state | Add-Member -NotePropertyName tasks -NotePropertyValue @() -Force
+    }
+    if (-not $state.repoRoot) {
+        $state | Add-Member -NotePropertyName repoRoot -NotePropertyValue $RepoRoot -Force
+    }
+    if (-not $state.version) {
+        $state | Add-Member -NotePropertyName version -NotePropertyValue 4 -Force
+    }
+    if (-not $state.lastPlanAppliedAt) {
+        $state | Add-Member -NotePropertyName lastPlanAppliedAt -NotePropertyValue "" -Force
+    }
     return $state
 }
 
 function Save-State {
-    param([string]$StateFile, $State)
+    param(
+        [string]$StateFile,
+        $State
+    )
+
     $State.updatedAt = (Get-Date).ToString("o")
     Ensure-ParentDirectory -Path $StateFile
-    [System.IO.File]::WriteAllText($StateFile, ($State | ConvertTo-Json -Depth 20), [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($StateFile, ($State | ConvertTo-Json -Depth 32), [System.Text.Encoding]::UTF8)
 }
 
 function Append-StateEvent {
-    param([string]$EventsFile, [string]$TaskId, [string]$Kind, [string]$Message, $Data)
+    param(
+        [string]$EventsFile,
+        [string]$TaskId,
+        [string]$Kind,
+        [string]$Message,
+        $Data
+    )
+
     Ensure-ParentDirectory -Path $EventsFile
     $entry = [pscustomobject]@{
         timestamp = (Get-Date).ToString("o")
@@ -171,12 +171,16 @@ function Append-StateEvent {
         kind = $Kind
         message = $Message
         data = $Data
-    } | ConvertTo-Json -Depth 12 -Compress
-    Add-Content -Path $EventsFile -Value $entry -Encoding UTF8
+    } | ConvertTo-Json -Depth 20 -Compress
+    Add-Content -LiteralPath $EventsFile -Value $entry -Encoding UTF8
 }
 
 function Acquire-Lock {
-    param([string]$LockFile, [int]$TimeoutSeconds = 180)
+    param(
+        [string]$LockFile,
+        [int]$TimeoutSeconds = 120
+    )
+
     Ensure-ParentDirectory -Path $LockFile
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -186,16 +190,36 @@ function Acquire-Lock {
             Start-Sleep -Milliseconds 250
         }
     }
-    throw "Scheduler-Lock konnte nicht erworben werden: $LockFile"
+
+    throw "Could not acquire the scheduler lock."
 }
 
 function Release-Lock {
     param($LockHandle)
-    if ($LockHandle) { $LockHandle.Dispose() }
+    if ($LockHandle) {
+        $LockHandle.Dispose()
+    }
+}
+
+function Read-JsonFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $content = Get-Content -LiteralPath $Path -Raw
+    if (-not $content.Trim()) {
+        return $null
+    }
+    return ($content | ConvertFrom-Json)
 }
 
 function Get-TaskById {
-    param($State, [string]$TaskId)
+    param(
+        $State,
+        [string]$TaskId
+    )
+
     return @($State.tasks | Where-Object { $_.taskId -eq $TaskId } | Select-Object -First 1)[0]
 }
 
@@ -205,291 +229,60 @@ function Get-Tasks {
 }
 
 function Get-TaskMode {
-    param([string]$CommandType)
-    if ($CommandType -eq "TLA-develop") { return "autonomous" }
+    param([string]$SourceCommand)
+    if ($SourceCommand -eq "TLA-develop") { return "autonomous" }
     return "interactive"
 }
 
-function Get-TaskNamePrefix {
-    param([string]$CommandType)
-    if ($CommandType -eq "TLA-develop") { return "tla" }
+function Get-TaskPrefix {
+    param([string]$SourceCommand)
+    if ($SourceCommand -eq "TLA-develop") { return "tla" }
     return "develop"
 }
 
-function Get-ShortTaskId {
+function Get-ShortTaskToken {
     param([string]$TaskId)
     if (-not $TaskId) { return "task" }
-    $token = ($TaskId -replace '[^A-Za-z0-9]', '')
-    if ($token.Length -gt 8) { return $token.Substring(0, 8).ToLowerInvariant() }
-    return $token.ToLowerInvariant()
+    $clean = ($TaskId -replace "[^A-Za-z0-9]", "").ToLowerInvariant()
+    if (-not $clean) { return "task" }
+    if ($clean.Length -gt 8) { return $clean.Substring(0, 8) }
+    return $clean
 }
 
-function New-SchedulerTaskRecord {
+function Get-AttemptTaskName {
     param(
         [string]$TaskId,
-        [string]$CommandType,
-        [string]$PromptFile,
-        [string]$PlanFile,
-        [string]$SolutionPath,
-        [string]$ResultFile,
-        [string]$RepoRoot,
-        [int]$SubmissionOrder,
-        [int]$WaveNumber,
-        $Plan,
-        [bool]$AllowNuget,
-        [bool]$UsageGateDisabled,
-        [string]$StateDir
+        [string]$SourceCommand,
+        [int]$AttemptNumber
     )
-    $taskName = "{0}-{1}-{2}" -f (Get-TaskNamePrefix -CommandType $CommandType), (Get-Date -Format "yyyyMMdd-HHmmss"), (Get-ShortTaskId -TaskId $TaskId)
-    $runDir = Join-Path (Join-Path $RepoRoot ".claude-develop-logs\runs") $taskName
-    return [pscustomobject]@{
-        taskId = $TaskId
-        commandType = $CommandType
-        mode = Get-TaskMode -CommandType $CommandType
-        taskName = $taskName
-        promptFile = $PromptFile
-        planFile = $PlanFile
-        resultFile = $ResultFile
-        pipelineResultFile = Join-Path $StateDir ("pipeline-" + $TaskId + ".json")
-        mergeOutcomeFile = Join-Path $StateDir ("merge-" + $TaskId + ".json")
-        solutionPath = $SolutionPath
-        repoRoot = $RepoRoot
-        createdAt = (Get-Date).ToString("o")
-        updatedAt = (Get-Date).ToString("o")
-        submissionOrder = $SubmissionOrder
-        waveNumber = $WaveNumber
-        state = "queued"
-        allowNuget = [bool]$AllowNuget
-        usageGateDisabled = [bool]$UsageGateDisabled
-        plan = [pscustomobject]@{
-            taskText = [string]$Plan.taskText
-            taskClassGuess = [string]$Plan.taskClassGuess
-            likelyAreas = @(Get-NormalizedPathSet -Paths $Plan.likelyAreas)
-            likelyFiles = @(Get-NormalizedPathSet -Paths $Plan.likelyFiles)
-            searchPatterns = @(Get-NormalizedPathSet -Paths $Plan.searchPatterns)
-            dependencyHints = @($Plan.dependencyHints | Where-Object { $_ } | Select-Object -Unique)
-            conflictRisk = if ($Plan.conflictRisk) { [string]$Plan.conflictRisk } else { "HIGH" }
-            confidence = if ($Plan.confidence) { [string]$Plan.confidence } else { "LOW" }
-            rationale = [string]$Plan.rationale
-        }
-        run = [pscustomobject]@{
-            processId = 0
-            route = ""
-            testability = ""
-            discoverTargetHints = @()
-            investigationTargets = @()
-            planTargets = @()
-            actualFiles = @()
-            finalStatus = ""
-            finalCategory = ""
-            summary = ""
-            feedback = ""
-            noChangeReason = ""
-            attempts = 0
-            branchName = ""
-            worktreePath = ""
-            artifacts = [pscustomobject]@{
-                runDir = $runDir
-                debugDir = ""
-            }
-        }
-        merge = [pscustomobject]@{
-            state = ""
-            commitMessage = ""
-            commitSha = ""
-            reason = ""
-            mergeReadyAt = ""
-            resolvedAt = ""
-        }
-        scheduler = [pscustomobject]@{
-            owner = ""
-            runnerProcessId = 0
-            runnerHeartbeatAt = ""
-        }
-    }
+
+    $prefix = Get-TaskPrefix -SourceCommand $SourceCommand
+    return "$prefix-$(Get-ShortTaskToken -TaskId $TaskId)-a$AttemptNumber"
 }
 
-function Get-PlanFromFile {
-    param([string]$PlanFile)
-    if (-not (Test-Path $PlanFile)) {
-        throw "Plan-Datei nicht gefunden: $PlanFile"
-    }
-    $plan = Get-Content $PlanFile -Raw | ConvertFrom-Json
-    if (-not $plan.taskText) {
-        throw "Plan-Datei enthaelt kein taskText: $PlanFile"
-    }
-    return $plan
-}
-
-function Ensure-TaskSchedulerMetadata {
-    param($Task)
-    if (-not $Task.scheduler) {
-        $Task | Add-Member -NotePropertyName scheduler -NotePropertyValue ([pscustomobject]@{
-            owner = ""
-            runnerProcessId = 0
-            runnerHeartbeatAt = ""
-        }) -Force
-    }
-    if ($null -eq $Task.scheduler.owner) { $Task.scheduler.owner = "" }
-    if ($null -eq $Task.scheduler.runnerProcessId) { $Task.scheduler.runnerProcessId = 0 }
-    if ($null -eq $Task.scheduler.runnerHeartbeatAt) { $Task.scheduler.runnerHeartbeatAt = "" }
-}
-
-function Set-TaskRunnerOwnership {
-    param($Task, [string]$Owner)
-    Ensure-TaskSchedulerMetadata -Task $Task
-    $Task.scheduler.owner = $Owner
-    $Task.scheduler.runnerProcessId = $PID
-    $Task.scheduler.runnerHeartbeatAt = (Get-Date).ToString("o")
-}
-
-function Clear-TaskRunnerOwnership {
-    param($Task)
-    Ensure-TaskSchedulerMetadata -Task $Task
-    $Task.scheduler.owner = ""
-    $Task.scheduler.runnerProcessId = 0
-    $Task.scheduler.runnerHeartbeatAt = ""
-}
-
-function Set-TaskOrphaned {
-    param($Task, [string]$Reason)
-    Clear-TaskRunnerOwnership -Task $Task
-    $Task.state = "orphaned_error"
-    $Task.merge.state = "orphaned"
-    $Task.merge.reason = $Reason
-    $Task.merge.resolvedAt = (Get-Date).ToString("o")
-}
-
-function Ensure-TaskArtifactMetadata {
-    param($Task)
-    if (-not $Task.pipelineResultFile) {
-        $stateDir = Join-Path $env:TEMP ("claude-develop\scheduler\" + (Get-RepoHash -RepoRoot $Task.repoRoot))
-        $Task | Add-Member -NotePropertyName pipelineResultFile -NotePropertyValue (Join-Path $stateDir ("pipeline-" + $Task.taskId + ".json")) -Force
-    }
-    if (-not $Task.mergeOutcomeFile) {
-        $stateDir = Split-Path $Task.pipelineResultFile -Parent
-        $Task | Add-Member -NotePropertyName mergeOutcomeFile -NotePropertyValue (Join-Path $stateDir ("merge-" + $Task.taskId + ".json")) -Force
-    }
-}
-
-function Try-ReadJsonFile {
-    param([string]$Path)
-    if (-not $Path -or -not (Test-Path $Path)) { return $null }
-    try {
-        return (Get-Content $Path -Raw | ConvertFrom-Json)
-    } catch {
-        return $null
-    }
-}
-
-function New-TaskPipelineLikeResult {
-    param($Task)
-    return [pscustomobject]@{
-        finalCategory = [string]$Task.run.finalCategory
-        summary = [string]$Task.run.summary
-        feedback = [string]$Task.run.feedback
-        noChangeReason = [string]$Task.run.noChangeReason
-        files = @(Get-NormalizedPathSet -Paths $Task.run.actualFiles)
-        attempts = [int]$Task.run.attempts
-        attemptsByPhase = $null
-        artifacts = $Task.run.artifacts
-        branch = [string]$Task.run.branchName
-    }
-}
-
-function Set-TaskSchedulerError {
-    param(
-        $Task,
-        [string]$FinalCategory,
-        [string]$Summary,
-        [string]$Feedback = ""
+function Is-TerminalState {
+    param([string]$State)
+    return $State -in @(
+        "merged",
+        "completed_no_change",
+        "completed_failed_terminal",
+        "discarded"
     )
-    $Task.state = "completed_error"
-    $Task.run.finalStatus = "ERROR"
-    $Task.run.finalCategory = $FinalCategory
-    $Task.run.summary = $Summary
-    $Task.run.feedback = $Feedback
-    $Task.merge.state = "error"
-    $Task.merge.reason = $Summary
-    $Task.merge.resolvedAt = (Get-Date).ToString("o")
-    Clear-TaskRunnerOwnership -Task $Task
 }
 
-function Save-TaskMergeOutcome {
-    param(
-        $Task,
-        [string]$State,
-        [string]$Summary,
-        [string]$CommitMessage = "",
-        [string]$CommitSha = ""
-    )
-    Ensure-TaskArtifactMetadata -Task $Task
-    Ensure-ParentDirectory -Path $Task.mergeOutcomeFile
-    $payload = [pscustomobject]@{
-        version = 1
-        taskId = $Task.taskId
-        state = $State
-        summary = $Summary
-        commitMessage = $CommitMessage
-        commitSha = $CommitSha
-        resolvedAt = (Get-Date).ToString("o")
-    }
-    [System.IO.File]::WriteAllText($Task.mergeOutcomeFile, ($payload | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
-    return $payload
+function Is-QueueState {
+    param([string]$State)
+    return $State -in @("queued", "retry_scheduled")
 }
 
-function Apply-MergeOutcomeToTask {
-    param($Task, $MergeOutcome)
-    if (-not $MergeOutcome) { return $false }
-    $Task.state = [string]$MergeOutcome.state
-    $Task.merge.state = [string]$MergeOutcome.state
-    $Task.merge.reason = [string]$MergeOutcome.summary
-    $Task.merge.commitMessage = [string]$MergeOutcome.commitMessage
-    $Task.merge.commitSha = [string]$MergeOutcome.commitSha
-    $Task.merge.resolvedAt = if ($MergeOutcome.resolvedAt) { [string]$MergeOutcome.resolvedAt } else { (Get-Date).ToString("o") }
-    Clear-TaskRunnerOwnership -Task $Task
-    return $true
+function Is-RunningState {
+    param([string]$State)
+    return $State -eq "running"
 }
 
-function Get-TaskResultStatus {
-    param($Task)
-    switch ([string]$Task.state) {
-        "awaiting_interactive_decision" { return "MERGE_READY" }
-        "completed_no_change" { return "NO_CHANGE" }
-        "completed_failed" { return "FAILED" }
-        "completed_error" { return "ERROR" }
-        "merged_committed" { return "COMMITTED" }
-        "merged_discarded" { return "DISCARDED" }
-        "skipped_conflict" { return "SKIPPED_CONFLICT" }
-        "skipped_merge_conflict" { return "SKIPPED_MERGE_CONFLICT" }
-        "skipped_build_failure" { return "SKIPPED_BUILD_FAILURE" }
-        "orphaned_error" { return "ERROR" }
-        default { return "" }
-    }
-}
-
-function Get-TaskPipelineResultOrFallback {
-    param($Task)
-    Ensure-TaskArtifactMetadata -Task $Task
-    $pipelineResult = Try-ReadJsonFile -Path $Task.pipelineResultFile
-    if ($pipelineResult) { return $pipelineResult }
-    return (New-TaskPipelineLikeResult -Task $Task)
-}
-
-function Write-TaskResultIfMissing {
-    param($Task)
-    if (Test-Path $Task.resultFile) { return $false }
-    $status = Get-TaskResultStatus -Task $Task
-    if (-not $status) { return $false }
-    $pipelineResult = Get-TaskPipelineResultOrFallback -Task $Task
-    $message = switch ($status) {
-        "MERGE_READY" { "Task ist merge-bereit." }
-        "ERROR" { if ($Task.merge.reason) { [string]$Task.merge.reason } else { [string]$Task.run.summary } }
-        default { if ($Task.merge.reason) { [string]$Task.merge.reason } else { [string]$Task.run.summary } }
-    }
-    $commitMessage = if ($Task.state -eq "merged_committed") { [string]$Task.merge.commitMessage } else { "" }
-    Write-UserResult -Path $Task.resultFile -Status $status -TaskId $Task.taskId -WaveNumber ([int]$Task.waveNumber) -PipelineResult $pipelineResult -Task $Task -Message $message -CommitMessage $commitMessage
-    return $true
+function Is-PendingMergeState {
+    param([string]$State)
+    return $State -in @("pending_merge", "merge_prepared", "waiting_user_test")
 }
 
 function Test-ProcessAlive {
@@ -503,1039 +296,1111 @@ function Test-ProcessAlive {
     }
 }
 
-function Is-ResolvedTaskState {
-    param([string]$State)
-    return $State -in @(
-        "completed_no_change",
-        "completed_failed",
-        "completed_error",
-        "merged_committed",
-        "merged_discarded",
-        "skipped_conflict",
-        "skipped_merge_conflict",
-        "skipped_build_failure",
-        "orphaned_error"
+function Get-DefaultTaskResultPath {
+    param(
+        [string]$RepoRoot,
+        [string]$TaskId
+    )
+
+    $paths = Get-StatePaths -RepoRoot $RepoRoot
+    Ensure-Directory -Path $paths.resultsDir
+    return (Join-Path $paths.resultsDir "$TaskId.json")
+}
+
+function Ensure-TaskShape {
+    param(
+        $Task,
+        [string]$RepoRoot
+    )
+
+    if (-not $Task.maxAttempts) { $Task | Add-Member -NotePropertyName maxAttempts -NotePropertyValue 3 -Force }
+    if ($null -eq $Task.attemptsUsed) { $Task | Add-Member -NotePropertyName attemptsUsed -NotePropertyValue 0 -Force }
+    if ($null -eq $Task.attemptsRemaining) { $Task | Add-Member -NotePropertyName attemptsRemaining -NotePropertyValue ([Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)) -Force }
+    if ($null -eq $Task.retryScheduled) { $Task | Add-Member -NotePropertyName retryScheduled -NotePropertyValue $false -Force }
+    if ($null -eq $Task.waitingUserTest) { $Task | Add-Member -NotePropertyName waitingUserTest -NotePropertyValue $false -Force }
+    if (-not $Task.blockedBy) { $Task | Add-Member -NotePropertyName blockedBy -NotePropertyValue @() -Force }
+    if (-not $Task.runs) { $Task | Add-Member -NotePropertyName runs -NotePropertyValue @() -Force }
+    if (-not $Task.plannerMetadata) { $Task | Add-Member -NotePropertyName plannerMetadata -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if (-not $Task.latestRun) { $Task | Add-Member -NotePropertyName latestRun -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if (-not $Task.merge) {
+        $Task | Add-Member -NotePropertyName merge -NotePropertyValue ([pscustomobject]@{
+            state = ""
+            preparedAt = ""
+            commitMessage = ""
+            commitSha = ""
+            reason = ""
+            branchName = ""
+        }) -Force
+    }
+    if (-not $Task.resultFile) {
+        $Task | Add-Member -NotePropertyName resultFile -NotePropertyValue (Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $Task.taskId) -Force
+    }
+    if (-not $Task.state) {
+        $Task | Add-Member -NotePropertyName state -NotePropertyValue "queued" -Force
+    }
+    if (-not $Task.mergeState) {
+        $Task | Add-Member -NotePropertyName mergeState -NotePropertyValue "" -Force
+    }
+}
+
+function Get-TaskSummaryText {
+    param($Task)
+    if ($Task.latestRun.summary) { return [string]$Task.latestRun.summary }
+    if ($Task.taskText) { return [string]$Task.taskText }
+    return ""
+}
+
+function ConvertTo-TaskSnapshot {
+    param($Task)
+
+    return [pscustomobject]@{
+        taskId = [string]$Task.taskId
+        sourceCommand = [string]$Task.sourceCommand
+        sourceInputType = [string]$Task.sourceInputType
+        taskText = [string]$Task.taskText
+        state = [string]$Task.state
+        waveNumber = [int]$Task.waveNumber
+        submissionOrder = [int]$Task.submissionOrder
+        blockedBy = @($Task.blockedBy)
+        attemptsUsed = [int]$Task.attemptsUsed
+        attemptsRemaining = [int]$Task.attemptsRemaining
+        retryScheduled = [bool]$Task.retryScheduled
+        waitingUserTest = [bool]$Task.waitingUserTest
+        mergeState = [string]$Task.mergeState
+        branchName = [string]$Task.latestRun.branchName
+        summary = Get-TaskSummaryText -Task $Task
+        finalStatus = [string]$Task.latestRun.finalStatus
+        finalCategory = [string]$Task.latestRun.finalCategory
+        noChangeReason = [string]$Task.latestRun.noChangeReason
+        actualFiles = @($Task.latestRun.actualFiles)
+        plannerMetadata = $Task.plannerMetadata
+        merge = $Task.merge
+        resultFile = [string]$Task.resultFile
+    }
+}
+
+function Write-TaskResultFile {
+    param($Task)
+    Ensure-ParentDirectory -Path $Task.resultFile
+    [System.IO.File]::WriteAllText($Task.resultFile, ((ConvertTo-TaskSnapshot -Task $Task) | ConvertTo-Json -Depth 24), [System.Text.Encoding]::UTF8)
+}
+
+function Normalize-RepoRelativePath {
+    param(
+        [string]$RepoRoot,
+        [string]$Path
+    )
+
+    if (-not $Path) { return "" }
+    $value = $Path.Trim().Replace("/", "\")
+    if (-not $value) { return "" }
+
+    try {
+        if ([System.IO.Path]::IsPathRooted($value)) {
+            $fullPath = [System.IO.Path]::GetFullPath($value)
+            $fullRepoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
+            if ($fullPath.StartsWith($fullRepoRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $value = $fullPath.Substring($fullRepoRoot.Length).TrimStart('\')
+            } else {
+                $value = $fullPath
+            }
+        }
+    } catch {
+    }
+
+    while ($value.StartsWith(".\")) {
+        $value = $value.Substring(2)
+    }
+    return $value.TrimStart('\')
+}
+
+function Get-NormalizedPathSet {
+    param(
+        [string]$RepoRoot,
+        [string[]]$Paths
+    )
+
+    return @(
+        @($Paths | ForEach-Object {
+            $normalized = Normalize-RepoRelativePath -RepoRoot $RepoRoot -Path ([string]$_)
+            if ($normalized) { $normalized }
+        } | Where-Object { $_ } | Select-Object -Unique)
     )
 }
 
-function Is-PreTerminalTaskState {
-    param([string]$State)
-    return $State -in @("queued", "usage_wait", "running")
-}
-
-function Get-UnresolvedTasks {
-    param($State)
-    return @((Get-Tasks -State $State) | Where-Object { -not (Is-ResolvedTaskState -State $_.state) })
-}
-
-function Get-NextSubmissionOrder {
+function Get-SubmissionOrder {
     param($State)
     $tasks = Get-Tasks -State $State
     if ($tasks.Count -eq 0) { return 1 }
     return ((@($tasks | ForEach-Object { [int]$_.submissionOrder } | Measure-Object -Maximum).Maximum) + 1)
 }
 
-function Get-CurrentOpenWaveNumber {
+function Get-CurrentExecutionWave {
     param($State)
-    $unresolved = Get-UnresolvedTasks -State $State
-    if ($unresolved.Count -eq 0) { return 0 }
-    $minWave = (@($unresolved | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Minimum).Minimum)
-    $waveTasks = @($unresolved | Where-Object { [int]$_.waveNumber -eq $minWave })
-    if ($waveTasks.Count -eq 0) { return 0 }
-    if (@($waveTasks | Where-Object { -not (Is-PreTerminalTaskState -State $_.state) }).Count -gt 0) { return 0 }
-    return $minWave
+    $active = @((Get-Tasks -State $State) | Where-Object {
+        -not (Is-TerminalState -State $_.state) -and [int]$_.waveNumber -gt 0
+    })
+    if ($active.Count -eq 0) { return 0 }
+    return (@($active | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Minimum).Minimum)
 }
 
-function Get-NextWaveNumber {
-    param($State)
-    $tasks = Get-Tasks -State $State
-    if ($tasks.Count -eq 0) { return 1 }
-    return ((@($tasks | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Maximum).Maximum) + 1)
-}
+function Get-TasksInWave {
+    param(
+        $State,
+        [int]$WaveNumber
+    )
 
-function Get-ComparisonData {
-    param($TaskLike)
-    $paths = [System.Collections.ArrayList]::new()
-    foreach ($item in @($TaskLike.run.actualFiles + $TaskLike.run.planTargets + $TaskLike.run.investigationTargets + $TaskLike.run.discoverTargetHints + $TaskLike.plan.likelyFiles)) {
-        $value = Normalize-RepoRelativePath -Path ([string]$item)
-        if ($value) { [void]$paths.Add($value) }
-    }
-    $areas = [System.Collections.ArrayList]::new()
-    foreach ($item in @($TaskLike.plan.likelyAreas + $TaskLike.plan.searchPatterns)) {
-        $value = Normalize-RepoRelativePath -Path ([string]$item)
-        if ($value) { [void]$areas.Add($value) }
-    }
-    $topLevel = [System.Collections.ArrayList]::new()
-    foreach ($value in @($paths + $areas)) {
-        $token = $value
-        if ($token.Contains("\")) {
-            $token = ($token -split "\\")[0]
-        } elseif ($token.Contains("/")) {
-            $token = ($token -split "/")[0]
-        }
-        if ($token) { [void]$topLevel.Add($token.ToLowerInvariant()) }
-    }
-    $configLike = @($paths + $areas | Where-Object { $_ -match '(?i)\.(csproj|sln|slnx|props|targets|json|ya?ml|config)$' })
-    return [pscustomobject]@{
-        files = @($paths | Select-Object -Unique)
-        areas = @($areas | Select-Object -Unique)
-        topLevel = @($topLevel | Select-Object -Unique)
-        configLike = @(Get-NormalizedPathSet -Paths $configLike)
-        broad = (($TaskLike.plan.confidence -ne "HIGH") -or ($TaskLike.plan.conflictRisk -ne "LOW") -or (@($paths).Count -eq 0))
-    }
-}
-
-function Test-PathOverlap {
-    param([string[]]$Left, [string[]]$Right)
-    foreach ($a in @($Left)) {
-        foreach ($b in @($Right)) {
-            if ($a -ieq $b) { return $true }
-            if ($a.StartsWith($b.TrimEnd('\') + "\", [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-            if ($b.StartsWith($a.TrimEnd('\') + "\", [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-        }
-    }
-    return $false
-}
-
-function Test-PlanConflict {
-    param($LeftTask, $RightTask)
-    $left = Get-ComparisonData -TaskLike $LeftTask
-    $right = Get-ComparisonData -TaskLike $RightTask
-    if ($left.files.Count -eq 0 -and $right.files.Count -eq 0 -and $left.areas.Count -eq 0 -and $right.areas.Count -eq 0) {
-        return $true
-    }
-    if (Test-PathOverlap -Left $left.files -Right $right.files) { return $true }
-    if (Test-PathOverlap -Left $left.configLike -Right $right.configLike) { return $true }
-    if (Test-PathOverlap -Left ($left.files + $left.areas) -Right ($right.files + $right.areas)) { return $true }
-    $sharedTop = @($left.topLevel | Where-Object { $right.topLevel -contains $_ })
-    if ($sharedTop.Count -gt 0 -and ($left.broad -or $right.broad)) { return $true }
-    if (($left.broad -or $right.broad) -and ($left.topLevel.Count -eq 0 -or $right.topLevel.Count -eq 0)) { return $true }
-    return $false
-}
-
-function Get-ExternalDebugRecords {
-    param([string]$RepoRoot, [string[]]$KnownTaskNames)
-    $debugRoot = Join-Path $env:TEMP "claude-develop\debug"
-    if (-not (Test-Path $debugRoot)) { return @() }
-    $records = [System.Collections.ArrayList]::new()
-    foreach ($dir in @(Get-ChildItem -Path $debugRoot -Directory -ErrorAction SilentlyContinue)) {
-        $manifestPath = Join-Path $dir.FullName "manifest.json"
-        if (-not (Test-Path $manifestPath)) { continue }
-        try {
-            $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-        } catch {
-            continue
-        }
-        if (-not $manifest.repoRoot) { continue }
-        if ((Get-CanonicalPath -Path $manifest.repoRoot) -ne $RepoRoot) { continue }
-        if ($KnownTaskNames -contains $manifest.taskName) { continue }
-        $snapshotPath = ""
-        if ($manifest.artifactRunDir) {
-            $candidate = Join-Path $manifest.artifactRunDir "scheduler-snapshot.json"
-            if (Test-Path $candidate) { $snapshotPath = $candidate }
-        }
-        if (-not $snapshotPath -and $manifest.debugDir) {
-            $candidate = Join-Path $manifest.debugDir "scheduler-snapshot.json"
-            if (Test-Path $candidate) { $snapshotPath = $candidate }
-        }
-        $snapshot = $null
-        if ($snapshotPath) {
-            try { $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json } catch { $snapshot = $null }
-        }
-        [void]$records.Add([pscustomobject]@{
-            taskName = [string]$manifest.taskName
-            commandType = if ($snapshot -and $snapshot.commandType) { [string]$snapshot.commandType } else { "legacy" }
-            branchName = if ($snapshot -and $snapshot.branchName) { [string]$snapshot.branchName } else { [string]$manifest.branchName }
-            manifest = $manifest
-            snapshot = $snapshot
-            processAlive = (Test-ProcessAlive -ProcessId ([int]$manifest.processId))
-        })
-    }
-    return @($records)
-}
-
-function Get-UnownedAutoBranches {
-    param([string]$RepoRoot, [string[]]$KnownBranches)
-    $result = Invoke-NativeCommand git @("branch", "--list", "auto/*") $RepoRoot
-    if ($result.exitCode -ne 0 -or -not $result.output) { return @() }
+    if ($WaveNumber -le 0) { return @() }
     return @(
-        @($result.output -split "`r?`n" | ForEach-Object {
-            ($_ -replace '^[\*\+\s]+', '').Trim()
-        } | Where-Object { $_ -and -not ($KnownBranches -contains $_) } | Select-Object -Unique)
+        @((Get-Tasks -State $State) | Where-Object {
+            [int]$_.waveNumber -eq $WaveNumber
+        } | Sort-Object submissionOrder)
     )
 }
 
-function New-ExternalTaskFromRecord {
-    param($Record, [string]$State, [string]$Rationale)
-    $snapshot = $Record.snapshot
-    return [pscustomobject]@{
-        taskId = "external:" + $Record.taskName
-        taskName = $Record.taskName
-        commandType = $Record.commandType
-        state = $State
-        plan = [pscustomobject]@{
-            taskText = ""
-            taskClassGuess = ""
-            likelyAreas = @()
-            likelyFiles = if ($snapshot) { @(Get-NormalizedPathSet -Paths ($snapshot.planTargets + $snapshot.changedFiles)) } else { @() }
-            searchPatterns = if ($snapshot) { @(Get-NormalizedPathSet -Paths ($snapshot.investigationTargets + $snapshot.discoverTargetHints)) } else { @() }
-            dependencyHints = @()
-            conflictRisk = if ($snapshot) { "MEDIUM" } else { "HIGH" }
-            confidence = if ($snapshot) { "MEDIUM" } else { "LOW" }
-            rationale = $Rationale
-        }
-        run = [pscustomobject]@{
-            actualFiles = if ($snapshot) { @(Get-NormalizedPathSet -Paths $snapshot.changedFiles) } else { @() }
-            planTargets = if ($snapshot) { @(Get-NormalizedPathSet -Paths $snapshot.planTargets) } else { @() }
-            investigationTargets = if ($snapshot) { @(Get-NormalizedPathSet -Paths $snapshot.investigationTargets) } else { @() }
-            discoverTargetHints = if ($snapshot) { @(Get-NormalizedPathSet -Paths $snapshot.discoverTargetHints) } else { @() }
-            branchName = [string]$Record.branchName
-        }
-    }
-}
+function Get-StartableTaskIds {
+    param($State)
+    $waveNumber = Get-CurrentExecutionWave -State $State
+    if ($waveNumber -le 0) { return @() }
 
-function Get-ExternalAutoTasks {
-    param([string]$RepoRoot, [string[]]$KnownTaskNames, [string[]]$KnownBranches)
-    $records = Get-ExternalDebugRecords -RepoRoot $RepoRoot -KnownTaskNames $KnownTaskNames
-    $unownedBranches = @(Get-UnownedAutoBranches -RepoRoot $RepoRoot -KnownBranches $KnownBranches)
-    $tasks = [System.Collections.ArrayList]::new()
-    $classifiedBranches = [System.Collections.ArrayList]::new()
+    $waveTasks = @(Get-TasksInWave -State $State -WaveNumber $waveNumber)
+    if ($waveTasks.Count -eq 0) { return @() }
 
-    foreach ($record in @($records)) {
-        if (-not $record.branchName) { continue }
-        if ($KnownBranches -contains $record.branchName) { continue }
-        if ($unownedBranches -notcontains $record.branchName) { continue }
-
-        if ($record.processAlive) {
-            [void]$tasks.Add((New-ExternalTaskFromRecord -Record $record -State "running" -Rationale "Aktiver externer AutoDevelop-Lauf."))
-            [void]$classifiedBranches.Add($record.branchName)
-            continue
-        }
-
-        if ($record.snapshot -and [string]$record.snapshot.finalStatus -eq "ACCEPTED") {
-            [void]$tasks.Add((New-ExternalTaskFromRecord -Record $record -State "pending_merge" -Rationale "Externe akzeptierte Aenderung wartet noch auf Merge oder Abschluss."))
-            [void]$classifiedBranches.Add($record.branchName)
-        }
+    $mergeGateStates = @("pending_merge", "merge_prepared", "waiting_user_test")
+    if (@($waveTasks | Where-Object { $mergeGateStates -contains $_.state }).Count -gt 0) {
+        return @()
     }
 
-    $unknownBranches = @(
-        @($unownedBranches | Where-Object { $classifiedBranches -notcontains $_ })
+    return @(
+        @($waveTasks | Where-Object {
+            [int]$_.waveNumber -eq $waveNumber -and (Is-QueueState -State $_.state)
+        } | Sort-Object submissionOrder | ForEach-Object { [string]$_.taskId })
     )
-
-    return [pscustomobject]@{
-        tasks = @($tasks)
-        unknownBranches = @($unknownBranches)
-    }
 }
 
-function Refresh-ManagedTaskFromSnapshot {
-    param($Task)
-    Ensure-TaskSchedulerMetadata -Task $Task
-    $snapshotPath = Join-Path $Task.run.artifacts.runDir "scheduler-snapshot.json"
-    if (-not (Test-Path $snapshotPath)) { return }
-    try {
-        $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json
-    } catch {
-        return
-    }
-    $Task.run.route = [string]$snapshot.route
-    $Task.run.testability = [string]$snapshot.testability
-    $Task.run.discoverTargetHints = @(Get-NormalizedPathSet -Paths $snapshot.discoverTargetHints)
-    $Task.run.investigationTargets = @(Get-NormalizedPathSet -Paths $snapshot.investigationTargets)
-    $Task.run.planTargets = @(Get-NormalizedPathSet -Paths $snapshot.planTargets)
-    $Task.run.actualFiles = @(Get-NormalizedPathSet -Paths $snapshot.changedFiles)
-    $Task.run.branchName = [string]$snapshot.branchName
-    if ($snapshot.artifacts -and $snapshot.artifacts.debugDir) {
-        $Task.run.artifacts.debugDir = [string]$snapshot.artifacts.debugDir
-    }
-    if ($snapshot.worktreePath) {
-        $Task.run.worktreePath = [string]$snapshot.worktreePath
-    }
-    if ($snapshot.processId) {
-        $Task.run.processId = [int]$snapshot.processId
-    }
+function Get-NextMergeTask {
+    param($State)
+    return @(
+        @((Get-Tasks -State $State) | Where-Object {
+            $_.state -eq "pending_merge"
+        } | Sort-Object waveNumber, submissionOrder)
+    )[0]
 }
 
-function Reconcile-TaskState {
-    param($Task)
-    Ensure-TaskSchedulerMetadata -Task $Task
-    Ensure-TaskArtifactMetadata -Task $Task
-    Refresh-ManagedTaskFromSnapshot -Task $Task
-    $runnerAlive = ($Task.scheduler.runnerProcessId -gt 0 -and (Test-ProcessAlive -ProcessId ([int]$Task.scheduler.runnerProcessId)))
-    $pipelineAlive = ($Task.run.processId -gt 0 -and (Test-ProcessAlive -ProcessId ([int]$Task.run.processId)))
-
-    $mergeOutcome = Try-ReadJsonFile -Path $Task.mergeOutcomeFile
-    if (Apply-MergeOutcomeToTask -Task $Task -MergeOutcome $mergeOutcome) {
-        return
-    }
-
-    $pipelineResult = Try-ReadJsonFile -Path $Task.pipelineResultFile
-    if ($pipelineResult) {
-        Update-TaskFromPipelineResult -Task $Task -PipelineResult $pipelineResult
-        if (-not $runnerAlive) {
-            Clear-TaskRunnerOwnership -Task $Task
-        }
-        return
-    }
-
-    if ($Task.state -eq "running" -and $Task.run.processId -and -not $pipelineAlive) {
-        Set-TaskOrphaned -Task $Task -Reason "Pipeline-Prozess beendet ohne Result-Datei."
-        return
-    }
-    if ($Task.state -in @("queued", "usage_wait", "running", "accepted_pending_wave_close", "merge_in_progress")) {
-        if ($Task.scheduler.owner -and -not $runnerAlive) {
-            $reason = switch ($Task.state) {
-                "queued" { "Scheduler-Runner ist vor dem Start ausgefallen." }
-                "usage_wait" { "Scheduler-Runner ist waehrend des Usage-Waits ausgefallen." }
-                "running" { "Scheduler-Runner ist waehrend der Pipeline-Ausfuehrung ausgefallen." }
-                "accepted_pending_wave_close" { "Scheduler-Runner ist vor der Merge-Freigabe ausgefallen." }
-                "merge_in_progress" { "Scheduler-Runner ist waehrend des Merge-Schritts ausgefallen." }
-                default { "Scheduler-Runner ist ausgefallen." }
-            }
-            Set-TaskOrphaned -Task $Task -Reason $reason
-        }
-    }
+function Get-MergePreparedTask {
+    param($State)
+    return @(
+        @((Get-Tasks -State $State) | Where-Object {
+            $_.state -in @("merge_prepared", "waiting_user_test")
+        } | Sort-Object waveNumber, submissionOrder)
+    )[0]
 }
 
 function Get-KnownBranches {
     param($State)
     return @(
         @((Get-Tasks -State $State) | ForEach-Object {
-            if ($_.run.branchName) { [string]$_.run.branchName }
+            if ($_.latestRun.branchName) { [string]$_.latestRun.branchName }
+            foreach ($run in @($_.runs)) {
+                if ($run.branchName) { [string]$run.branchName }
+            }
         } | Where-Object { $_ } | Select-Object -Unique)
     )
 }
 
-function Get-TaskByWaveOrder {
-    param($State, [int]$WaveNumber)
-    return @((Get-Tasks -State $State) | Where-Object { [int]$_.waveNumber -eq $WaveNumber } | Sort-Object submissionOrder)
-}
+function Get-UnknownAutoBranches {
+    param(
+        [string]$RepoRoot,
+        [string[]]$KnownBranches
+    )
 
-function Test-WaveRunComplete {
-    param($State, [int]$WaveNumber)
-    $waveTasks = Get-TaskByWaveOrder -State $State -WaveNumber $WaveNumber
-    if ($waveTasks.Count -eq 0) { return $true }
-    return (@($waveTasks | Where-Object { $_.state -in @("queued", "usage_wait", "running") }).Count -eq 0)
-}
+    $result = Invoke-NativeCommand -Command "git" -Arguments @("branch", "--format", "%(refname:short)", "--list", "auto/*") -WorkingDirectory $RepoRoot
+    if ($result.exitCode -ne 0 -or -not $result.output) { return @() }
 
-function Test-WavesBeforeResolved {
-    param($State, [int]$WaveNumber)
-    return (@((Get-Tasks -State $State) | Where-Object { ([int]$_.waveNumber -lt $WaveNumber) -and -not (Is-ResolvedTaskState -State $_.state) }).Count -eq 0)
+    return @(
+        @($result.output -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object {
+            $_ -and ($KnownBranches -notcontains $_)
+        })
+    )
 }
 
 function Get-MergedFilesBeforeTask {
-    param($State, [int]$WaveNumber, [int]$SubmissionOrder)
+    param(
+        $State,
+        $Task
+    )
+
     $files = [System.Collections.ArrayList]::new()
-    foreach ($task in @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)) {
-        if ($task.waveNumber -gt $WaveNumber) { break }
-        if ($task.waveNumber -eq $WaveNumber -and $task.submissionOrder -ge $SubmissionOrder) { break }
-        if ($task.state -eq "merged_committed") {
-            foreach ($file in @($task.run.actualFiles)) {
-                $normalized = Normalize-RepoRelativePath -Path ([string]$file)
-                if ($normalized) { [void]$files.Add($normalized) }
+    foreach ($candidate in @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)) {
+        if ([int]$candidate.waveNumber -gt [int]$Task.waveNumber) { break }
+        if ([int]$candidate.waveNumber -eq [int]$Task.waveNumber -and [int]$candidate.submissionOrder -ge [int]$Task.submissionOrder) { break }
+        if ($candidate.state -ne "merged") { continue }
+        foreach ($file in @(Get-NormalizedPathSet -RepoRoot $State.repoRoot -Paths $candidate.latestRun.actualFiles)) {
+            if ($files -notcontains $file) {
+                [void]$files.Add($file)
             }
         }
     }
-    return @($files | Select-Object -Unique)
+    return @($files)
 }
 
-function Try-MarkSkippedConflict {
-    param($State, $Task)
-    $actualFiles = @(Get-NormalizedPathSet -Paths $Task.run.actualFiles)
-    $mergedFiles = Get-MergedFilesBeforeTask -State $State -WaveNumber ([int]$Task.waveNumber) -SubmissionOrder ([int]$Task.submissionOrder)
-    $overlap = @($actualFiles | Where-Object { $mergedFiles -contains $_ })
-    $parallelCount = @((Get-TaskByWaveOrder -State $State -WaveNumber ([int]$Task.waveNumber))).Count
-    $riskyEmpty = ($actualFiles.Count -eq 0 -and $parallelCount -gt 1 -and $Task.plan.confidence -ne "HIGH")
-    if ($overlap.Count -eq 0 -and -not $riskyEmpty) { return $false }
-    $Task.state = "skipped_conflict"
-    $Task.merge.state = "skipped_conflict"
-    $Task.merge.reason = if ($overlap.Count -gt 0) {
-        "Unerwartete Datei-Ueberschneidung nach Lauf."
-    } else {
-        "Leere result.files in paralleler unsicherer Welle."
-    }
-    $Task.merge.resolvedAt = (Get-Date).ToString("o")
-    return $true
-}
-
-function Get-AcceptedWaveTasksInOrder {
-    param($State, [int]$WaveNumber)
-    return @((Get-TaskByWaveOrder -State $State -WaveNumber $WaveNumber) | Where-Object {
-        $_.state -in @("accepted_pending_wave_close", "awaiting_interactive_decision", "merge_in_progress", "merged_committed", "merged_discarded", "skipped_conflict", "skipped_merge_conflict", "skipped_build_failure")
-    })
-}
-
-function Test-IsMergeTurn {
-    param($State, $Task)
-    if (-not (Test-WavesBeforeResolved -State $State -WaveNumber ([int]$Task.waveNumber))) { return $false }
-    if (-not (Test-WaveRunComplete -State $State -WaveNumber ([int]$Task.waveNumber))) { return $false }
-    $accepted = Get-AcceptedWaveTasksInOrder -State $State -WaveNumber ([int]$Task.waveNumber)
-    foreach ($candidate in $accepted) {
-        if ($candidate.state -in @("accepted_pending_wave_close", "merge_in_progress", "awaiting_interactive_decision")) {
-            return ($candidate.taskId -eq $Task.taskId)
-        }
-    }
-    return $false
-}
-
-function Test-TaskCanStartNow {
-    param($State, $Task, $ExternalTasks)
-    if (-not (Test-WavesBeforeResolved -State $State -WaveNumber ([int]$Task.waveNumber))) { return $false }
-    if (@($ExternalTasks | Where-Object { $_.state -eq "pending_merge" }).Count -gt 0) { return $false }
-    foreach ($external in @($ExternalTasks)) {
-        if ($external.state -eq "pending_merge") { continue }
-        if (Test-PlanConflict -LeftTask $Task -RightTask $external) { return $false }
-    }
-    return $true
-}
-
-function Get-AutoDevelopScriptPath {
-    return (Get-CanonicalPath -Path (Join-Path $PSScriptRoot "auto-develop.ps1"))
-}
-
-function Get-UsageGatePath {
-    $candidate = Join-Path $PSScriptRoot "claude-usage-gate.ps1"
-    if (Test-Path $candidate) { return $candidate }
-    return ""
-}
-
-function Wait-ForUsageGate {
-    param([string]$StateDir, [string]$TaskId, [bool]$Disabled)
-    if ($Disabled) {
-        return [pscustomobject]@{
-            ok = $true
-            processStatus = "disabled"
-            waitedSeconds = 0
-            source = "disabled"
-            fiveHourUtilization = $null
-            errors = @()
-        }
-    }
-    $gateScript = Get-UsageGatePath
-    if (-not $gateScript) {
-        return [pscustomobject]@{
-            ok = $false
-            processStatus = "unavailable"
-            waitedSeconds = 0
-            source = "none"
-            fiveHourUtilization = $null
-            errors = @("claude-usage-gate.ps1 wurde nicht gefunden.")
-        }
-    }
-    $gateJson = Join-Path $StateDir ("usage-" + $TaskId + ".json")
-    $args = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", $gateScript,
-        "-Mode", "wait",
-        "-ThresholdPercent", "90"
-    )
-    $proc = Start-Process powershell.exe -ArgumentList $args -RedirectStandardOutput $gateJson -NoNewWindow -Wait -PassThru
-    if ($proc.ExitCode -ne 0 -or -not (Test-Path $gateJson)) {
-        return [pscustomobject]@{
-            ok = $false
-            processStatus = "fatal"
-            waitedSeconds = 0
-            source = "none"
-            fiveHourUtilization = $null
-            errors = @("Wait-Mode des 5h-Usage-Gates lieferte kein lesbares JSON-Ergebnis.")
-        }
-    }
-    try {
-        return (Get-Content $gateJson -Raw | ConvertFrom-Json)
-    } catch {
-        return [pscustomobject]@{
-            ok = $false
-            processStatus = "fatal"
-            waitedSeconds = 0
-            source = "none"
-            fiveHourUtilization = $null
-            errors = @("Wait-Mode des 5h-Usage-Gates konnte nicht geparst werden.")
-        }
-    }
-}
-
-function Write-UserResult {
+function Test-ActualOverlap {
     param(
-        [string]$Path,
-        [string]$Status,
-        [string]$TaskId,
-        [int]$WaveNumber,
-        $PipelineResult,
-        $Task,
-        [string]$Message = "",
-        [string]$CommitMessage = ""
+        $State,
+        $Task
     )
-    Ensure-ParentDirectory -Path $Path
-    $payload = [pscustomobject]@{
-        status = $Status
-        schedulerTaskId = $TaskId
-        waveNumber = $WaveNumber
-        schedulerState = $Task.state
-        finalCategory = if ($PipelineResult) { [string]$PipelineResult.finalCategory } else { "" }
-        summary = if ($Message) { $Message } elseif ($PipelineResult) { [string]$PipelineResult.summary } else { "" }
-        feedback = if ($PipelineResult) { [string]$PipelineResult.feedback } else { "" }
-        noChangeReason = if ($PipelineResult) { [string]$PipelineResult.noChangeReason } else { "" }
-        files = if ($PipelineResult) { @(Get-NormalizedPathSet -Paths $PipelineResult.files) } else { @() }
-        attempts = if ($PipelineResult) { [int]$PipelineResult.attempts } else { 0 }
-        attemptsByPhase = if ($PipelineResult) { $PipelineResult.attemptsByPhase } else { $null }
-        artifacts = if ($PipelineResult) { $PipelineResult.artifacts } else { $Task.run.artifacts }
-        branch = if ($PipelineResult) { [string]$PipelineResult.branch } else { [string]$Task.run.branchName }
-        commitMessage = $CommitMessage
-        mergeReason = [string]$Task.merge.reason
-    }
-    [System.IO.File]::WriteAllText($Path, ($payload | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
-}
 
-function Start-AutoDevelopRun {
-    param($Task)
-    $autoDevelop = Get-AutoDevelopScriptPath
-    Ensure-ParentDirectory -Path $Task.pipelineResultFile
-    $args = @(
-        "-NoProfile",
-        "-ExecutionPolicy", "Bypass",
-        "-File", $autoDevelop,
-        "-PromptFile", $Task.promptFile,
-        "-SolutionPath", $Task.solutionPath,
-        "-ResultFile", $Task.pipelineResultFile,
-        "-TaskName", $Task.taskName,
-        "-SchedulerTaskId", $Task.taskId,
-        "-CommandType", $Task.commandType
-    )
-    if ($Task.allowNuget) { $args += "-AllowNuget" }
-    Start-Process powershell.exe -ArgumentList $args -WorkingDirectory $Task.repoRoot -Wait -PassThru -NoNewWindow | Out-Null
-    if (Test-Path $Task.pipelineResultFile) {
-        return Get-Content $Task.pipelineResultFile -Raw | ConvertFrom-Json
-    }
-    return [pscustomobject]@{
-        status = "ERROR"
-        finalCategory = "MISSING_RESULT_FILE"
-        summary = "Pipeline lieferte keine Result-Datei."
-        feedback = ""
-        noChangeReason = ""
-        attempts = 0
-        files = @()
-        artifacts = [pscustomobject]@{
-            runDir = $Task.run.artifacts.runDir
-            debugDir = $Task.run.artifacts.debugDir
-        }
-        branch = ""
-    }
-}
-
-function Update-TaskFromPipelineResult {
-    param($Task, $PipelineResult)
-    Refresh-ManagedTaskFromSnapshot -Task $Task
-    $Task.run.finalStatus = [string]$PipelineResult.status
-    $Task.run.finalCategory = [string]$PipelineResult.finalCategory
-    $Task.run.summary = [string]$PipelineResult.summary
-    $Task.run.feedback = [string]$PipelineResult.feedback
-    $Task.run.noChangeReason = [string]$PipelineResult.noChangeReason
-    $Task.run.attempts = [int]$PipelineResult.attempts
-    $Task.run.actualFiles = @(Get-NormalizedPathSet -Paths $PipelineResult.files)
-    if ($PipelineResult.branch) {
-        $Task.run.branchName = [string]$PipelineResult.branch
-    }
-    if ($PipelineResult.artifacts) {
-        if ($PipelineResult.artifacts.runDir) { $Task.run.artifacts.runDir = [string]$PipelineResult.artifacts.runDir }
-        if ($PipelineResult.artifacts.debugDir) { $Task.run.artifacts.debugDir = [string]$PipelineResult.artifacts.debugDir }
-    }
-    switch ([string]$PipelineResult.status) {
-        "ACCEPTED" { $Task.state = "accepted_pending_wave_close" }
-        "NO_CHANGE" { $Task.state = "completed_no_change" }
-        "FAILED" { $Task.state = "completed_failed" }
-        default { $Task.state = "completed_error" }
-    }
-    if ($Task.state -in @("completed_no_change", "completed_failed", "completed_error")) {
-        Clear-TaskRunnerOwnership -Task $Task
-    }
+    $currentFiles = @(Get-NormalizedPathSet -RepoRoot $State.repoRoot -Paths $Task.latestRun.actualFiles)
+    if ($currentFiles.Count -eq 0) { return @() }
+    $previousFiles = @(Get-MergedFilesBeforeTask -State $State -Task $Task)
+    return @($currentFiles | Where-Object { $previousFiles -contains $_ } | Select-Object -Unique)
 }
 
 function Invoke-GitCleanCheck {
     param([string]$RepoRoot)
-    $status = Invoke-NativeCommand git @("status", "--porcelain") $RepoRoot
+    $status = Invoke-NativeCommand -Command "git" -Arguments @("status", "--porcelain") -WorkingDirectory $RepoRoot
     return (-not $status.output)
 }
 
-function Reset-RepoAfterMergeAttempt {
+function Undo-MergeAttempt {
     param([string]$RepoRoot)
-    Invoke-NativeCommand git @("reset", "HEAD", ".") $RepoRoot | Out-Null
-    Invoke-NativeCommand git @("checkout", "--", ".") $RepoRoot | Out-Null
-}
-
-function Resolve-InteractiveMerge {
-    param($Task, [string]$Decision, [string]$CommitMessage)
-    if (-not (Invoke-GitCleanCheck -RepoRoot $Task.repoRoot)) {
-        throw "Working Tree ist nicht sauber. Interaktive Merge-Entscheidung abgebrochen."
+    $abortResult = Invoke-NativeCommand -Command "git" -Arguments @("merge", "--abort") -WorkingDirectory $RepoRoot
+    if ($abortResult.exitCode -eq 0) {
+        return
     }
-    if ($Decision -eq "discard") {
-        if ($Task.run.branchName) {
-            Invoke-NativeCommand git @("branch", "-D", $Task.run.branchName) $Task.repoRoot | Out-Null
-        }
-        return [pscustomobject]@{
-            state = "merged_discarded"
-            commitSha = ""
-            message = ""
-            summary = "Aenderungen verworfen."
-        }
-    }
-    $mergeResult = Invoke-NativeCommand git @("merge", "--squash", $Task.run.branchName) $Task.repoRoot
-    if ($mergeResult.exitCode -ne 0) {
-        Invoke-NativeCommand git @("merge", "--abort") $Task.repoRoot | Out-Null
-        if (-not (Invoke-GitCleanCheck -RepoRoot $Task.repoRoot)) {
-            Reset-RepoAfterMergeAttempt -RepoRoot $Task.repoRoot
-        }
-        return [pscustomobject]@{
-            state = "skipped_merge_conflict"
-            commitSha = ""
-            message = ""
-            summary = "Squash-Merge erzeugte Konflikte."
-        }
-    }
-    $buildResult = Invoke-NativeCommand dotnet @("build", $Task.solutionPath) $Task.repoRoot
-    if ($buildResult.exitCode -ne 0) {
-        Reset-RepoAfterMergeAttempt -RepoRoot $Task.repoRoot
-        return [pscustomobject]@{
-            state = "skipped_build_failure"
-            commitSha = ""
-            message = ""
-            summary = "Build nach Merge fehlgeschlagen."
-        }
-    }
-    $commitResult = Invoke-NativeCommand git @("commit", "-m", $CommitMessage) $Task.repoRoot
-    if ($commitResult.exitCode -ne 0) {
-        throw "Commit fehlgeschlagen: $($commitResult.output)"
-    }
-    $shaResult = Invoke-NativeCommand git @("rev-parse", "HEAD") $Task.repoRoot
-    if ($Task.run.branchName) {
-        Invoke-NativeCommand git @("branch", "-D", $Task.run.branchName) $Task.repoRoot | Out-Null
-    }
-    return [pscustomobject]@{
-        state = "merged_committed"
-        commitSha = [string]$shaResult.output
-        message = $CommitMessage
-        summary = "Aenderungen uebernommen und committet."
+    $resetResult = Invoke-NativeCommand -Command "git" -Arguments @("reset", "--merge") -WorkingDirectory $RepoRoot
+    if ($resetResult.exitCode -ne 0) {
+        throw "Failed to abort the merge attempt: $($abortResult.output) $($resetResult.output)"
     }
 }
 
-function Resolve-AutonomousMerge {
-    param($Task)
-    $message = "AutoDevelop: $($Task.plan.taskText)"
-    $result = Resolve-InteractiveMerge -Task $Task -Decision "commit" -CommitMessage $message
-    $result | Add-Member -NotePropertyName autoCommitMessage -NotePropertyValue $message -Force
-    return $result
-}
-
-function Submit-SingleTask {
+function Remove-TaskBranch {
     param(
-        [string]$CommandType,
-        [string]$PromptFile,
-        [string]$PlanFile,
-        [string]$SolutionPath,
-        [string]$ResultFile,
-        [bool]$AllowNuget,
-        [bool]$UsageGateDisabled
+        [string]$RepoRoot,
+        [string]$BranchName
     )
-    $repoRoot = Get-CanonicalRepoRoot -SolutionPath $SolutionPath
-    if (-not (Invoke-GitCleanCheck -RepoRoot $repoRoot)) {
-        throw "Working Tree ist nicht sauber."
+
+    if (-not $BranchName) { return }
+    Invoke-NativeCommand -Command "git" -Arguments @("branch", "-D", $BranchName) -WorkingDirectory $RepoRoot | Out-Null
+}
+
+function Get-RetryableResult {
+    param(
+        $Task,
+        [string]$Reason
+    )
+
+    $hasBudget = ([int]$Task.attemptsUsed -lt [int]$Task.maxAttempts)
+    if ($hasBudget) {
+        $Task.state = "retry_scheduled"
+        $Task.retryScheduled = $true
+        $Task.waitingUserTest = $false
+        $Task.waveNumber = 0
+        $Task.blockedBy = @()
+        $Task.mergeState = ""
+        $Task.merge.state = ""
+        $Task.merge.reason = $Reason
+    } else {
+        $Task.state = "completed_failed_terminal"
+        $Task.retryScheduled = $false
+        $Task.waitingUserTest = $false
+        $Task.mergeState = "failed_terminal"
+        $Task.merge.state = "failed_terminal"
+        $Task.merge.reason = $Reason
     }
-    $plan = Get-PlanFromFile -PlanFile $PlanFile
-    $paths = Get-StatePaths -RepoRoot $repoRoot
-    Ensure-Directory -Path $paths.baseDir
-    $lock = Acquire-Lock -LockFile $paths.lockFile
-    try {
-        $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-        foreach ($existing in @(Get-Tasks -State $state)) {
-            Reconcile-TaskState -Task $existing
+    $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
+}
+
+function Apply-PipelineResultToTask {
+    param(
+        $Task,
+        $PipelineResult
+    )
+
+    $Task.latestRun.finalStatus = [string]$PipelineResult.status
+    $Task.latestRun.finalCategory = [string]$PipelineResult.finalCategory
+    $Task.latestRun.summary = [string]$PipelineResult.summary
+    $Task.latestRun.feedback = [string]$PipelineResult.feedback
+    $Task.latestRun.noChangeReason = [string]$PipelineResult.noChangeReason
+    $Task.latestRun.actualFiles = @($PipelineResult.files)
+    $Task.latestRun.branchName = [string]$PipelineResult.branch
+    $Task.latestRun.artifacts = $PipelineResult.artifacts
+    $Task.latestRun.completedAt = (Get-Date).ToString("o")
+
+    $runRecord = [pscustomobject]@{
+        attemptNumber = [int]$Task.attemptsUsed
+        finalStatus = [string]$PipelineResult.status
+        finalCategory = [string]$PipelineResult.finalCategory
+        summary = [string]$PipelineResult.summary
+        feedback = [string]$PipelineResult.feedback
+        noChangeReason = [string]$PipelineResult.noChangeReason
+        actualFiles = @($PipelineResult.files)
+        branchName = [string]$PipelineResult.branch
+        resultFile = [string]$Task.latestRun.resultFile
+        completedAt = $Task.latestRun.completedAt
+        artifacts = $PipelineResult.artifacts
+    }
+    $Task.runs = @($Task.runs) + @($runRecord)
+
+    switch ([string]$PipelineResult.status) {
+        "ACCEPTED" {
+            $Task.state = "pending_merge"
+            $Task.retryScheduled = $false
+            $Task.waitingUserTest = $false
+            $Task.mergeState = "pending"
+            $Task.merge.state = "pending"
+            $Task.merge.branchName = [string]$PipelineResult.branch
+            $Task.merge.reason = ""
         }
-        foreach ($existing in @(Get-Tasks -State $state)) {
-            [void](Write-TaskResultIfMissing -Task $existing)
-        }
-        $externalContext = Get-ExternalAutoTasks -RepoRoot $repoRoot -KnownTaskNames @((Get-Tasks -State $state | ForEach-Object { $_.taskName })) -KnownBranches (Get-KnownBranches -State $state)
-        $external = @($externalContext.tasks)
-        if ($externalContext.unknownBranches.Count -gt 0) {
-            throw ("Offene auto/*-Branches ohne klassifizierbaren Kontext blockieren neue Tasks: " + ($externalContext.unknownBranches -join ", "))
-        }
-        $externalPendingMerge = @($external | Where-Object { $_.state -eq "pending_merge" })
-        $taskId = [guid]::NewGuid().ToString("N")
-        $submissionOrder = Get-NextSubmissionOrder -State $state
-        $openWave = Get-CurrentOpenWaveNumber -State $state
-        $waveNumber = 0
-        $blockedBy = @()
-        $task = $null
-        if ($openWave -gt 0) {
-            $candidate = New-SchedulerTaskRecord -TaskId $taskId -CommandType $CommandType -PromptFile $PromptFile -PlanFile $PlanFile -SolutionPath $SolutionPath -ResultFile $ResultFile -RepoRoot $repoRoot -SubmissionOrder $submissionOrder -WaveNumber $openWave -Plan $plan -AllowNuget $AllowNuget -UsageGateDisabled $UsageGateDisabled -StateDir $paths.baseDir
-            $waveTasks = Get-TaskByWaveOrder -State $state -WaveNumber $openWave
-            $conflictsWave = @($waveTasks | Where-Object { Test-PlanConflict -LeftTask $candidate -RightTask $_ })
-            $conflictsExternal = @($external | Where-Object { $_.state -ne "pending_merge" -and (Test-PlanConflict -LeftTask $candidate -RightTask $_) })
-            if ($externalPendingMerge.Count -eq 0 -and $conflictsWave.Count -eq 0 -and $conflictsExternal.Count -eq 0) {
-                $waveNumber = $openWave
+        "NO_CHANGE" {
+            if ([string]$PipelineResult.finalCategory -eq "NO_CHANGE_ALREADY_SATISFIED") {
+                $Task.state = "completed_no_change"
+                $Task.retryScheduled = $false
+                $Task.waitingUserTest = $false
+                $Task.mergeState = "no_change"
+                $Task.merge.state = "no_change"
             } else {
-                $waveNumber = Get-NextWaveNumber -State $state
-                $blockedBy = @($conflictsWave.taskId + $conflictsExternal.taskId + $externalPendingMerge.taskId | Where-Object { $_ } | Select-Object -Unique)
-            }
-            $task = $candidate
-            $task.waveNumber = $waveNumber
-        } else {
-            $waveNumber = Get-NextWaveNumber -State $state
-            $task = New-SchedulerTaskRecord -TaskId $taskId -CommandType $CommandType -PromptFile $PromptFile -PlanFile $PlanFile -SolutionPath $SolutionPath -ResultFile $ResultFile -RepoRoot $repoRoot -SubmissionOrder $submissionOrder -WaveNumber $waveNumber -Plan $plan -AllowNuget $AllowNuget -UsageGateDisabled $UsageGateDisabled -StateDir $paths.baseDir
-            $conflictsExternal = @($external | Where-Object { $_.state -ne "pending_merge" -and (Test-PlanConflict -LeftTask $task -RightTask $_) })
-            if ($conflictsExternal.Count -gt 0 -or $externalPendingMerge.Count -gt 0) {
-                $blockedBy = @($conflictsExternal.taskId + $externalPendingMerge.taskId | Where-Object { $_ } | Select-Object -Unique)
+                Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
             }
         }
-        $tasks = [System.Collections.ArrayList]::new()
-        foreach ($item in @(Get-Tasks -State $state)) { [void]$tasks.Add($item) }
-        [void]$tasks.Add($task)
-        $state.tasks = @($tasks)
-        Save-State -StateFile $paths.stateFile -State $state
-        Append-StateEvent -EventsFile $paths.eventsFile -TaskId $taskId -Kind "submitted" -Message "Task eingereiht." -Data @{ wave = $waveNumber; blockedBy = $blockedBy }
-        $action = if ($waveNumber -eq $openWave -and $blockedBy.Count -eq 0) { "startable" } elseif ($waveNumber -eq 1 -and $openWave -eq 0 -and $blockedBy.Count -eq 0) { "startable" } else { "queued" }
-        return [pscustomobject]@{
-            taskId = $taskId
-            action = $action
-            waveNumber = $waveNumber
-            blockedBy = @($blockedBy)
-            taskName = $task.taskName
-            stateDir = $paths.baseDir
+        "FAILED" {
+            Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
         }
-    } finally {
-        Release-Lock -LockHandle $lock
+        default {
+            Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
+        }
+    }
+
+    $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
+}
+
+function Reconcile-TaskState {
+    param($Task)
+
+    if (-not (Is-RunningState -State $Task.state)) {
+        return
+    }
+
+    $alive = Test-ProcessAlive -ProcessId ([int]$Task.latestRun.processId)
+    if ($alive) {
+        return
+    }
+
+    $pipelineResult = Read-JsonFile -Path $Task.latestRun.resultFile
+    if ($pipelineResult) {
+        Apply-PipelineResultToTask -Task $Task -PipelineResult $pipelineResult
+        return
+    }
+
+    Get-RetryableResult -Task $Task -Reason "WORKER_EXITED_WITHOUT_RESULT"
+}
+
+function Reconcile-State {
+    param($State)
+    foreach ($task in @(Get-Tasks -State $State)) {
+        Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
+        Reconcile-TaskState -Task $task
+        Write-TaskResultFile -Task $task
     }
 }
 
-function Run-SingleTask {
-    param([string]$TaskId, [string]$SolutionPath)
-    $repoRoot = Get-CanonicalRepoRoot -SolutionPath $SolutionPath
-    $paths = Get-StatePaths -RepoRoot $repoRoot
-    while ($true) {
-        $startPipeline = $false
-        $pipelineTask = $null
-        $writeResult = $null
-        $runMerge = $null
-        $runMergeOwnedByCurrentTask = $false
-        $mustSaveState = $false
-        $lock = Acquire-Lock -LockFile $paths.lockFile
-        try {
-            $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-            foreach ($existing in @(Get-Tasks -State $state)) {
-                Reconcile-TaskState -Task $existing
-            }
-            foreach ($candidate in @((Get-Tasks -State $state) | Sort-Object waveNumber, submissionOrder)) {
-                if ($candidate.state -ne "accepted_pending_wave_close") { continue }
-                if ($candidate.scheduler.owner) { continue }
-                if (-not (Test-IsMergeTurn -State $state -Task $candidate)) { continue }
+function New-TaskRecord {
+    param(
+        [string]$RepoRoot,
+        $InputTask,
+        [int]$SubmissionOrder
+    )
 
-                if (Try-MarkSkippedConflict -State $state -Task $candidate) {
-                    Clear-TaskRunnerOwnership -Task $candidate
-                    $mustSaveState = $true
-                    continue
-                }
+    $taskId = if ($InputTask.taskId) { [string]$InputTask.taskId } else { ([guid]::NewGuid().ToString("N")) }
+    $resolvedSolutionPath = if ($InputTask.solutionPath) { Get-CanonicalPath -Path ([string]$InputTask.solutionPath) } else { "" }
+    $resolvedPromptFile = if ($InputTask.promptFile) { Get-CanonicalPath -Path ([string]$InputTask.promptFile) } else { "" }
+    $resolvedPlanFile = if ($InputTask.planFile) { Get-CanonicalPath -Path ([string]$InputTask.planFile) } else { "" }
+    $resultFile = if ($InputTask.resultFile) { Get-CanonicalPath -Path ([string]$InputTask.resultFile) } else { Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $taskId }
 
-                if ($candidate.mode -eq "interactive") {
-                    $candidate.state = "awaiting_interactive_decision"
-                    $candidate.merge.state = "merge_ready"
-                    if (-not $candidate.merge.mergeReadyAt) {
-                        $candidate.merge.mergeReadyAt = (Get-Date).ToString("o")
-                    }
-                    Clear-TaskRunnerOwnership -Task $candidate
-                    $mustSaveState = $true
-                    continue
-                }
-
-                if (-not $runMerge) {
-                    Set-TaskRunnerOwnership -Task $candidate -Owner "run-single"
-                    $candidate.state = "merge_in_progress"
-                    $candidate.merge.state = "merge_in_progress"
-                    $runMerge = $candidate
-                    $runMergeOwnedByCurrentTask = ($candidate.taskId -eq $TaskId)
-                    $mustSaveState = $true
-                }
-            }
-            foreach ($existing in @(Get-Tasks -State $state)) {
-                [void](Write-TaskResultIfMissing -Task $existing)
-            }
-            $task = Get-TaskById -State $state -TaskId $TaskId
-            if (-not $task) { throw "Scheduler-Task nicht gefunden: $TaskId" }
-            Set-TaskRunnerOwnership -Task $task -Owner "run-single"
-            $externalContext = Get-ExternalAutoTasks -RepoRoot $repoRoot -KnownTaskNames @((Get-Tasks -State $state | ForEach-Object { $_.taskName })) -KnownBranches (Get-KnownBranches -State $state)
-            if ($externalContext.unknownBranches.Count -gt 0) {
-                throw ("Offene auto/*-Branches ohne klassifizierbaren Kontext blockieren Scheduler-Weiterlauf: " + ($externalContext.unknownBranches -join ", "))
-            }
-            $external = @($externalContext.tasks)
-            if (($task.state -eq "awaiting_interactive_decision" -or (Is-ResolvedTaskState -State $task.state)) -and (Test-Path $task.resultFile)) {
-                Clear-TaskRunnerOwnership -Task $task
-                $mustSaveState = $true
-                $writeResult = [pscustomobject]@{
-                    task = $task
-                    status = "__EXIT__"
-                    message = ""
-                }
-            } elseif (-not $runMerge -and $task.state -eq "queued" -and (Test-TaskCanStartNow -State $state -Task $task -ExternalTasks $external)) {
-                $task.state = "usage_wait"
-                Save-State -StateFile $paths.stateFile -State $state
-                Append-StateEvent -EventsFile $paths.eventsFile -TaskId $task.taskId -Kind "ready" -Message "Task darf starten." -Data @{ wave = $task.waveNumber }
-                $startPipeline = $true
-                $pipelineTask = $task
-            } elseif (-not $runMerge -and $task.state -eq "accepted_pending_wave_close" -and (Test-IsMergeTurn -State $state -Task $task)) {
-                if (Try-MarkSkippedConflict -State $state -Task $task) {
-                    Clear-TaskRunnerOwnership -Task $task
-                    Save-State -StateFile $paths.stateFile -State $state
-                    $writeResult = [pscustomobject]@{
-                        task = $task
-                        status = "SKIPPED_CONFLICT"
-                        message = $task.merge.reason
-                    }
-                } elseif ($task.mode -eq "interactive") {
-                    $task.state = "awaiting_interactive_decision"
-                    $task.merge.state = "merge_ready"
-                    $task.merge.mergeReadyAt = (Get-Date).ToString("o")
-                    Clear-TaskRunnerOwnership -Task $task
-                    Save-State -StateFile $paths.stateFile -State $state
-                    Append-StateEvent -EventsFile $paths.eventsFile -TaskId $task.taskId -Kind "merge_ready" -Message "Task ist merge-bereit." -Data @{ wave = $task.waveNumber }
-                    $writeResult = [pscustomobject]@{
-                        task = $task
-                        status = "MERGE_READY"
-                        message = "Task ist merge-bereit."
-                    }
-                } else {
-                    $task.state = "merge_in_progress"
-                    $task.merge.state = "merge_in_progress"
-                    Save-State -StateFile $paths.stateFile -State $state
-                    $runMerge = $task
-                }
-            } elseif (Is-ResolvedTaskState -State $task.state -and -not (Test-Path $task.resultFile)) {
-                $status = switch ($task.state) {
-                    "completed_no_change" { "NO_CHANGE" }
-                    "completed_failed" { "FAILED" }
-                    "completed_error" { "ERROR" }
-                    "merged_committed" { "COMMITTED" }
-                    "merged_discarded" { "DISCARDED" }
-                    "skipped_conflict" { "SKIPPED_CONFLICT" }
-                    "skipped_merge_conflict" { "SKIPPED_MERGE_CONFLICT" }
-                    "skipped_build_failure" { "SKIPPED_BUILD_FAILURE" }
-                    default { "ERROR" }
-                }
-                $writeResult = [pscustomobject]@{
-                    task = $task
-                    status = $status
-                    message = if ($task.merge.reason) { $task.merge.reason } else { $task.run.summary }
-                }
-            }
-            if ($mustSaveState -or (-not $startPipeline -and -not $runMerge -and -not $writeResult)) {
-                Save-State -StateFile $paths.stateFile -State $state
-            }
-        } finally {
-            Release-Lock -LockHandle $lock
+    return [pscustomobject]@{
+        taskId = $taskId
+        sourceCommand = if ($InputTask.sourceCommand) { [string]$InputTask.sourceCommand } else { "develop" }
+        sourceInputType = if ($InputTask.sourceInputType) { [string]$InputTask.sourceInputType } else { "inline" }
+        taskText = [string]$InputTask.taskText
+        promptFile = $resolvedPromptFile
+        planFile = $resolvedPlanFile
+        solutionPath = $resolvedSolutionPath
+        resultFile = $resultFile
+        allowNuget = [bool]$InputTask.allowNuget
+        submissionOrder = $SubmissionOrder
+        waveNumber = if ($InputTask.waveNumber) { [int]$InputTask.waveNumber } else { 0 }
+        blockedBy = @()
+        maxAttempts = 3
+        attemptsUsed = 0
+        attemptsRemaining = 3
+        retryScheduled = $false
+        waitingUserTest = $false
+        mergeState = ""
+        state = "queued"
+        plannerMetadata = if ($InputTask.plannerMetadata) { $InputTask.plannerMetadata } else { [pscustomobject]@{} }
+        latestRun = [pscustomobject]@{}
+        runs = @()
+        merge = [pscustomobject]@{
+            state = ""
+            preparedAt = ""
+            commitMessage = ""
+            commitSha = ""
+            reason = ""
+            branchName = ""
         }
-        if ($startPipeline) {
-            $gateResult = Wait-ForUsageGate -StateDir $paths.baseDir -TaskId $pipelineTask.taskId -Disabled ([bool]$pipelineTask.usageGateDisabled)
-            if ($gateResult.ok -ne $true) {
-                $lock = Acquire-Lock -LockFile $paths.lockFile
-                try {
-                    $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-                    $task = Get-TaskById -State $state -TaskId $pipelineTask.taskId
-                    if (-not $task) { throw "Scheduler-Task nach Usage-Gate nicht gefunden: $($pipelineTask.taskId)" }
-                    Set-TaskSchedulerError -Task $task -FinalCategory "USAGE_GATE_UNAVAILABLE" -Summary "Task wurde nicht gestartet, weil der 5h-Usage-Gate spaeter nicht mehr verifizierbar war." -Feedback (($gateResult.errors | Where-Object { $_ }) -join "`n")
-                    Save-State -StateFile $paths.stateFile -State $state
-                    Append-StateEvent -EventsFile $paths.eventsFile -TaskId $task.taskId -Kind "usage_gate_unavailable" -Message "Start wegen nicht verifizierbarem 5h-Usage-Gate abgebrochen." -Data @{ processStatus = $gateResult.processStatus; errors = @($gateResult.errors) }
-                    Write-UserResult -Path $task.resultFile -Status "ERROR" -TaskId $task.taskId -WaveNumber ([int]$task.waveNumber) -PipelineResult (New-TaskPipelineLikeResult -Task $task) -Task $task -Message $task.run.summary
-                    return
-                } finally {
-                    Release-Lock -LockHandle $lock
-                }
-            }
-            $lock = Acquire-Lock -LockFile $paths.lockFile
-            try {
-                $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-                $task = Get-TaskById -State $state -TaskId $pipelineTask.taskId
-                if (-not $task) { throw "Scheduler-Task vor Pipeline-Start nicht gefunden: $($pipelineTask.taskId)" }
-                Set-TaskRunnerOwnership -Task $task -Owner "run-single"
-                $task.state = "running"
-                Save-State -StateFile $paths.stateFile -State $state
-                Append-StateEvent -EventsFile $paths.eventsFile -TaskId $task.taskId -Kind "started" -Message "Pipeline wird gestartet." -Data @{ wave = $task.waveNumber }
-                $pipelineTask = $task
-            } finally {
-                Release-Lock -LockHandle $lock
-            }
-            $pipelineResult = Start-AutoDevelopRun -Task $pipelineTask
-            $lock = Acquire-Lock -LockFile $paths.lockFile
-            try {
-                $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-                $task = Get-TaskById -State $state -TaskId $pipelineTask.taskId
-                if (-not $task) { throw "Scheduler-Task nach Run nicht gefunden: $($pipelineTask.taskId)" }
-                Update-TaskFromPipelineResult -Task $task -PipelineResult $pipelineResult
-                Save-State -StateFile $paths.stateFile -State $state
-                Append-StateEvent -EventsFile $paths.eventsFile -TaskId $task.taskId -Kind "pipeline_complete" -Message "Pipeline beendet." -Data @{ status = $pipelineResult.status; finalCategory = $pipelineResult.finalCategory }
-            } finally {
-                Release-Lock -LockHandle $lock
-            }
-            if ($pipelineResult.status -ne "ACCEPTED") {
-                $status = switch ([string]$pipelineResult.status) {
-                    "NO_CHANGE" { "NO_CHANGE" }
-                    "FAILED" { "FAILED" }
-                    default { "ERROR" }
-                }
-                Write-UserResult -Path $pipelineTask.resultFile -Status $status -TaskId $pipelineTask.taskId -WaveNumber ([int]$pipelineTask.waveNumber) -PipelineResult $pipelineResult -Task $pipelineTask -Message $pipelineResult.summary
-                return
-            }
+    }
+}
+
+function Read-TaskRegistrationPayload {
+    param([string]$Path)
+
+    $payload = Read-JsonFile -Path $Path
+    if (-not $payload) {
+        throw "Task registration file not found or empty: $Path"
+    }
+
+    if ($payload -is [System.Array]) {
+        return @($payload)
+    }
+    if ($payload.tasks) {
+        return @($payload.tasks)
+    }
+    return @($payload)
+}
+
+function Read-PlanPayload {
+    param([string]$Path)
+
+    $payload = Read-JsonFile -Path $Path
+    if (-not $payload) {
+        throw "Plan file not found or empty: $Path"
+    }
+    return $payload
+}
+
+function Is-MergeResolvedState {
+    param([string]$State)
+    return $State -in @("merged", "completed_no_change", "completed_failed_terminal", "discarded")
+}
+
+function Get-NextMergeCandidate {
+    param($State)
+
+    foreach ($waveNumber in @((Get-Tasks -State $State) | ForEach-Object { [int]$_.waveNumber } | Where-Object { $_ -gt 0 } | Sort-Object -Unique)) {
+        $waveTasks = @(Get-TasksInWave -State $State -WaveNumber $waveNumber)
+        if ($waveTasks.Count -eq 0) {
             continue
         }
-        if ($runMerge) {
-            try {
-                $mergeResult = Resolve-AutonomousMerge -Task $runMerge
-            } catch {
-                $mergeError = $_.Exception.Message
-                Invoke-NativeCommand git @("reset", "HEAD", ".") $repoRoot | Out-Null
-                Invoke-NativeCommand git @("checkout", "--", ".") $repoRoot | Out-Null
-                $lock = Acquire-Lock -LockFile $paths.lockFile
-                try {
-                    $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-                    $task = Get-TaskById -State $state -TaskId $runMerge.taskId
-                    if ($task) {
-                        Set-TaskSchedulerError -Task $task -FinalCategory "MERGE_ERROR" -Summary "Autonomer Merge konnte nicht abgeschlossen werden." -Feedback $mergeError
-                        Save-State -StateFile $paths.stateFile -State $state
-                        Write-UserResult -Path $task.resultFile -Status "ERROR" -TaskId $task.taskId -WaveNumber ([int]$task.waveNumber) -PipelineResult (New-TaskPipelineLikeResult -Task $task) -Task $task -Message $task.run.summary
-                    }
-                } finally {
-                    Release-Lock -LockHandle $lock
-                }
-                if ($runMergeOwnedByCurrentTask) { return }
-                continue
-            }
-            $lock = Acquire-Lock -LockFile $paths.lockFile
-            try {
-                $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-                $task = Get-TaskById -State $state -TaskId $runMerge.taskId
-                if (-not $task) { throw "Scheduler-Task fuer Merge nicht gefunden: $($runMerge.taskId)" }
-                [void](Save-TaskMergeOutcome -Task $task -State $mergeResult.state -Summary $mergeResult.summary -CommitMessage $mergeResult.autoCommitMessage -CommitSha $mergeResult.commitSha)
-                $task.state = $mergeResult.state
-                $task.merge.state = $mergeResult.state
-                $task.merge.reason = $mergeResult.summary
-                $task.merge.commitMessage = $mergeResult.autoCommitMessage
-                $task.merge.commitSha = $mergeResult.commitSha
-                $task.merge.resolvedAt = (Get-Date).ToString("o")
-                Clear-TaskRunnerOwnership -Task $task
-                Save-State -StateFile $paths.stateFile -State $state
-                Write-UserResult -Path $task.resultFile -Status (if ($mergeResult.state -eq "merged_committed") { "COMMITTED" } elseif ($mergeResult.state -eq "skipped_merge_conflict") { "SKIPPED_MERGE_CONFLICT" } else { "SKIPPED_BUILD_FAILURE" }) -TaskId $task.taskId -WaveNumber ([int]$task.waveNumber) -PipelineResult ([pscustomobject]@{ finalCategory = $task.run.finalCategory; summary = $task.run.summary; feedback = $task.run.feedback; noChangeReason = $task.run.noChangeReason; files = $task.run.actualFiles; attempts = $task.run.attempts; branch = $task.run.branchName; artifacts = $task.run.artifacts }) -Task $task -Message $mergeResult.summary -CommitMessage $mergeResult.autoCommitMessage
-                if ($runMergeOwnedByCurrentTask) { return }
-                continue
-            } finally {
-                Release-Lock -LockHandle $lock
-            }
+
+        $hasPreparedMerge = @($waveTasks | Where-Object { $_.state -in @("merge_prepared", "waiting_user_test") }).Count -gt 0
+        if ($hasPreparedMerge) {
+            return $null
         }
-        if ($writeResult) {
-            if ($writeResult.status -eq "__EXIT__") { return }
-            $task = $writeResult.task
-            $pipelineResult = if (Test-Path $task.pipelineResultFile) { Get-Content $task.pipelineResultFile -Raw | ConvertFrom-Json } else { $null }
-            Write-UserResult -Path $task.resultFile -Status $writeResult.status -TaskId $task.taskId -WaveNumber ([int]$task.waveNumber) -PipelineResult $pipelineResult -Task $task -Message $writeResult.message
-            return
+
+        $hasUnfinishedPipes = @($waveTasks | Where-Object { $_.state -in @("queued", "retry_scheduled", "running") }).Count -gt 0
+        if ($hasUnfinishedPipes) {
+            return $null
         }
-        Start-Sleep -Seconds 3
+
+        $pendingMergeTask = @($waveTasks | Where-Object { $_.state -eq "pending_merge" } | Select-Object -First 1)[0]
+        if ($pendingMergeTask) {
+            return $pendingMergeTask
+        }
+    }
+
+    return $null
+}
+
+function Get-DefaultMergeCommitMessage {
+    param($Task)
+
+    $taskText = [string]$Task.taskText
+    if (-not $taskText) {
+        return "Implement scheduled task"
+    }
+
+    $singleLine = (($taskText -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join " ").Trim()
+    if (-not $singleLine) {
+        return "Implement scheduled task"
+    }
+    if ($singleLine.Length -gt 72) {
+        $singleLine = $singleLine.Substring(0, 72).TrimEnd()
+    }
+    return $singleLine
+}
+
+function Get-SchedulerContext {
+    param([string]$ResolvedSolutionPath)
+
+    $repoRoot = Get-CanonicalRepoRoot -ResolvedSolutionPath $ResolvedSolutionPath
+    $paths = Get-StatePaths -RepoRoot $repoRoot
+    Ensure-Directory -Path $paths.baseDir
+    Ensure-Directory -Path $paths.tasksDir
+    Ensure-Directory -Path $paths.resultsDir
+    return [pscustomobject]@{
+        repoRoot = $repoRoot
+        paths = $paths
     }
 }
 
-function Resolve-InteractiveTask {
-    param([string]$TaskId, [string]$SolutionPath, [string]$Decision, [string]$CommitMessage)
-    $repoRoot = Get-CanonicalRepoRoot -SolutionPath $SolutionPath
-    $paths = Get-StatePaths -RepoRoot $repoRoot
-    $task = $null
-    $lock = Acquire-Lock -LockFile $paths.lockFile
+function Get-AutoDevelopScriptPath {
+    return (Join-Path (Split-Path -Path $PSCommandPath -Parent) "auto-develop.ps1")
+}
+
+function Get-SnapshotPayload {
+    param($State)
+
+    $knownBranches = Get-KnownBranches -State $State
+    $unknownBranches = Get-UnknownAutoBranches -RepoRoot $State.repoRoot -KnownBranches $knownBranches
+    $nextMergeTask = Get-NextMergeCandidate -State $State
+    $mergePreparedTask = Get-MergePreparedTask -State $State
+
+    return [pscustomobject]@{
+        repoRoot = $State.repoRoot
+        updatedAt = [string]$State.updatedAt
+        lastPlanAppliedAt = [string]$State.lastPlanAppliedAt
+        tasks = @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder | ForEach-Object { ConvertTo-TaskSnapshot -Task $_ })
+        runningTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "running" } | ForEach-Object { [string]$_.taskId })
+        queuedTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "queued" } | ForEach-Object { [string]$_.taskId })
+        retryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+        pendingMergeTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "pending_merge" } | ForEach-Object { [string]$_.taskId })
+        startableTaskIds = @(Get-StartableTaskIds -State $State)
+        nextMergeTaskId = if ($nextMergeTask) { [string]$nextMergeTask.taskId } else { "" }
+        mergePreparedTaskId = if ($mergePreparedTask) { [string]$mergePreparedTask.taskId } else { "" }
+        unknownAutoBranches = @($unknownBranches)
+    }
+}
+
+function Snapshot-Queue {
+    param([string]$ResolvedSolutionPath)
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
-        $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-        $task = Get-TaskById -State $state -TaskId $TaskId
-        if (-not $task) { throw "Scheduler-Task nicht gefunden: $TaskId" }
-        if ($task.state -ne "awaiting_interactive_decision") {
-            throw "Task ist nicht im Zustand awaiting_interactive_decision."
-        }
-        if (-not (Invoke-GitCleanCheck -RepoRoot $repoRoot)) {
-            return [pscustomobject]@{
-                status = "ERROR"
-                schedulerTaskId = $task.taskId
-                waveNumber = [int]$task.waveNumber
-                summary = "Working Tree ist nicht sauber. Merge-Entscheidung wurde nicht ausgefuehrt."
-                commitMessage = ""
-                commitSha = ""
-            }
-        }
-        Set-TaskRunnerOwnership -Task $task -Owner "resolve-interactive"
-        $task.state = "merge_in_progress"
-        $task.merge.state = "merge_in_progress"
-        Save-State -StateFile $paths.stateFile -State $state
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        Reconcile-State -State $state
+        Save-State -StateFile $context.paths.stateFile -State $state
+        return (Get-SnapshotPayload -State $state)
     } finally {
         Release-Lock -LockHandle $lock
     }
+}
+
+function Register-Tasks {
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$ResolvedTasksFile
+    )
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $registrationTasks = @(Read-TaskRegistrationPayload -Path $ResolvedTasksFile)
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
-        $mergeResult = Resolve-InteractiveMerge -Task $task -Decision $Decision -CommitMessage $CommitMessage
-    } catch {
-        $mergeError = $_.Exception.Message
-        if (-not (Invoke-GitCleanCheck -RepoRoot $repoRoot)) {
-            Reset-RepoAfterMergeAttempt -RepoRoot $repoRoot
-        }
-        $lock = Acquire-Lock -LockFile $paths.lockFile
-        try {
-            $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-            $task = Get-TaskById -State $state -TaskId $TaskId
-            if ($task) {
-                $task.state = "awaiting_interactive_decision"
-                $task.merge.state = "merge_ready"
-                $task.merge.reason = $mergeError
-                Clear-TaskRunnerOwnership -Task $task
-                Save-State -StateFile $paths.stateFile -State $state
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        Reconcile-State -State $state
+
+        $submissionOrder = Get-SubmissionOrder -State $state
+        $registered = [System.Collections.ArrayList]::new()
+
+        foreach ($inputTask in $registrationTasks) {
+            $task = New-TaskRecord -RepoRoot $context.repoRoot -InputTask $inputTask -SubmissionOrder $submissionOrder
+            Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+            if (Get-TaskById -State $state -TaskId $task.taskId) {
+                throw "Task id '$($task.taskId)' is already registered."
             }
-            return [pscustomobject]@{
-                status = "ERROR"
-                schedulerTaskId = $TaskId
-                waveNumber = if ($task) { [int]$task.waveNumber } else { 0 }
-                summary = $mergeError
-                commitMessage = ""
-                commitSha = ""
-            }
-        } finally {
-            Release-Lock -LockHandle $lock
+            $state.tasks = @($state.tasks) + @($task)
+            Write-TaskResultFile -Task $task
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "registered" -Message "Task registered." -Data @{ sourceCommand = $task.sourceCommand; sourceInputType = $task.sourceInputType }
+            [void]$registered.Add((ConvertTo-TaskSnapshot -Task $task))
+            $submissionOrder += 1
         }
-    }
-    $lock = Acquire-Lock -LockFile $paths.lockFile
-    try {
-        $state = Load-State -StateFile $paths.stateFile -RepoRoot $repoRoot -RepoHash $paths.repoHash
-        $task = Get-TaskById -State $state -TaskId $TaskId
-        if (-not $task) { throw "Scheduler-Task nach Merge nicht gefunden: $TaskId" }
-        [void](Save-TaskMergeOutcome -Task $task -State $mergeResult.state -Summary $mergeResult.summary -CommitMessage $mergeResult.message -CommitSha $mergeResult.commitSha)
-        $task.state = $mergeResult.state
-        $task.merge.state = $mergeResult.state
-        $task.merge.reason = $mergeResult.summary
-        $task.merge.commitMessage = $mergeResult.message
-        $task.merge.commitSha = $mergeResult.commitSha
-        $task.merge.resolvedAt = (Get-Date).ToString("o")
-        Clear-TaskRunnerOwnership -Task $task
-        Save-State -StateFile $paths.stateFile -State $state
+
+        Save-State -StateFile $context.paths.stateFile -State $state
+
         return [pscustomobject]@{
-            status = if ($mergeResult.state -eq "merged_committed") { "COMMITTED" } elseif ($mergeResult.state -eq "merged_discarded") { "DISCARDED" } elseif ($mergeResult.state -eq "skipped_merge_conflict") { "SKIPPED_MERGE_CONFLICT" } else { "SKIPPED_BUILD_FAILURE" }
-            schedulerTaskId = $task.taskId
-            waveNumber = [int]$task.waveNumber
-            summary = $mergeResult.summary
-            commitMessage = $mergeResult.message
-            commitSha = $mergeResult.commitSha
+            registered = @($registered)
+            snapshot = Get-SnapshotPayload -State $state
         }
     } finally {
         Release-Lock -LockHandle $lock
     }
 }
+
+function Apply-Plan {
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$ResolvedPlanFile
+    )
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $planPayload = Read-PlanPayload -Path $ResolvedPlanFile
+    $assignments = if ($planPayload.tasks) { @($planPayload.tasks) } elseif ($planPayload.assignments) { @($planPayload.assignments) } else { @() }
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        Reconcile-State -State $state
+
+        foreach ($assignment in $assignments) {
+            if (-not $assignment.taskId) { continue }
+            $task = Get-TaskById -State $state -TaskId ([string]$assignment.taskId)
+            if (-not $task) { continue }
+            if (Is-TerminalState -State $task.state) { continue }
+
+            if ($assignment.waveNumber) { $task.waveNumber = [int]$assignment.waveNumber }
+            $task.blockedBy = if ($assignment.blockedBy) { @($assignment.blockedBy) } else { @() }
+            if ($assignment.plannerMetadata) {
+                $task.plannerMetadata = $assignment.plannerMetadata
+            }
+            if ($assignment.plannedState -and (Is-QueueState -State $task.state)) {
+                $task.state = [string]$assignment.plannedState
+            }
+            Write-TaskResultFile -Task $task
+        }
+
+        $state.lastPlanAppliedAt = (Get-Date).ToString("o")
+        Save-State -StateFile $context.paths.stateFile -State $state
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId "" -Kind "plan_applied" -Message "Planner output applied." -Data @{
+            summary = [string]$planPayload.summary
+            startableTaskIds = @(Get-StartableTaskIds -State $state)
+        }
+
+        return [pscustomobject]@{
+            summary = [string]$planPayload.summary
+            startableTaskIds = @(Get-StartableTaskIds -State $state)
+            snapshot = Get-SnapshotPayload -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+function Run-Task {
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$TaskId
+    )
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $autoDevelopScript = Get-AutoDevelopScriptPath
+    if (-not (Test-Path -LiteralPath $autoDevelopScript)) {
+        throw "auto-develop.ps1 was not found."
+    }
+
+    $task = $null
+    $pipelineResultPath = ""
+    $attemptNumber = 0
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        Reconcile-State -State $state
+        $task = Get-TaskById -State $state -TaskId $TaskId
+        if (-not $task) {
+            throw "Task '$TaskId' was not found."
+        }
+        if (-not (Is-QueueState -State $task.state)) {
+            throw "Task '$TaskId' is not in a startable state."
+        }
+        if ((Get-StartableTaskIds -State $state) -notcontains $TaskId) {
+            throw "Task '$TaskId' is not startable in the current wave."
+        }
+
+        $task.state = "running"
+        $task.retryScheduled = $false
+        $task.waitingUserTest = $false
+        $task.mergeState = ""
+        $task.attemptsUsed = [int]$task.attemptsUsed + 1
+        $task.attemptsRemaining = [Math]::Max(0, [int]$task.maxAttempts - [int]$task.attemptsUsed)
+        $attemptNumber = [int]$task.attemptsUsed
+        $pipelineResultPath = Join-Path $context.paths.tasksDir "$TaskId-attempt-$attemptNumber-result.json"
+        $task.latestRun = [pscustomobject]@{
+            attemptNumber = $attemptNumber
+            taskName = Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -AttemptNumber $attemptNumber
+            resultFile = $pipelineResultPath
+            processId = $PID
+            startedAt = (Get-Date).ToString("o")
+            finalStatus = ""
+            finalCategory = ""
+            summary = ""
+            feedback = ""
+            noChangeReason = ""
+            actualFiles = @()
+            branchName = ""
+            artifacts = $null
+        }
+        Write-TaskResultFile -Task $task
+        Save-State -StateFile $context.paths.stateFile -State $state
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "started" -Message "Task pipeline started." -Data @{ attempt = $attemptNumber; waveNumber = $task.waveNumber }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $autoDevelopScript,
+        "-PromptFile", $task.promptFile,
+        "-SolutionPath", $task.solutionPath,
+        "-ResultFile", $pipelineResultPath,
+        "-TaskName", $task.latestRun.taskName,
+        "-SchedulerTaskId", $task.taskId,
+        "-CommandType", $task.sourceCommand
+    )
+    if ([bool]$task.allowNuget) {
+        $arguments += "-AllowNuget"
+    }
+
+    $workerResult = Invoke-NativeCommand -Command "powershell.exe" -Arguments $arguments -WorkingDirectory $context.repoRoot
+    $pipelineResult = Read-JsonFile -Path $pipelineResultPath
+    if (-not $pipelineResult) {
+        $pipelineResult = [pscustomobject]@{
+            status = "ERROR"
+            finalCategory = "PIPELINE_RESULT_MISSING"
+            summary = if ($workerResult.output) { $workerResult.output } else { "Pipeline completed without a result file." }
+            feedback = [string]$workerResult.output
+            noChangeReason = ""
+            files = @()
+            branch = ""
+            artifacts = $null
+        }
+    }
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $task = Get-TaskById -State $state -TaskId $TaskId
+        if (-not $task) {
+            throw "Task '$TaskId' disappeared during execution."
+        }
+        Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+        Apply-PipelineResultToTask -Task $task -PipelineResult $pipelineResult
+        Write-TaskResultFile -Task $task
+        Save-State -StateFile $context.paths.stateFile -State $state
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "completed" -Message "Task pipeline finished." -Data @{
+            attempt = $attemptNumber
+            finalStatus = [string]$task.latestRun.finalStatus
+            finalCategory = [string]$task.latestRun.finalCategory
+            state = [string]$task.state
+        }
+
+        return [pscustomobject]@{
+            task = ConvertTo-TaskSnapshot -Task $task
+            snapshot = Get-SnapshotPayload -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+function Prepare-Merge {
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$TaskId
+    )
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $selectedTask = $null
+    $mergeResult = $null
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        Reconcile-State -State $state
+
+        $alreadyPrepared = Get-MergePreparedTask -State $state
+        if ($alreadyPrepared -and ((-not $TaskId) -or [string]$alreadyPrepared.taskId -ne $TaskId)) {
+            return [pscustomobject]@{
+                task = ConvertTo-TaskSnapshot -Task $alreadyPrepared
+                blocked = $true
+                reason = "Another task already has a prepared merge."
+                snapshot = Get-SnapshotPayload -State $state
+            }
+        }
+
+        $selectedTask = if ($TaskId) { Get-TaskById -State $state -TaskId $TaskId } else { Get-NextMergeCandidate -State $state }
+        if (-not $selectedTask) {
+            return [pscustomobject]@{
+                task = $null
+                blocked = $false
+                reason = "No task is ready for merge preparation."
+                snapshot = Get-SnapshotPayload -State $state
+            }
+        }
+        if ($selectedTask.state -ne "pending_merge") {
+            return [pscustomobject]@{
+                task = ConvertTo-TaskSnapshot -Task $selectedTask
+                blocked = $true
+                reason = "The selected task is not pending merge."
+                snapshot = Get-SnapshotPayload -State $state
+            }
+        }
+
+        $unknownBranches = Get-UnknownAutoBranches -RepoRoot $context.repoRoot -KnownBranches (Get-KnownBranches -State $state)
+        if ($unknownBranches.Count -gt 0) {
+            return [pscustomobject]@{
+                task = ConvertTo-TaskSnapshot -Task $selectedTask
+                blocked = $true
+                reason = "Untracked auto/* branches are blocking merge preparation."
+                unknownAutoBranches = @($unknownBranches)
+                snapshot = Get-SnapshotPayload -State $state
+            }
+        }
+
+        if (-not (Invoke-GitCleanCheck -RepoRoot $context.repoRoot)) {
+            return [pscustomobject]@{
+                task = ConvertTo-TaskSnapshot -Task $selectedTask
+                blocked = $true
+                reason = "The repository worktree is not clean."
+                snapshot = Get-SnapshotPayload -State $state
+            }
+        }
+
+        $overlap = @(Test-ActualOverlap -State $state -Task $selectedTask)
+        if ($overlap.Count -gt 0) {
+            Get-RetryableResult -Task $selectedTask -Reason ("ACTUAL_OVERLAP: " + ($overlap -join ", "))
+            Write-TaskResultFile -Task $selectedTask
+            Save-State -StateFile $context.paths.stateFile -State $state
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_retry" -Message "Task rescheduled after actual file overlap was detected." -Data @{ overlap = @($overlap) }
+            return [pscustomobject]@{
+                task = ConvertTo-TaskSnapshot -Task $selectedTask
+                blocked = $false
+                reason = "Task was requeued because the merged files overlap."
+                snapshot = Get-SnapshotPayload -State $state
+            }
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+
+    $branchName = [string]$selectedTask.latestRun.branchName
+    $mergeCommand = Invoke-NativeCommand -Command "git" -Arguments @("merge", "--no-commit", "--no-ff", $branchName) -WorkingDirectory $context.repoRoot
+    if ($mergeCommand.exitCode -ne 0) {
+        Undo-MergeAttempt -RepoRoot $context.repoRoot
+        $mergeResult = [pscustomobject]@{
+            success = $false
+            reason = if ($mergeCommand.output) { $mergeCommand.output } else { "Merge conflict." }
+        }
+    } else {
+        $buildCommand = Invoke-NativeCommand -Command "dotnet" -Arguments @("build", $selectedTask.solutionPath, "--no-restore") -WorkingDirectory $context.repoRoot
+        if ($buildCommand.exitCode -ne 0) {
+            Undo-MergeAttempt -RepoRoot $context.repoRoot
+            $mergeResult = [pscustomobject]@{
+                success = $false
+                reason = if ($buildCommand.output) { $buildCommand.output } else { "Build failed after merge preparation." }
+            }
+        } else {
+            $mergeResult = [pscustomobject]@{
+                success = $true
+                reason = "Merge prepared successfully."
+            }
+        }
+    }
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $selectedTask = Get-TaskById -State $state -TaskId $selectedTask.taskId
+        if (-not $selectedTask) {
+            throw "Task '$TaskId' disappeared during merge preparation."
+        }
+
+        if ($mergeResult.success) {
+            $selectedTask.merge.preparedAt = (Get-Date).ToString("o")
+            $selectedTask.merge.reason = ""
+            $selectedTask.merge.state = "prepared"
+            $selectedTask.mergeState = "prepared"
+            if ($selectedTask.sourceCommand -eq "TLA-develop") {
+                $selectedTask.state = "merge_prepared"
+                $selectedTask.waitingUserTest = $false
+            } else {
+                $selectedTask.state = "waiting_user_test"
+                $selectedTask.waitingUserTest = $true
+            }
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_prepared" -Message "Merge prepared successfully." -Data @{ waitingUserTest = [bool]$selectedTask.waitingUserTest }
+        } else {
+            Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
+            Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$selectedTask.latestRun.branchName)
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_failed" -Message "Merge preparation failed." -Data @{ reason = [string]$mergeResult.reason }
+        }
+
+        Write-TaskResultFile -Task $selectedTask
+        Save-State -StateFile $context.paths.stateFile -State $state
+
+        return [pscustomobject]@{
+            task = ConvertTo-TaskSnapshot -Task $selectedTask
+            prepared = [bool]$mergeResult.success
+            reason = [string]$mergeResult.reason
+            snapshot = Get-SnapshotPayload -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+function Resolve-Merge {
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$TaskId,
+        [string]$Decision,
+        [string]$CommitMessage
+    )
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        Reconcile-State -State $state
+        $task = Get-TaskById -State $state -TaskId $TaskId
+        if (-not $task) {
+            throw "Task '$TaskId' was not found."
+        }
+        if ($task.state -notin @("merge_prepared", "waiting_user_test")) {
+            throw "Task '$TaskId' is not waiting for merge resolution."
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+
+    $operation = $null
+    switch ($Decision) {
+        "commit" {
+            $message = if ($CommitMessage) { $CommitMessage } else { Get-DefaultMergeCommitMessage -Task $task }
+            $commitResult = Invoke-NativeCommand -Command "git" -Arguments @("commit", "-m", $message) -WorkingDirectory $context.repoRoot
+            if ($commitResult.exitCode -ne 0) {
+                throw "Failed to commit the prepared merge: $($commitResult.output)"
+            }
+            $shaResult = Invoke-NativeCommand -Command "git" -Arguments @("rev-parse", "HEAD") -WorkingDirectory $context.repoRoot
+            $operation = [pscustomobject]@{
+                state = "merged"
+                reason = "Merge committed."
+                commitMessage = $message
+                commitSha = [string]$shaResult.output
+            }
+        }
+        "abort" {
+            Undo-MergeAttempt -RepoRoot $context.repoRoot
+            $operation = [pscustomobject]@{
+                state = "pending_merge"
+                reason = "Prepared merge was aborted."
+                commitMessage = ""
+                commitSha = ""
+            }
+        }
+        "discard" {
+            Undo-MergeAttempt -RepoRoot $context.repoRoot
+            $operation = [pscustomobject]@{
+                state = "discarded"
+                reason = "Task was discarded."
+                commitMessage = ""
+                commitSha = ""
+            }
+        }
+        "requeue" {
+            Undo-MergeAttempt -RepoRoot $context.repoRoot
+            $operation = [pscustomobject]@{
+                state = "requeue"
+                reason = "Task was rescheduled."
+                commitMessage = ""
+                commitSha = ""
+            }
+        }
+        default {
+            throw "Unsupported merge decision '$Decision'."
+        }
+    }
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $task = Get-TaskById -State $state -TaskId $TaskId
+        if (-not $task) {
+            throw "Task '$TaskId' disappeared during merge resolution."
+        }
+
+        switch ($Decision) {
+            "commit" {
+                $task.state = "merged"
+                $task.waitingUserTest = $false
+                $task.retryScheduled = $false
+                $task.mergeState = "merged"
+                $task.merge.state = "merged"
+                $task.merge.commitMessage = [string]$operation.commitMessage
+                $task.merge.commitSha = [string]$operation.commitSha
+                $task.merge.reason = ""
+                Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$task.latestRun.branchName)
+            }
+            "abort" {
+                $task.state = "pending_merge"
+                $task.waitingUserTest = $false
+                $task.mergeState = "pending"
+                $task.merge.state = "pending"
+                $task.merge.reason = [string]$operation.reason
+            }
+            "discard" {
+                $task.state = "discarded"
+                $task.waitingUserTest = $false
+                $task.retryScheduled = $false
+                $task.mergeState = "discarded"
+                $task.merge.state = "discarded"
+                $task.merge.reason = [string]$operation.reason
+                Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$task.latestRun.branchName)
+            }
+            "requeue" {
+                Get-RetryableResult -Task $task -Reason ([string]$operation.reason)
+                Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$task.latestRun.branchName)
+            }
+        }
+
+        Write-TaskResultFile -Task $task
+        Save-State -StateFile $context.paths.stateFile -State $state
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "merge_resolved" -Message ([string]$operation.reason) -Data @{
+            decision = $Decision
+            state = [string]$task.state
+            commitSha = [string]$task.merge.commitSha
+        }
+
+        return [pscustomobject]@{
+            task = ConvertTo-TaskSnapshot -Task $task
+            decision = $Decision
+            reason = [string]$operation.reason
+            commitMessage = [string]$task.merge.commitMessage
+            commitSha = [string]$task.merge.commitSha
+            snapshot = Get-SnapshotPayload -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+$resolvedSolutionPath = if ($SolutionPath) { Get-CanonicalPath -Path $SolutionPath } else { "" }
+$resolvedTasksFile = if ($TasksFile) { Get-CanonicalPath -Path $TasksFile } else { "" }
+$resolvedPlanFile = if ($PlanFile) { Get-CanonicalPath -Path $PlanFile } else { "" }
 
 switch ($Mode) {
-    "submit-single" {
-        $result = Submit-SingleTask -CommandType $CommandType -PromptFile (Get-CanonicalPath -Path $PromptFile) -PlanFile (Get-CanonicalPath -Path $PlanFile) -SolutionPath (Get-CanonicalPath -Path $SolutionPath) -ResultFile (Get-CanonicalPath -Path $ResultFile) -AllowNuget ([bool]$AllowNuget) -UsageGateDisabled ([bool]$UsageGateDisabled)
-        Write-JsonOutput -Object $result
+    "snapshot-queue" {
+        Write-JsonOutput -Object (Snapshot-Queue -ResolvedSolutionPath $resolvedSolutionPath)
         break
     }
-    "run-single" {
-        Run-SingleTask -TaskId $TaskId -SolutionPath (Get-CanonicalPath -Path $SolutionPath)
+    "register-tasks" {
+        Write-JsonOutput -Object (Register-Tasks -ResolvedSolutionPath $resolvedSolutionPath -ResolvedTasksFile $resolvedTasksFile)
         break
     }
-    "resolve-interactive" {
-        $result = Resolve-InteractiveTask -TaskId $TaskId -SolutionPath (Get-CanonicalPath -Path $SolutionPath) -Decision $Decision -CommitMessage $CommitMessage
-        Write-JsonOutput -Object $result
+    "apply-plan" {
+        Write-JsonOutput -Object (Apply-Plan -ResolvedSolutionPath $resolvedSolutionPath -ResolvedPlanFile $resolvedPlanFile)
+        break
+    }
+    "run-task" {
+        Write-JsonOutput -Object (Run-Task -ResolvedSolutionPath $resolvedSolutionPath -TaskId $TaskId)
+        break
+    }
+    "prepare-merge" {
+        Write-JsonOutput -Object (Prepare-Merge -ResolvedSolutionPath $resolvedSolutionPath -TaskId $TaskId)
+        break
+    }
+    "resolve-merge" {
+        Write-JsonOutput -Object (Resolve-Merge -ResolvedSolutionPath $resolvedSolutionPath -TaskId $TaskId -Decision $Decision -CommitMessage $CommitMessage)
         break
     }
 }

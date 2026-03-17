@@ -1,7 +1,7 @@
 {
   "name": "T.L-AutoDevelop",
-  "version": "3.0.0",
-  "description": "Interactive .NET dev pipeline with scheduler-managed single tasks, wave-safe merges, and parallel batches.",
+  "version": "4.0.1",
+  "description": "Interactive queue-aware .NET dev orchestration with scheduler-planned waves, task-file intake, retries, and normal merge checkpoints.",
   "author": {
     "name": "TLeiott",
     "url": "https://github.com/TLeiott"

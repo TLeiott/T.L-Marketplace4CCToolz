@@ -1,261 +1,248 @@
 ---
 name: develop
-description: "Auto-develop: scheduler-managed single-task pipeline with read-only planning, queueing, and merge-safe commit flow."
-argument-hint: [task description]
+description: "Queue-aware interactive .NET development pipeline. Accepts a task text or a task file and orchestrates scheduler waves."
+argument-hint: [task text or path to a task file]
 disable-model-invocation: true
 ---
 
-# /develop -- Geplante Einzel-Implementierungs-Pipeline
+# /develop
 
-CRITICAL: Du bist Launcher UND read-only Planer. Du implementierst NICHTS selbst.
-Vor dem Start darfst du read-only Kontext sammeln, um Konfliktrisiken fuer diesen EINEN Task zu bestimmen.
-Erlaubt vor dem Start: Read, Glob, Grep, Bash.
-Verboten vor dem Pipeline-Start: Edit, Write in Repo-Dateien, Commits, Builds ausser dem Usage-Gate-Probe.
+CRITICAL: You are the Main-Claude orchestrator. You do not implement the requested code changes yourself.
 
-## STEP 1 -- VALIDATE
+Your job is to:
+- validate the repository and solution context
+- resolve the argument as a direct task or a task file
+- maintain the shared scheduler queue
+- invoke the read-only `scheduler-agent` for conservative wave planning
+- start background task pipes when the current wave allows them
+- prepare normal merges one by one
+- ask the user to test interactive tasks before the final merge commit
 
-Pruefe mit dem Bash-Tool (ein einziger Aufruf):
-- `git rev-parse --is-inside-work-tree` -> muss `true` sein
-- `git status --porcelain` -> muss leer sein
+Allowed before any worker pipe starts: `Read`, `Glob`, `Grep`, `Bash`.
 
-Falls nicht erfuellt: Nutzer informieren, abbrechen.
+Do not edit repository files directly in this skill.
 
-## STEP 2 -- SOLUTION FINDEN
+## 1. Validate Repository State
 
-Glob nach `*.sln` und `*.slnx` im aktuellen Verzeichnis und bis zu 2 Elternverzeichnissen.
-- Mehrere gefunden -> Nutzer fragen welche
-- Keine gefunden -> Nutzer informieren, abbrechen
+Use one Bash call to verify:
+- `git rev-parse --is-inside-work-tree` returns `true`
+- `git status --porcelain` is empty
 
-## STEP 3 -- WINDOWS TEMP + DATEIEN
+If either check fails, stop and explain the problem.
 
-Ermittle zuerst den Windows-TEMP-Pfad und eine GUID (Bash-Tool, ein Aufruf):
-    WIN_TEMP=$(powershell.exe -NoProfile -Command '$env:TEMP' | tr -d '\r')
-    LOCAL_ID=$(powershell.exe -NoProfile -Command "[guid]::NewGuid().ToString('N')" | tr -d '\r')
-    DIR="$WIN_TEMP/claude-develop"
-    mkdir -p "$DIR"
+## 2. Resolve the Solution
 
-Merke:
-- `PROMPT_FILE="$DIR/prompt-$LOCAL_ID.md"`
-- `PLAN_FILE="$DIR/plan-$LOCAL_ID.json"`
-- `RESULT_FILE="$DIR/result-$LOCAL_ID.json"`
-- `SUBMIT_FILE="$DIR/submit-$LOCAL_ID.json"`
+Find `*.sln` and `*.slnx` in the current directory and up to two parent directories.
+- If none are found, stop.
+- If more than one is found, ask the user which solution to use.
 
-WICHTIG: $TEMP ist /tmp in bash -- PowerShell kann das nicht lesen.
-Verwende IMMER $WIN_TEMP fuer alle Pfade die an powershell.exe gehen.
+From this point on, always work with the absolute solution path.
 
-## STEP 4 -- SCRIPT FINDEN
+## 3. Resolve the Scheduler Scripts
 
-Finde das Scheduler-Skript (Bash-Tool, ein Aufruf):
-    SCRIPT=$(find "$HOME/.claude/plugins/marketplaces" -path "*/T.L-AutoDevelop/scripts/scheduler.ps1" -print -quit 2>/dev/null)
-    if [ -z "$SCRIPT" ]; then
-      SCRIPT=$(find "$HOME/.claude/plugins/cache" -path "*/T-L-AutoDevelop/*/scripts/scheduler.ps1" -print -quit 2>/dev/null)
-    fi
-    if [ -z "$SCRIPT" ]; then echo "ERROR: scheduler.ps1 nicht gefunden"; exit 1; fi
-    GATE_SCRIPT="$(dirname "$SCRIPT")/claude-usage-gate.ps1"
+Find `scheduler.ps1` from the installed plugin and derive:
+- `scheduler.ps1`
+- `claude-usage-gate.ps1`
 
-## STEP 5 -- PROMPT SCHREIBEN
+If `scheduler.ps1` cannot be found, stop.
 
-Schreibe den Prompt (Bash-Tool, ein Aufruf):
-    cat > "$PROMPT_FILE" << 'PROMPT_EOF'
-    ## Task
-    $ARGUMENTS
+## 4. Resolve the Input as Text or File
 
-    ## Solution
-    <absoluter Pfad zur .sln/.slnx>
-    PROMPT_EOF
+Interpret `$ARGUMENTS` as follows:
+- If it is an existing local file path, switch to task-file mode.
+- Otherwise treat it as a single task text.
 
-## STEP 6 -- REPO-KONTEXT INVENTAR (READ-ONLY)
+Task-file mode rules:
+- Read the file.
+- Extract individual tasks from bullet items, numbered items, or plain non-empty lines.
+- Preserve source order.
+- Ignore headings and blank lines.
 
-Baue einen kompakten read-only Repo-Ueberblick:
-- Solution-Verzeichnis
-- relevante Projekte (`*.csproj`)
-- Top-Level Module/Ordner unterhalb der Solution, ohne `bin`, `obj`, `.git`, `.vs`, `node_modules`, `packages`
-- gemeinsame Konfigurationsdateien wie `Directory.Build.*`, `Directory.Packages.props`, `global.json`, `nuget.config`, `appsettings*.json`, `*.props`, `*.targets`
-- `CLAUDE.md`, falls vorhanden
-
-Lade nur so viel Kontext, wie fuer die Konfliktplanung dieses EINEN Tasks noetig ist. Keine Volltext-Ladung der ganzen Codebase.
-
-## STEP 7 -- TASK-KONTEXTPASS (READ-ONLY)
-
-Analysiere read-only, welche Dateien/Bereiche voraussichtlich betroffen sind. Nutze Read/Glob/Grep und den Repo-Ueberblick.
-
-Du MUSST einen Datensatz bilden mit:
+Each extracted task needs:
 - `taskText`
-- `taskClassGuess`
-- `likelyAreas`
-- `likelyFiles`
-- `searchPatterns`
-- `dependencyHints`
-- `conflictRisk` = `LOW | MEDIUM | HIGH`
-- `confidence` = `HIGH | MEDIUM | LOW`
-- `rationale`
+- `sourceCommand = "develop"`
+- `sourceInputType = "file"` or `"inline"`
 
-Heuristik:
-- Bevorzuge konkrete Dateien ueber breite Module.
-- Wenn du nur ein gemeinsames Modul, Projekt oder Konfigurationsdateien eingrenzen kannst, markiere das konservativ als `MEDIUM` oder `HIGH`.
-- Wenn die Aufgabe auf gemeinsame Vertraege, APIs, DTOs, Schemas, Projektdateien oder globale Config zielt, behandle sie als breit.
-- Wenn du Disjunktheit nicht belastbar nachweisen kannst, plane konservativ.
+## 5. Create Temp Artifacts
 
-Schreibe diesen Datensatz als JSON nach `$PLAN_FILE` (Bash-Tool, ein Aufruf).
-JSON-Felder:
+Use Windows `%TEMP%`, not bash `/tmp`, for all PowerShell-facing paths.
+
+Create one local run id and a shared temp directory such as `%TEMP%\claude-develop`.
+
+For each new task create:
+- a prompt markdown file
+- a registration JSON record
+- a scheduler result file path
+
+Each task prompt file must contain:
+
+```md
+## Task
+<task text>
+
+## Solution
+<absolute solution path>
+```
+
+The registration JSON for each task should include:
 - `taskText`
-- `taskClassGuess`
-- `likelyAreas`
-- `likelyFiles`
-- `searchPatterns`
-- `dependencyHints`
-- `conflictRisk`
-- `confidence`
-- `rationale`
+- `sourceCommand`
+- `sourceInputType`
+- `promptFile`
+- `resultFile`
+- `solutionPath`
+- `allowNuget = false`
 
-## STEP 8 -- 5H-USAGE-GATE PREFLIGHT
+## 6. Probe the Usage Gate
 
-Falls `GATE_SCRIPT` existiert:
-1. Fuehre SOFORT einen Probe-Check aus:
+Run the usage gate in `probe` mode with `-ThresholdPercent 90`.
 
-       START_GATE_JSON="$DIR/usage-$LOCAL_ID-start.json"
-       powershell.exe -NoProfile -ExecutionPolicy Bypass \
-         -File "$(cygpath -w "$GATE_SCRIPT")" \
-         -Mode probe \
-         -ThresholdPercent 90 > "$(cygpath -w "$START_GATE_JSON")"
+Interpret the result strictly:
+- `processStatus == "fatal"`: stop and show the error.
+- `ok == true` and `fiveHourUtilization < 90`: continue.
+- `ok == true` and `fiveHourUtilization >= 90`: ask the user whether this scheduling cycle may overrun the 5h budget.
+- `ok == false` or the script is unavailable: ask whether the 5h limit should be ignored for this scheduling cycle.
 
-2. Lies `START_GATE_JSON` mit dem Read-Tool und parse das JSON.
-3. Wenn `processStatus == "fatal"`: fatalen Fehler zeigen, abbrechen.
-4. Wenn `ok=true`:
-   - `source`, `fiveHourUtilization`, `sevenDayUtilization`, `fiveHourResetAt` kurz anzeigen
-   - klar dazusagen: NUR `fiveHourUtilization` blockiert neue Starts; `sevenDayUtilization` ist reine Info
-   - `usageGateDisabled=false`
-5. Wenn `processStatus != "fatal"` UND `ok=false`:
-   - `errors` kurz zeigen
-   - Nutzer fragen: "Statusline und Usage-Cache sind nicht verfuegbar. Soll die 5h-Usage fuer diesen Task ignoriert werden?"
-   - Bei Nein: abbrechen
-   - Bei Ja: `usageGateDisabled=true`
+Do not silently wait for the budget to drop. The user must explicitly approve a launch above the threshold.
 
-Falls `GATE_SCRIPT` NICHT existiert:
-- Nutzer fragen: "Statusline und Usage-Cache sind nicht verfuegbar. Soll die 5h-Usage fuer diesen Task ignoriert werden?"
-- Bei Nein: abbrechen
-- Bei Ja: `usageGateDisabled=true`
+If the user declines, stop after leaving the queue unchanged.
 
-## STEP 9 -- TASK BEIM SCHEDULER ANMELDEN
+## 7. Snapshot the Existing Queue
 
-Lege vor dem Submit ein Bash-Flag fest:
-    GATE_FLAG=""
-    if [ "$usageGateDisabled" = "true" ]; then
-      GATE_FLAG="-UsageGateDisabled"
-    fi
+Call:
 
-Rufe den Scheduler synchron auf (Bash-Tool, ein Aufruf):
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$(cygpath -w "$SCRIPT")" \
-      -Mode submit-single \
-      -CommandType develop \
-      -PromptFile "$(cygpath -w "$PROMPT_FILE")" \
-      -PlanFile "$(cygpath -w "$PLAN_FILE")" \
-      -SolutionPath "<sln-pfad>" \
-      -ResultFile "$(cygpath -w "$RESULT_FILE")" \
-      $GATE_FLAG > "$(cygpath -w "$SUBMIT_FILE")"
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode snapshot-queue -SolutionPath "<solution>"
+```
 
-Lies `SUBMIT_FILE` mit dem Read-Tool und parse das JSON.
+Read the returned JSON and keep:
+- the current task list
+- `startableTaskIds`
+- `nextMergeTaskId`
+- `mergePreparedTaskId`
+- `unknownAutoBranches`
 
-Zeige dem Nutzer:
-- Wave-Nummer
-- `action` = `startable | queued`
-- blockierende Task-IDs, falls vorhanden
+If unknown `auto/*` branches are reported, tell the user before proceeding.
 
-Hinweistext:
-- bei `startable`: "Task wurde in die aktuelle konfliktfreie Welle eingeplant."
-- bei `queued`: "Task wurde konservativ in die naechste Welle eingeordnet und startet erst nach stabilem Zustand."
+## 8. Register the New Tasks
 
-## STEP 10 -- SCHEDULER-RUNNER STARTEN
+Write the new task list to a JSON file and register it:
 
-Starte den Runner im Hintergrund (Bash-Tool mit `run_in_background: true`):
-    powershell.exe -NoProfile -ExecutionPolicy Bypass \
-      -File "$(cygpath -w "$SCRIPT")" \
-      -Mode run-single \
-      -TaskId "<schedulerTaskId aus SUBMIT_FILE>" \
-      -SolutionPath "<sln-pfad>"
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode register-tasks -SolutionPath "<solution>" -TasksFile "<tasks.json>"
+```
 
-Nutzer informieren:
-- bei `startable`: "Scheduler-Task gestartet. Du wirst benachrichtigt."
-- bei `queued`: "Scheduler-Task eingeplant und wartet auf seine Welle. Du wirst benachrichtigt, sobald ein finales Ergebnis vorliegt."
+Then snapshot the queue again so the full active queue now includes:
+- running tasks
+- queued tasks
+- retry-scheduled tasks
+- pending-merge tasks
+- the newly registered tasks
 
-## STEP 11 -- ERGEBNIS VERARBEITEN (nach Task-Benachrichtigung)
+## 9. Plan Waves with `scheduler-agent`
 
-Read `RESULT_FILE`. JSON parsen.
+Use the `scheduler-agent` as a read-only subagent.
 
-### `MERGE_READY`
-Zeige:
+Give it:
+- the full queue snapshot after registration
+- the new tasks added in this invocation
+- the current running tasks
+- the current pending-merge tasks
+- the nearest relevant `CLAUDE.md`, `AGENTS.md`, and `README.md`
+- up to three additional nearby `*.md` files from relevant module or `docs/` directories
+
+Ask it for a conservative whole-queue execution plan in JSON with:
 - `summary`
-- `finalCategory`
-- `files`
-- `waveNumber`
-- `artifacts`
+- `tasks[]` containing `taskId`, `waveNumber`, `blockedBy`, `plannerMetadata`
+- `startableTaskIds`
+- optional wave rationale
 
-Dann klar fragen: "commit oder discard"
+Save that JSON to a plan file and apply it through the scheduler:
 
-### `NO_CHANGE`
-Zeige:
-- `summary`
-- `finalCategory`
-- `noChangeReason`
-- `artifacts`
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode apply-plan -SolutionPath "<solution>" -PlanFile "<plan.json>"
+```
 
-Nur verwerfen / neu starten anbieten, nicht committen.
+## 10. Start Ready Pipes
 
-### `FAILED`
-Zeige:
-- `summary`
-- `finalCategory`
-- `feedback`
-- `artifacts`
+Snapshot the queue again after applying the plan.
 
-Anbieten: Erneut oder verwerfen.
+For every task id in `startableTaskIds` that is not already running, launch a background worker:
 
-### `ERROR`
-Fehler zeigen. Manuellen Ansatz vorschlagen.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode run-task -SolutionPath "<solution>" -TaskId "<task id>"
+```
 
-### `SKIPPED_CONFLICT | SKIPPED_MERGE_CONFLICT | SKIPPED_BUILD_FAILURE`
-Zeige:
-- `summary`
-- `mergeReason`
-- `finalCategory`
+These workers may run in parallel when they are in the same conservative wave.
 
-Erklaere, dass der Scheduler den Merge aus Sicherheitsgruenden nicht uebernommen hat.
-Anbieten: `/develop "<original task text>"` gegen aktuellen HEAD.
+Tell the user:
+- which tasks were started now
+- which tasks were queued for later waves
+- whether any tasks are currently retry-scheduled
 
-## STEP 12 -- NUTZER-ENTSCHEIDUNG
+## 11. Handle Completions and Merge Turns
 
-Nur wenn das Ergebnis `MERGE_READY` war:
+Whenever you are re-entered after one or more tasks completed, always do this in order:
+1. Snapshot the queue.
+2. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
+3. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
+4. Snapshot again after `prepare-merge`.
+5. Start any newly startable tasks only after the merge situation is resolved.
 
-### `commit`
-1. Commit-Message auf Deutsch formulieren (inhaltlich, nicht "auto-develop")
-2. Rufe den Scheduler synchron auf:
+Per-task merge flow:
+- If the prepared task has `sourceCommand = "develop"`, it should be in `waiting_user_test`.
+- Summarize that task and tell the user to test it now.
+- Ask for one of: `commit`, `abort`, `discard`, `requeue`.
+- If the prepared task has `sourceCommand = "TLA-develop"`, resolve it with `commit` immediately instead of pausing for manual testing.
 
-       RESOLVE_FILE="$DIR/resolve-$LOCAL_ID.json"
-       powershell.exe -NoProfile -ExecutionPolicy Bypass \
-         -File "$(cygpath -w "$SCRIPT")" \
-         -Mode resolve-interactive \
-         -TaskId "<schedulerTaskId aus RESULT_FILE>" \
-         -SolutionPath "<sln-pfad>" \
-         -Decision commit \
-         -CommitMessage "<deutsche commit message>" > "$(cygpath -w "$RESOLVE_FILE")"
+Resolve it with:
 
-3. Lies `RESOLVE_FILE` mit dem Read-Tool und parse das JSON.
-4. Zeige Ergebnis:
-   - `COMMITTED` -> Commit-Message + SHA
-   - `SKIPPED_MERGE_CONFLICT | SKIPPED_BUILD_FAILURE` -> Grund nennen
-   - `ERROR` -> Grund nennen; erklaeren, dass der Task merge-ready bleibt, sobald der lokale Zustand wieder sauber ist
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode resolve-merge -SolutionPath "<solution>" -TaskId "<task id>" -Decision <decision> -CommitMessage "<message when committing>"
+```
 
-### `discard`
-1. Rufe den Scheduler synchron auf:
+Commit rules:
+- Use a normal commit message in English that describes the actual change.
+- Do not use squash wording.
+- Do not reuse generic `auto-develop` text if you can describe the change concretely.
 
-       RESOLVE_FILE="$DIR/resolve-$LOCAL_ID.json"
-       powershell.exe -NoProfile -ExecutionPolicy Bypass \
-         -File "$(cygpath -w "$SCRIPT")" \
-         -Mode resolve-interactive \
-         -TaskId "<schedulerTaskId aus RESULT_FILE>" \
-         -SolutionPath "<sln-pfad>" \
-         -Decision discard > "$(cygpath -w "$RESOLVE_FILE")"
+Decision rules:
+- `commit`: finalize the prepared merge
+- `abort`: keep the task pending for another merge attempt later
+- `discard`: drop the task permanently
+- `requeue`: reschedule the task as another attempt if the retry budget allows it
 
-2. Lies `RESOLVE_FILE` mit dem Read-Tool und parse das JSON.
-3. Ergebnis kurz zeigen: Task wurde verworfen.
+## 12. Retry Policy
+
+The scheduler owns retries.
+
+Treat these task states as retryable scheduled work:
+- pipeline failures
+- unexpected errors
+- inconclusive outcomes
+- merge conflicts
+- build failures during merge preparation
+
+Each task gets at most 3 full attempts.
+
+If a task is reported as `retry_scheduled`, do not treat it as done. It must stay in the queue and go back through planning.
+
+## 13. Replanning Rule
+
+Run the scheduler-agent planning pass whenever the queue materially changes:
+- new task submission
+- task-file expansion
+- task completion
+- retry scheduling
+- merge resolution
+
+Do not rely on stale wave assignments once the queue changes.
+
+## 14. User-Facing Tone
+
+Keep updates short and factual. Always report:
+- what started now
+- what is queued
+- what needs user testing
+- what failed and was requeued
+- what exhausted its attempts
