@@ -140,18 +140,31 @@ Report to the user:
 - which tasks are retry-scheduled
 - whether the circuit breaker is open
 - the projected queue cost from `usageProjection`
+- a compact progress snapshot from:
+  - `queueProgressSummary`
+  - `runningTaskProgress`
+  - `queuedTaskProgress`
+  - `recentQueueEvents`
 
 If `circuitBreaker.status == "manual_override"`, report that the breaker is temporarily suppressed until `manualOverrideUntil`.
+
+Do not reduce this to only "started" / "queued" lines when richer progress data is available.
 
 ## 9. Autonomous Merge Flow
 
 Whenever you re-enter after task completion:
 1. Snapshot the queue.
-2. If a merge is already prepared, inspect that task record and its `sourceCommand`.
-3. If `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
-4. If the prepared task has `sourceCommand = "TLA-develop"`, call `resolve-merge -Decision commit` immediately.
-5. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
-6. After each merge, snapshot again and start any newly startable tasks.
+2. Before any merge handling, show a compact progress snapshot for the user from:
+   - `queueProgressSummary`
+   - `runningTaskProgress`
+   - `queuedTaskProgress`
+   - `mergeTaskProgress`
+   - `recentQueueEvents`
+3. If a merge is already prepared, inspect that task record and its `sourceCommand`.
+4. If `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
+5. If the prepared task has `sourceCommand = "TLA-develop"`, call `resolve-merge -Decision commit` immediately.
+6. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
+7. After each merge, snapshot again and start any newly startable tasks.
 
 `nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
@@ -198,6 +211,11 @@ Do not continue using stale wave assignments after the queue changed.
 
 Keep updates short and factual. Report:
 - what started
+- what is currently running and in which phase
 - what merged
+- what is queued or blocked
+- what changed since the last queue update
 - what was requeued
 - what exhausted its attempts
+
+When progress fields are present, prefer structured status lines over generic text like "No output available."

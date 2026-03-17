@@ -196,17 +196,30 @@ Tell the user:
 - whether any tasks are currently retry-scheduled
 - whether the circuit breaker is open
 - the projected queue cost from `usageProjection`
+- a compact progress snapshot from:
+  - `queueProgressSummary`
+  - `runningTaskProgress`
+  - `queuedTaskProgress`
+  - `recentQueueEvents`
 
 If `circuitBreaker.status == "manual_override"`, report that the breaker is temporarily suppressed until `manualOverrideUntil`.
+
+Do not reduce this to only "started" / "queued" lines when richer progress data is available.
 
 ## 11. Handle Completions and Merge Turns
 
 Whenever you are re-entered after one or more tasks completed, always do this in order:
 1. Snapshot the queue.
-2. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
-3. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
-4. Snapshot again after `prepare-merge`.
-5. Start any newly startable tasks only after the merge situation is resolved.
+2. Before any merge handling, show a compact progress snapshot for the user from:
+   - `queueProgressSummary`
+   - `runningTaskProgress`
+   - `queuedTaskProgress`
+   - `mergeTaskProgress`
+   - `recentQueueEvents`
+3. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
+4. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
+5. Snapshot again after `prepare-merge`.
+6. Start any newly startable tasks only after the merge situation is resolved.
 
 `nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
@@ -267,7 +280,12 @@ Do not rely on stale wave assignments once the queue changes.
 
 Keep updates short and factual. Always report:
 - what started now
+- what is currently running and in which phase
 - what is queued
+- what is blocked and why
+- what changed since the last queue update
 - what needs user testing
 - what failed and was requeued
 - what exhausted its attempts
+
+When progress fields are present, prefer structured status lines over generic text like "No output available."
