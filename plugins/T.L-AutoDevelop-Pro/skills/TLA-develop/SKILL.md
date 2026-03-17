@@ -149,6 +149,8 @@ If `prepare-merge` fails:
 - report the failure briefly
 - continue with the updated queue state
 
+The scheduler may preserve an accepted branch and retry merge preparation separately when the worker result itself is still valid.
+
 ## 10. Retry Policy
 
 The scheduler owns retries.

@@ -1,9 +1,10 @@
 # scheduler.ps1 -- Repo-scoped queue scheduler for AutoDevelop v4
 param(
-    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge")][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge", "admin-edit-task")][string]$Mode,
     [string]$SolutionPath = "",
     [string]$TasksFile = "",
     [string]$PlanFile = "",
+    [string]$EditFile = "",
     [string]$TaskId = "",
     [string]$Decision = "",
     [string]$CommitMessage = ""
@@ -311,6 +312,11 @@ function Is-QueueState {
     return $State -in @("queued", "retry_scheduled")
 }
 
+function Is-MergeRetryState {
+    param([string]$State)
+    return $State -eq "merge_retry_scheduled"
+}
+
 function Is-RunningState {
     param([string]$State)
     return $State -eq "running"
@@ -481,6 +487,15 @@ function Normalize-TaskRecord {
     if (-not $Task.plannerMetadata) {
         Set-ObjectProperty -Object $Task -Name "plannerMetadata" -Value ([pscustomobject]@{})
     }
+    if ($null -eq $Task.maxMergeAttempts) {
+        Set-ObjectProperty -Object $Task -Name "maxMergeAttempts" -Value 3
+    }
+    if ($null -eq $Task.mergeAttemptsUsed) {
+        Set-ObjectProperty -Object $Task -Name "mergeAttemptsUsed" -Value 0
+    }
+    if ($null -eq $Task.mergeAttemptsRemaining) {
+        Set-ObjectProperty -Object $Task -Name "mergeAttemptsRemaining" -Value ([Math]::Max(0, [int]$Task.maxMergeAttempts - [int]$Task.mergeAttemptsUsed))
+    }
     Set-ObjectProperty -Object $Task -Name "latestRun" -Value (Normalize-LatestRun -LatestRun $Task.latestRun -ResultFile ([string]$Task.resultFile))
     if (-not $Task.merge) {
         Set-ObjectProperty -Object $Task -Name "merge" -Value (New-MergeRecord)
@@ -506,6 +521,9 @@ function Ensure-TaskShape {
     if ($null -eq $Task.attemptsRemaining) { $Task | Add-Member -NotePropertyName attemptsRemaining -NotePropertyValue ([Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)) -Force }
     if ($null -eq $Task.retryScheduled) { $Task | Add-Member -NotePropertyName retryScheduled -NotePropertyValue $false -Force }
     if ($null -eq $Task.waitingUserTest) { $Task | Add-Member -NotePropertyName waitingUserTest -NotePropertyValue $false -Force }
+    if ($null -eq $Task.maxMergeAttempts) { $Task | Add-Member -NotePropertyName maxMergeAttempts -NotePropertyValue 3 -Force }
+    if ($null -eq $Task.mergeAttemptsUsed) { $Task | Add-Member -NotePropertyName mergeAttemptsUsed -NotePropertyValue 0 -Force }
+    if ($null -eq $Task.mergeAttemptsRemaining) { $Task | Add-Member -NotePropertyName mergeAttemptsRemaining -NotePropertyValue 3 -Force }
     if ($null -eq $Task.blockedBy) { $Task | Add-Member -NotePropertyName blockedBy -NotePropertyValue @() -Force }
     if ($null -eq $Task.runs) { $Task | Add-Member -NotePropertyName runs -NotePropertyValue @() -Force }
     if (-not $Task.plannerMetadata) { $Task | Add-Member -NotePropertyName plannerMetadata -NotePropertyValue ([pscustomobject]@{}) -Force }
@@ -547,6 +565,9 @@ function ConvertTo-TaskSnapshot {
         attemptsUsed = [int]$Task.attemptsUsed
         attemptsRemaining = [int]$Task.attemptsRemaining
         retryScheduled = [bool]$Task.retryScheduled
+        maxMergeAttempts = [int]$Task.maxMergeAttempts
+        mergeAttemptsUsed = [int]$Task.mergeAttemptsUsed
+        mergeAttemptsRemaining = [int]$Task.mergeAttemptsRemaining
         waitingUserTest = [bool]$Task.waitingUserTest
         mergeState = [string]$Task.mergeState
         branchName = [string]$Task.latestRun.branchName
@@ -648,7 +669,7 @@ function Get-StartableTaskIds {
     $waveTasks = @(Get-TasksInWave -State $State -WaveNumber $waveNumber)
     if ($waveTasks.Count -eq 0) { return @() }
 
-    $mergeGateStates = @("pending_merge", "merge_prepared", "waiting_user_test")
+    $mergeGateStates = @("pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test")
     if (@($waveTasks | Where-Object { $mergeGateStates -contains $_.state }).Count -gt 0) {
         return @()
     }
@@ -791,6 +812,28 @@ function Get-RetryableResult {
         $Task.merge.reason = $Reason
     }
     $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
+}
+
+function Get-MergeRetryableResult {
+    param(
+        $Task,
+        [string]$Reason
+    )
+
+    $Task.mergeAttemptsUsed = [int]$Task.mergeAttemptsUsed + 1
+    $Task.mergeAttemptsRemaining = [Math]::Max(0, [int]$Task.maxMergeAttempts - [int]$Task.mergeAttemptsUsed)
+
+    if ([int]$Task.mergeAttemptsUsed -lt [int]$Task.maxMergeAttempts) {
+        $Task.state = "merge_retry_scheduled"
+        $Task.retryScheduled = $false
+        $Task.waitingUserTest = $false
+        $Task.mergeState = "retry_scheduled"
+        $Task.merge.state = "retry_scheduled"
+        $Task.merge.reason = $Reason
+        return $true
+    }
+
+    return $false
 }
 
 function Get-LockFailureInfo {
@@ -1074,12 +1117,13 @@ function Reconcile-State {
 function New-TaskRecord {
     param(
         [string]$RepoRoot,
+        [string]$DefaultSolutionPath,
         $InputTask,
         [int]$SubmissionOrder
     )
 
     $taskId = if ($InputTask.taskId) { [string]$InputTask.taskId } else { ([guid]::NewGuid().ToString("N")) }
-    $resolvedSolutionPath = if ($InputTask.solutionPath) { Get-CanonicalPath -Path ([string]$InputTask.solutionPath) } else { "" }
+    $resolvedSolutionPath = if ($InputTask.solutionPath) { Get-CanonicalPath -Path ([string]$InputTask.solutionPath) } else { $DefaultSolutionPath }
     $resolvedPromptFile = if ($InputTask.promptFile) { Get-CanonicalPath -Path ([string]$InputTask.promptFile) } else { "" }
     $resolvedPlanFile = if ($InputTask.planFile) { Get-CanonicalPath -Path ([string]$InputTask.planFile) } else { "" }
     $resultFile = if ($InputTask.resultFile) { Get-CanonicalPath -Path ([string]$InputTask.resultFile) } else { Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $taskId }
@@ -1100,6 +1144,9 @@ function New-TaskRecord {
         maxAttempts = 3
         attemptsUsed = 0
         attemptsRemaining = 3
+        maxMergeAttempts = 3
+        mergeAttemptsUsed = 0
+        mergeAttemptsRemaining = 3
         retryScheduled = $false
         waitingUserTest = $false
         mergeState = ""
@@ -1138,6 +1185,16 @@ function Read-PlanPayload {
     return $payload
 }
 
+function Read-AdminEditPayload {
+    param([string]$Path)
+
+    $payload = Read-JsonFile -Path $Path
+    if (-not $payload) {
+        throw "Admin edit file not found or empty: $Path"
+    }
+    return $payload
+}
+
 function Is-MergeResolvedState {
     param([string]$State)
     return $State -in @("merged", "completed_no_change", "completed_failed_terminal", "discarded")
@@ -1157,12 +1214,12 @@ function Get-NextMergeCandidate {
             return $null
         }
 
-        $hasUnfinishedPipes = @($waveTasks | Where-Object { $_.state -in @("queued", "retry_scheduled", "running") }).Count -gt 0
+        $hasUnfinishedPipes = @($waveTasks | Where-Object { $_.state -in @("queued", "running") }).Count -gt 0
         if ($hasUnfinishedPipes) {
             return $null
         }
 
-        $pendingMergeTask = @($waveTasks | Where-Object { $_.state -eq "pending_merge" } | Select-Object -First 1)[0]
+        $pendingMergeTask = @($waveTasks | Where-Object { $_.state -in @("pending_merge", "merge_retry_scheduled") } | Select-Object -First 1)[0]
         if ($pendingMergeTask) {
             return $pendingMergeTask
         }
@@ -1226,6 +1283,7 @@ function Get-SnapshotPayload {
         runningTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "running" } | ForEach-Object { [string]$_.taskId })
         queuedTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "queued" } | ForEach-Object { [string]$_.taskId })
         retryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+        mergeRetryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "merge_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
         pendingMergeTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "pending_merge" } | ForEach-Object { [string]$_.taskId })
         startableTaskIds = @(Get-StartableTaskIds -State $State)
         nextMergeTaskId = if ($nextMergeTask) { [string]$nextMergeTask.taskId } else { "" }
@@ -1269,7 +1327,13 @@ function Register-Tasks {
         $registered = [System.Collections.ArrayList]::new()
 
         foreach ($inputTask in $registrationTasks) {
-            $task = New-TaskRecord -RepoRoot $context.repoRoot -InputTask $inputTask -SubmissionOrder $submissionOrder
+            $task = New-TaskRecord -RepoRoot $context.repoRoot -DefaultSolutionPath $ResolvedSolutionPath -InputTask $inputTask -SubmissionOrder $submissionOrder
+            if (-not $task.solutionPath) {
+                throw "Task '$($task.taskId)' has no solution path after registration fallback."
+            }
+            if (-not (Test-Path -LiteralPath $task.solutionPath)) {
+                throw "Task '$($task.taskId)' references a solution that does not exist: $($task.solutionPath)"
+            }
             Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
             if (Get-TaskById -State $state -TaskId $task.taskId) {
                 throw "Task id '$($task.taskId)' is already registered."
@@ -1376,6 +1440,8 @@ function Run-Task {
         $task.retryScheduled = $false
         $task.waitingUserTest = $false
         $task.mergeState = ""
+        $task.mergeAttemptsUsed = 0
+        $task.mergeAttemptsRemaining = [int]$task.maxMergeAttempts
         $task.attemptsUsed = [int]$task.attemptsUsed + 1
         $task.attemptsRemaining = [Math]::Max(0, [int]$task.maxAttempts - [int]$task.attemptsUsed)
         $attemptNumber = [int]$task.attemptsUsed
@@ -1487,7 +1553,7 @@ function Prepare-Merge {
                 snapshot = Get-SnapshotPayload -State $state
             }
         }
-        if ($selectedTask.state -ne "pending_merge") {
+        if ($selectedTask.state -notin @("pending_merge", "merge_retry_scheduled")) {
             return [pscustomobject]@{
                 task = ConvertTo-TaskSnapshot -Task $selectedTask
                 blocked = $true
@@ -1586,6 +1652,8 @@ function Prepare-Merge {
         }
 
         if ($mergeResult.success) {
+            $selectedTask.mergeAttemptsUsed = 0
+            $selectedTask.mergeAttemptsRemaining = [int]$selectedTask.maxMergeAttempts
             $selectedTask.merge.preparedAt = (Get-Date).ToString("o")
             $selectedTask.merge.reason = ""
             $selectedTask.merge.state = "prepared"
@@ -1599,8 +1667,17 @@ function Prepare-Merge {
             }
             Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_prepared" -Message "Merge prepared successfully." -Data @{ waitingUserTest = [bool]$selectedTask.waitingUserTest }
         } else {
-            Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
-            Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$selectedTask.latestRun.branchName)
+            $requiresWorkerRetry = ($mergeAttempt.phase -eq "merge")
+            if ($requiresWorkerRetry) {
+                Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
+                Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$selectedTask.latestRun.branchName)
+            } else {
+                $scheduled = Get-MergeRetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
+                if (-not $scheduled) {
+                    Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
+                    Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$selectedTask.latestRun.branchName)
+                }
+            }
             Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $selectedTask.taskId -Kind "merge_failed" -Message "Merge preparation failed." -Data @{ reason = [string]$mergeResult.reason }
         }
 
@@ -1614,6 +1691,68 @@ function Prepare-Merge {
             lockFailureDetected = [bool]$mergeResult.lockFailureDetected
             lockRemediationAttempted = [bool]$mergeResult.lockRemediationAttempted
             killedProcesses = @($mergeResult.killedProcesses)
+            snapshot = Get-SnapshotPayload -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+function Admin-Edit-Task {
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$ResolvedEditFile
+    )
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $payload = Read-AdminEditPayload -Path $ResolvedEditFile
+    $taskId = [string]$payload.taskId
+    if (-not $taskId) {
+        throw "Admin edit payload must include taskId."
+    }
+    $updates = if ($payload.updates) { $payload.updates } else { $payload }
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $task = Get-TaskById -State $state -TaskId $taskId
+        if (-not $task) {
+            throw "Task '$taskId' was not found."
+        }
+
+        foreach ($field in @("state", "waveNumber", "retryScheduled", "waitingUserTest", "mergeState", "attemptsUsed", "attemptsRemaining", "mergeAttemptsUsed", "mergeAttemptsRemaining")) {
+            if ($null -ne $updates.$field) {
+                Set-ObjectProperty -Object $task -Name $field -Value $updates.$field
+            }
+        }
+        if ($null -ne $updates.blockedBy) {
+            Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $updates.blockedBy))
+        }
+        if ($updates.merge) {
+            foreach ($field in @("state", "preparedAt", "commitMessage", "commitSha", "reason", "branchName")) {
+                if ($null -ne $updates.merge.$field) {
+                    Set-ObjectProperty -Object $task.merge -Name $field -Value $updates.merge.$field
+                }
+            }
+        }
+        if ($updates.latestRun) {
+            foreach ($field in @("branchName", "finalStatus", "finalCategory", "summary", "feedback", "noChangeReason", "completedAt", "startedAt", "taskName", "resultFile", "processId", "artifacts")) {
+                if ($null -ne $updates.latestRun.$field) {
+                    Set-ObjectProperty -Object $task.latestRun -Name $field -Value $updates.latestRun.$field
+                }
+            }
+            if ($null -ne $updates.latestRun.actualFiles) {
+                Set-ObjectProperty -Object $task.latestRun -Name "actualFiles" -Value ([object[]](Normalize-StringArray -Value $updates.latestRun.actualFiles))
+            }
+        }
+
+        Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+        Write-TaskResultFile -Task $task
+        Save-State -StateFile $context.paths.stateFile -State $state
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "admin_edit" -Message "Task edited by admin command." -Data $updates
+
+        return [pscustomobject]@{
+            task = ConvertTo-TaskSnapshot -Task $task
             snapshot = Get-SnapshotPayload -State $state
         }
     } finally {
@@ -1759,6 +1898,7 @@ function Resolve-Merge {
 $resolvedSolutionPath = if ($SolutionPath) { Get-CanonicalPath -Path $SolutionPath } else { "" }
 $resolvedTasksFile = if ($TasksFile) { Get-CanonicalPath -Path $TasksFile } else { "" }
 $resolvedPlanFile = if ($PlanFile) { Get-CanonicalPath -Path $PlanFile } else { "" }
+$resolvedEditFile = if ($EditFile) { Get-CanonicalPath -Path $EditFile } else { "" }
 
 switch ($Mode) {
     "snapshot-queue" {
@@ -1783,6 +1923,10 @@ switch ($Mode) {
     }
     "resolve-merge" {
         Write-JsonOutput -Object (Resolve-Merge -ResolvedSolutionPath $resolvedSolutionPath -TaskId $TaskId -Decision $Decision -CommitMessage $CommitMessage)
+        break
+    }
+    "admin-edit-task" {
+        Write-JsonOutput -Object (Admin-Edit-Task -ResolvedSolutionPath $resolvedSolutionPath -ResolvedEditFile $resolvedEditFile)
         break
     }
 }

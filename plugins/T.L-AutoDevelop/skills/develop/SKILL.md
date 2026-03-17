@@ -229,6 +229,8 @@ Each task gets at most 3 full attempts.
 
 If a task is reported as `retry_scheduled`, do not treat it as done. It must stay in the queue and go back through planning.
 
+If merge preparation fails after a worker already produced an accepted branch, the scheduler may preserve that branch and reschedule merge preparation separately instead of rerunning the whole worker immediately.
+
 ## 13. Replanning Rule
 
 Run the scheduler-agent planning pass whenever the queue materially changes:

@@ -144,7 +144,10 @@ function Invoke-WithEnvironment {
 }
 
 function New-MockCommandSet {
-    param([string]$Root)
+    param(
+        [string]$Root,
+        [string]$DotnetBehavior = "lock-then-success"
+    )
 
     $mockDir = Join-Path $Root "mock-bin"
     New-Item -ItemType Directory -Path $mockDir -Force | Out-Null
@@ -173,7 +176,16 @@ if ($Args.Count -ge 1 -and $Args[0] -in @('branch','status','merge','reset','com
 exit 0
 '@, [System.Text.Encoding]::UTF8)
 
-    [System.IO.File]::WriteAllText((Join-Path $mockDir "dotnet-behavior.ps1"), @'
+    $dotnetScript = switch ($DotnetBehavior) {
+        "compile-fail" {
+@'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+Write-Output "error CS1002: ; expected"
+exit 1
+'@
+        }
+        default {
+@'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
 $countFile = $env:AUTODEV_TEST_DOTNET_COUNT_FILE
 $count = 0
@@ -191,7 +203,10 @@ if ($count -eq 1) {
 }
 Write-Output 'Build succeeded.'
 exit 0
-'@, [System.Text.Encoding]::UTF8)
+'@
+        }
+    }
+    [System.IO.File]::WriteAllText((Join-Path $mockDir "dotnet-behavior.ps1"), $dotnetScript, [System.Text.Encoding]::UTF8)
 
     [System.IO.File]::WriteAllText((Join-Path $mockDir "taskkill-behavior.ps1"), @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
@@ -206,6 +221,34 @@ exit 0
         git = (Join-Path $mockDir "git.cmd")
         dotnet = (Join-Path $mockDir "dotnet.cmd")
         taskkill = (Join-Path $mockDir "taskkill.cmd")
+    }
+}
+
+function Test-SolutionPathFallback {
+    $repo = New-TestRepo
+    try {
+        $tasksFile = Join-Path $repo.root "tasks-no-solution.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            @{
+                taskId = "task-fallback"
+                taskText = "uses scheduler solution"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                promptFile = ""
+                resultFile = (Join-Path $repo.resultsDir "task-fallback.json")
+                allowNuget = $false
+            }
+        ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $registerResult = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "register-tasks" -TasksFile $tasksFile
+        Assert-True ([string]$registerResult.registered[0].taskId -eq "task-fallback") "Task should register successfully without explicit solutionPath."
+
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $actualSolution = [System.IO.Path]::GetFullPath([string]$savedState.tasks[0].solutionPath)
+        $expectedSolution = [System.IO.Path]::GetFullPath($repo.solution)
+        Assert-True ($actualSolution -eq $expectedSolution) "Missing task solutionPath should fall back to the scheduler solution."
+    } finally {
+        Remove-TestRepo -Root $repo.root
     }
 }
 
@@ -471,6 +514,82 @@ function Test-NextMergeGate {
     }
 }
 
+function Test-RetryDoesNotBlockMerge {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-ready-merge"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "merge"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-ready-merge.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "task-ready-merge" -ResultFile (Join-Path $repo.tasksDir "task-ready-merge-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "task-worker-retry"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "retry later"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-worker-retry.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.nextMergeTaskId -eq "task-ready-merge") "Detached worker retries must not block merge readiness for completed wave work."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-TlaMergeLockRemediation {
     $repo = New-TestRepo
     try {
@@ -548,10 +667,158 @@ function Test-TlaMergeLockRemediation {
     }
 }
 
+function Test-MergeBuildFailurePreservesBranch {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "compile-fail"
+        $gitLog = Join-Path $repo.root "git-compile.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "merge-build-retry"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "preserve branch on build fail"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "merge-build-retry.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "merge-build-retry" -ResultFile (Join-Path $repo.tasksDir "merge-build-retry-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/merge-build-retry"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_GIT_LOG = $gitLog
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $false) "Compile failure should still fail merge preparation."
+        Assert-True ([string]$prepareResult.task.state -eq "merge_retry_scheduled") "Build failures during prepare-merge should preserve accepted work as merge_retry_scheduled."
+        Assert-True ([string]$prepareResult.task.branchName -eq "auto/merge-build-retry") "Merge-stage retry must preserve the accepted branch."
+        Assert-True ([int]$prepareResult.task.mergeAttemptsUsed -eq 1) "Merge retry budget should be consumed."
+
+        $gitEntries = if (Test-Path -LiteralPath $gitLog) { @(Get-Content -LiteralPath $gitLog) } else { @() }
+        Assert-True (@($gitEntries | Where-Object { $_ -match 'branch\s+-D' }).Count -eq 0) "Branch should not be deleted on merge-stage build failure."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AdminEditTask {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "admin-fix"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "repair me"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "admin-fix.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 1
+                    mergeAttemptsRemaining = 2
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $editFile = Join-Path $repo.root "admin-edit.json"
+        [System.IO.File]::WriteAllText($editFile, (@{
+            taskId = "admin-fix"
+            updates = @{
+                state = "queued"
+                waveNumber = 2
+                blockedBy = @("task-a")
+                retryScheduled = $false
+                mergeAttemptsUsed = 0
+                mergeAttemptsRemaining = 3
+                latestRun = @{
+                    branchName = "auto/admin-fix"
+                }
+                merge = @{
+                    state = "pending"
+                    reason = "manual reset"
+                }
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:SchedulerPath -Mode "admin-edit-task" -SolutionPath $repo.solution -EditFile $editFile
+        $editResult = ($raw | Out-String | ConvertFrom-Json)
+
+        Assert-True ([string]$editResult.task.state -eq "queued") "Admin edit should update task state."
+        Assert-True ([int]$editResult.task.waveNumber -eq 2) "Admin edit should update wave number."
+        Assert-True (@($editResult.task.blockedBy).Count -eq 1 -and [string]$editResult.task.blockedBy[0] -eq "task-a") "Admin edit should normalize blockedBy."
+        Assert-True ([string]$editResult.task.branchName -eq "auto/admin-fix") "Admin edit should allow latestRun branch repair."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-SnapshotResilience
 Test-BlockedByNormalization
 Test-NextMergeGate
+Test-RetryDoesNotBlockMerge
 Test-TlaMergeLockRemediation
+Test-MergeBuildFailurePreservesBranch
+Test-AdminEditTask
 
 Write-Host "Scheduler regression checks passed."
