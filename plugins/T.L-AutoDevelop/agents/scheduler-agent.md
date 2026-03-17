@@ -21,6 +21,7 @@ You receive:
 - the subset of newly added tasks
 - currently running tasks
 - pending merge tasks
+- recent planner feedback from prior tasks in this repo
 - relevant markdown documentation near the affected code
 
 Treat the queue snapshot as the source of truth for current task ids and current states.
@@ -59,6 +60,11 @@ Consider:
 - tasks already running
 - tasks already pending merge
 - retry-scheduled tasks that will run again from current HEAD
+- user-declared hard constraints:
+  - `declaredDependencies`
+  - `declaredPriority`
+  - `serialOnly`
+- recent planner hit/miss feedback from earlier tasks
 - whether a task looks broad even if concrete files are unknown
 
 # Output Contract
@@ -79,6 +85,7 @@ Use this shape:
         "likelyFiles": ["relative/path.cs"],
         "likelyAreas": ["Module/Submodule"],
         "dependencyHints": ["other task id"],
+        "effortClass": "MEDIUM",
         "conflictRisk": "LOW",
         "confidence": "MEDIUM",
         "rationale": "Short evidence-based explanation."
@@ -93,6 +100,9 @@ Rules:
 - every active non-terminal task must appear in `tasks`
 - `waveNumber` must be a positive integer
 - `blockedBy` must reference task ids from the queue
+- declared dependencies from the queue are hard constraints
+- tasks with declared dependencies must be placed in a strictly later wave than the dependency target
+- serial-only tasks must be isolated in their own wave
 - `startableTaskIds` must be a subset of tasks in the earliest unresolved wave that are safe to start now
 
 # Decision Standard

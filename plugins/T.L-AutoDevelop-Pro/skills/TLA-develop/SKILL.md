@@ -52,12 +52,23 @@ Task-file mode rules:
 - extract tasks from bullet items, numbered items, or plain non-empty lines
 - preserve source order
 - ignore headings and blank lines
+- support optional inline annotations:
+  - `[after: <task id or earlier task number>]`
+  - `[priority: high|normal|low]`
+  - `[serial]`
+
+Semantics:
+- `[after: ...]` is a hard execution dependency, not just a planning hint.
+- Tasks declared with `[after: ...]` must run in a later wave and must not start in parallel with their dependency target.
 
 Every extracted task must be registered with:
 - `taskText`
 - `sourceCommand = "TLA-develop"`
 - `sourceInputType = "file"` or `"inline"`
 - `allowNuget = true` only if the surrounding task context explicitly requires package installation
+- optional `declaredDependencies`
+- optional `declaredPriority`
+- optional `serialOnly`
 
 ## 5. Create Temp Artifacts
 
@@ -110,6 +121,7 @@ The planner input must include:
 - all retry-scheduled tasks
 - all pending-merge tasks
 - the newly added tasks
+- recent planner feedback from the queue snapshot
 - nearby documentation markdown files relevant to the affected modules
 
 ## 8. Start Ready Pipes
@@ -126,6 +138,10 @@ Report to the user:
 - which tasks started
 - which tasks were queued
 - which tasks are retry-scheduled
+- whether the circuit breaker is open
+- the projected queue cost from `usageProjection`
+
+If `circuitBreaker.status == "manual_override"`, report that the breaker is temporarily suppressed until `manualOverrideUntil`.
 
 ## 9. Autonomous Merge Flow
 
@@ -137,15 +153,19 @@ Whenever you re-enter after task completion:
 5. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
 6. After each merge, snapshot again and start any newly startable tasks.
 
-`nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued`, `retry_scheduled`, or `running`. The scheduler only surfaces merge turns after the whole wave is finished.
+`nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
 Use a normal English merge commit message that describes the actual change.
 Do not use squash wording.
+
+For `TLA-develop`, if merge preparation fails only because local dev hosts are locking build outputs, the scheduler may automatically `taskkill` the blocking Visual Studio / IIS Express style processes once and retry the merge build.
 
 If `prepare-merge` fails:
 - let the scheduler requeue the task if attempts remain
 - report the failure briefly
 - continue with the updated queue state
+
+The scheduler may preserve an accepted branch and retry merge preparation separately when the worker result itself is still valid.
 
 ## 10. Retry Policy
 
@@ -170,6 +190,7 @@ Run the scheduler-agent planning pass whenever the queue materially changes:
 - task completion
 - retry scheduling
 - merge completion
+- circuit-breaker clear
 
 Do not continue using stale wave assignments after the queue changed.
 
