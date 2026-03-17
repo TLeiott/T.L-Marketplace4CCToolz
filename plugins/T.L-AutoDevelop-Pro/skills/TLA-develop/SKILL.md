@@ -98,12 +98,22 @@ Run the usage gate in `probe` mode with `-ThresholdPercent 90`.
 Interpret the result strictly:
 - fatal gate error -> stop
 - `fiveHourUtilization < 90` -> continue
-- `fiveHourUtilization >= 90` -> ask whether this scheduling cycle may overrun the 5h budget
-- unavailable statusline/cache -> ask whether the 5h limit should be ignored for this scheduling cycle
+- `fiveHourUtilization >= 90` -> do not ask the user; pause autonomously until the 5h budget resets, then recheck
+- unavailable statusline/cache -> do not ask the user; sleep 5 hours, then re-run the gate probe
 
-Do not silently wait for the budget to drop.
+Autonomous wait rules:
+- If the initial probe is blocked and `fiveHourResetAt` is available, call the usage gate in `wait` mode with the same threshold and let it wait until the gate opens.
+- If the initial probe is unavailable or has no usable reset time, sleep for 5 hours, then run `probe` again.
+- If the post-fallback probe is still unavailable, stop and report that the autonomous gate state could not be determined after the 5-hour fallback.
+- If the post-fallback probe is still blocked but now provides a usable reset time, switch to the normal `wait` path.
+- Do not create an unbounded 5-hour sleep loop.
 
-If the user declines, stop after leaving the queue unchanged.
+User-facing reporting:
+- tell the user when TLA pauses because of the 5h budget
+- include the current `fiveHourUtilization`
+- include `fiveHourResetAt` when available
+- say whether TLA is using gate-script `wait` or the conservative 5-hour fallback
+- when it resumes, report how long it waited and the final utilization that allowed launch
 
 ## 7. Snapshot, Register, and Replan the Whole Queue
 
