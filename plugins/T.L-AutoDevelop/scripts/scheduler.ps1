@@ -428,6 +428,7 @@ function Get-DefaultTaskResultPath {
 function New-LatestRunRecord {
     param(
         [int]$AttemptNumber = 0,
+        [int]$LaunchSequence = 0,
         [string]$TaskName = "",
         [string]$ResultFile = "",
         [int]$ProcessId = 0,
@@ -437,6 +438,7 @@ function New-LatestRunRecord {
 
     return [pscustomobject]@{
         attemptNumber = $AttemptNumber
+        launchSequence = $LaunchSequence
         taskName = $TaskName
         resultFile = $ResultFile
         processId = $ProcessId
@@ -544,6 +546,7 @@ function Normalize-LatestRun {
     if ($LatestRun) {
         foreach ($property in @(
             "attemptNumber",
+            "launchSequence",
             "taskName",
             "resultFile",
             "processId",
@@ -582,6 +585,8 @@ function Normalize-RunRecords {
         if (-not $run) { continue }
         $normalizedRuns += [pscustomobject]@{
             attemptNumber = if ($null -ne $run.attemptNumber) { [int]$run.attemptNumber } else { 0 }
+            launchSequence = if ($null -ne $run.launchSequence) { [int]$run.launchSequence } else { 0 }
+            taskName = [string]$run.taskName
             finalStatus = [string]$run.finalStatus
             finalCategory = [string]$run.finalCategory
             summary = [string]$run.summary
@@ -1355,6 +1360,7 @@ function ConvertTo-TaskSnapshot {
 
     $progress = Get-TaskProgress -RepoRoot $RepoRoot -Task $Task
     $artifactPointers = Get-TaskArtifactPointers -RepoRoot $RepoRoot -Task $Task
+    $integrityWarnings = @(Get-TaskIntegrityWarnings -Task $Task)
 
     return [pscustomobject]@{
         taskId = [string]$Task.taskId
@@ -1371,6 +1377,7 @@ function ConvertTo-TaskSnapshot {
         attemptsUsed = [int]$Task.attemptsUsed
         attemptsRemaining = [int]$Task.attemptsRemaining
         workerLaunchSequence = [int]$Task.workerLaunchSequence
+        latestRunLaunchSequence = [int]$Task.latestRun.launchSequence
         maxEnvironmentRepairAttempts = [int]$Task.maxEnvironmentRepairAttempts
         environmentRepairAttemptsUsed = [int]$Task.environmentRepairAttemptsUsed
         environmentRepairAttemptsRemaining = [int]$Task.environmentRepairAttemptsRemaining
@@ -1393,6 +1400,8 @@ function ConvertTo-TaskSnapshot {
         actualFiles = @($Task.latestRun.actualFiles)
         plannerMetadata = $Task.plannerMetadata
         plannerFeedback = $Task.plannerFeedback
+        runs = @($Task.runs)
+        integrityWarnings = @($integrityWarnings)
         merge = $Task.merge
         resultFile = [string]$Task.resultFile
         progress = $progress
@@ -1902,6 +1911,103 @@ function Get-NormalizedComparisonText {
     return (([string]$Text).ToLowerInvariant() -replace '\s+', ' ').Trim()
 }
 
+function Get-TaskIntegrityWarnings {
+    param($Task)
+
+    $warnings = [System.Collections.ArrayList]::new()
+    $runs = @($Task.runs)
+    $launchSequences = @($runs | Where-Object { [int]$_.launchSequence -gt 0 } | ForEach-Object { [int]$_.launchSequence })
+    $taskNames = @($runs | ForEach-Object { [string]$_.taskName } | Where-Object { $_ })
+    $resultFiles = @($runs | ForEach-Object { [string]$_.resultFile } | Where-Object { $_ })
+    $maxLaunchSequence = if ($launchSequences.Count -gt 0) { (@($launchSequences | Measure-Object -Maximum).Maximum) } else { 0 }
+
+    if ([int]$Task.attemptsUsed -gt [int]$Task.maxAttempts) {
+        [void]$warnings.Add("attemptsUsed exceeds maxAttempts.")
+    }
+    if ([int]$Task.attemptsRemaining -ne [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)) {
+        [void]$warnings.Add("attemptsRemaining does not match attemptsUsed.")
+    }
+    if ([int]$Task.mergeAttemptsUsed -gt [int]$Task.maxMergeAttempts) {
+        [void]$warnings.Add("mergeAttemptsUsed exceeds maxMergeAttempts.")
+    }
+    if ([int]$Task.mergeAttemptsRemaining -ne [Math]::Max(0, [int]$Task.maxMergeAttempts - [int]$Task.mergeAttemptsUsed)) {
+        [void]$warnings.Add("mergeAttemptsRemaining does not match mergeAttemptsUsed.")
+    }
+    if ([int]$Task.environmentRepairAttemptsUsed -gt [int]$Task.maxEnvironmentRepairAttempts) {
+        [void]$warnings.Add("environmentRepairAttemptsUsed exceeds maxEnvironmentRepairAttempts.")
+    }
+    if ([int]$Task.environmentRepairAttemptsRemaining -ne [Math]::Max(0, [int]$Task.maxEnvironmentRepairAttempts - [int]$Task.environmentRepairAttemptsUsed)) {
+        [void]$warnings.Add("environmentRepairAttemptsRemaining does not match environmentRepairAttemptsUsed.")
+    }
+    if ($launchSequences.Count -ne @($launchSequences | Select-Object -Unique).Count) {
+        [void]$warnings.Add("runs contain duplicate launchSequence values.")
+    }
+    if ($taskNames.Count -ne @($taskNames | Select-Object -Unique).Count) {
+        [void]$warnings.Add("runs contain duplicate taskName values.")
+    }
+    if ($resultFiles.Count -ne @($resultFiles | Select-Object -Unique).Count) {
+        [void]$warnings.Add("runs contain duplicate resultFile values.")
+    }
+    if ([int]$Task.workerLaunchSequence -lt [int]$maxLaunchSequence) {
+        [void]$warnings.Add("workerLaunchSequence is lower than recorded run launchSequence history.")
+    }
+
+    $latestRun = $Task.latestRun
+    if ($latestRun) {
+        if ([int]$latestRun.launchSequence -gt 0 -and [int]$Task.workerLaunchSequence -gt 0 -and [int]$latestRun.launchSequence -gt [int]$Task.workerLaunchSequence) {
+            [void]$warnings.Add("latestRun.launchSequence exceeds workerLaunchSequence.")
+        }
+        if ($runs.Count -gt 0) {
+            $latestRecordedRun = @($runs | Sort-Object launchSequence, completedAt | Select-Object -Last 1)[0]
+            if ($latestRecordedRun) {
+                if ([int]$latestRun.launchSequence -gt 0 -and [int]$latestRecordedRun.launchSequence -gt 0 -and [int]$latestRun.launchSequence -lt [int]$latestRecordedRun.launchSequence) {
+                    [void]$warnings.Add("latestRun.launchSequence is older than the latest recorded run.")
+                }
+                if ($latestRun.taskName -and $latestRecordedRun.taskName -and [string]$latestRun.taskName -ne [string]$latestRecordedRun.taskName -and [int]$latestRun.launchSequence -eq [int]$latestRecordedRun.launchSequence) {
+                    [void]$warnings.Add("latestRun.taskName conflicts with latest recorded run for the same launchSequence.")
+                }
+                if ($latestRun.resultFile -and $latestRecordedRun.resultFile -and [string]$latestRun.resultFile -ne [string]$latestRecordedRun.resultFile -and [int]$latestRun.launchSequence -eq [int]$latestRecordedRun.launchSequence) {
+                    [void]$warnings.Add("latestRun.resultFile conflicts with latest recorded run for the same launchSequence.")
+                }
+                if ($latestRun.branchName -and $latestRecordedRun.branchName -and [string]$latestRun.branchName -ne [string]$latestRecordedRun.branchName -and [int]$latestRun.launchSequence -eq [int]$latestRecordedRun.launchSequence) {
+                    [void]$warnings.Add("latestRun.branchName conflicts with latest recorded run for the same launchSequence.")
+                }
+            }
+        }
+    }
+
+    return @($warnings | Select-Object -Unique)
+}
+
+function Get-StateIntegritySummary {
+    param($State)
+
+    $taskWarnings = @(
+        (Get-Tasks -State $State) | ForEach-Object {
+            $warnings = @(Get-TaskIntegrityWarnings -Task $_)
+            if ($warnings.Count -gt 0) {
+                [pscustomobject]@{
+                    taskId = [string]$_.taskId
+                    warnings = @($warnings)
+                }
+            }
+        } | Where-Object { $_ }
+    )
+
+    $warningCount = if ($taskWarnings.Count -gt 0) {
+        [int](@($taskWarnings | ForEach-Object { @($_.warnings).Count } | Measure-Object -Sum).Sum)
+    } else {
+        0
+    }
+
+    return [pscustomobject]@{
+        status = if ($taskWarnings.Count -gt 0) { "warning" } else { "clean" }
+        warningCount = $warningCount
+        taskWarnings = @($taskWarnings)
+        summary = if ($taskWarnings.Count -gt 0) { "$($taskWarnings.Count) task(s) have run bookkeeping warnings." } else { "No run bookkeeping warnings detected." }
+    }
+}
+
 function Get-InvestigationEvidenceSignature {
     param($RunRecord)
 
@@ -2238,9 +2344,12 @@ function Apply-PipelineResultToTask {
     Set-ObjectProperty -Object $Task.latestRun -Name "branchName" -Value ([string]$PipelineResult.branch)
     Set-ObjectProperty -Object $Task.latestRun -Name "artifacts" -Value $PipelineResult.artifacts
     Set-ObjectProperty -Object $Task.latestRun -Name "completedAt" -Value ((Get-Date).ToString("o"))
+    Set-ObjectProperty -Object $Task.latestRun -Name "launchSequence" -Value ([int]$Task.workerLaunchSequence)
 
     $runRecord = [pscustomobject]@{
         attemptNumber = [int]$Task.attemptsUsed
+        launchSequence = [int]$Task.workerLaunchSequence
+        taskName = [string]$Task.latestRun.taskName
         finalStatus = [string]$PipelineResult.status
         finalCategory = [string]$PipelineResult.finalCategory
         summary = [string]$PipelineResult.summary
@@ -2696,6 +2805,7 @@ function Get-SnapshotPayload {
     $plannerFeedbackSummary = Get-PlannerFeedbackSummary -State $State
     $recentEvents = Get-RecentQueueEvents -EventsFile $EventsFile
     $tasks = @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)
+    $stateIntegrity = Get-StateIntegritySummary -State $State
     $taskSnapshots = @($tasks | ForEach-Object { ConvertTo-TaskSnapshot -Task $_ -RepoRoot $State.repoRoot })
     $startableTaskIds = @(Get-StartableTaskIds -State $State)
     $runningTaskProgress = @($taskSnapshots | Where-Object { $_.state -eq "running" } | ForEach-Object {
@@ -2750,6 +2860,8 @@ function Get-SnapshotPayload {
         unknownAutoBranches = @($unknownBranches)
         plannerFeedbackSummary = $plannerFeedbackSummary
         usageProjection = $usageProjection
+        stateIntegrity = $stateIntegrity
+        hasIntegrityWarnings = [bool]($stateIntegrity.status -eq "warning")
         circuitBreaker = $breaker
         queueStall = $queueStall
         needsReplan = [bool]($queueStall.status -eq "stalled")
@@ -2966,6 +3078,7 @@ function Run-Task {
         }
         $task.latestRun = New-LatestRunRecord `
             -AttemptNumber $attemptNumber `
+            -LaunchSequence $launchSequence `
             -TaskName $taskName `
             -ResultFile $pipelineResultPath `
             -ProcessId 0 `
@@ -3385,13 +3498,18 @@ function Admin-Edit-Task {
         }
 
         Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+        $integrityWarnings = @(Get-TaskIntegrityWarnings -Task $task)
         Write-TaskResultFile -Task $task
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
-        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "admin_edit" -Message "Task edited by admin command." -Data $updates
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "admin_edit" -Message "Task edited by admin command." -Data @{
+            updates = $updates
+            integrityWarnings = @($integrityWarnings)
+        }
 
         return [pscustomobject]@{
             task = ConvertTo-TaskSnapshot -Task $task -RepoRoot $context.repoRoot
+            integrityWarnings = @($integrityWarnings)
             snapshot = Get-SnapshotPayload -State $state -EventsFile $context.paths.eventsFile
         }
     } finally {

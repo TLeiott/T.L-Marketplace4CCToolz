@@ -43,6 +43,7 @@ function New-TestRepo {
 function New-TestLatestRun {
     param(
         [int]$AttemptNumber = 0,
+        [int]$LaunchSequence = 0,
         [string]$TaskName = "",
         [string]$ResultFile = "",
         [int]$ProcessId = 0,
@@ -51,6 +52,7 @@ function New-TestLatestRun {
 
     return [pscustomobject]@{
         attemptNumber = $AttemptNumber
+        launchSequence = $LaunchSequence
         taskName = $TaskName
         resultFile = $ResultFile
         processId = $ProcessId
@@ -3146,6 +3148,209 @@ function Test-AdminEditTask {
     }
 }
 
+function Test-RunHistoryCapturesLaunchSequence {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-launch-sequence-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("src/File.cs")
+            branch = "auto/task-launch-sequence"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-launch-sequence"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "capture launch sequence"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = $resultPath
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 2 -TaskName "develop-task-launch-sequence-a2" -ResultFile $resultPath -StartedAt ((Get-Date).AddMinutes(-2).ToString("o")))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-launch-sequence" })[0]
+        Assert-True ([int]$task.latestRunLaunchSequence -eq 2) "latestRun should expose the worker launch sequence."
+        Assert-True (@($task.runs).Count -eq 1) "A completed run should be appended to run history."
+        Assert-True ([int]$task.runs[0].launchSequence -eq 2) "Run history should persist the worker launch sequence."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-StateIntegrityWarnsOnDuplicateLaunchSequence {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-drift"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "drift"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-drift.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-drift-a1" -ResultFile (Join-Path $repo.resultsDir "task-drift.json"))
+                    runs = @(
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = "develop-task-drift-a1"
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = ""
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @("src/File.cs")
+                            branchName = "auto/task-drift-a1"
+                            resultFile = "result-1.json"
+                            completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                            artifacts = $null
+                        },
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = "develop-task-drift-a1-duplicate"
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = ""
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @("src/Other.cs")
+                            branchName = "auto/task-drift-a1b"
+                            resultFile = "result-2.json"
+                            completedAt = (Get-Date).AddMinutes(-4).ToString("o")
+                            artifacts = $null
+                        }
+                    )
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.stateIntegrity.status -eq "warning") "Duplicate launch sequences should surface as integrity warnings."
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-drift" })[0]
+        Assert-True (@($task.integrityWarnings).Count -gt 0) "Task snapshots should expose integrity warnings."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AdminEditTaskReturnsIntegrityWarnings {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "admin-warning"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "warn me"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "admin-warning.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-admin-warning-a1" -ResultFile (Join-Path $repo.resultsDir "admin-warning.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $editFile = Join-Path $repo.root "admin-warning-edit.json"
+        [System.IO.File]::WriteAllText($editFile, (@{
+            taskId = "admin-warning"
+            updates = @{
+                attemptsUsed = 3
+                attemptsRemaining = 3
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:SchedulerPath -Mode "admin-edit-task" -SolutionPath $repo.solution -EditFile $editFile
+        $editResult = ($raw | Out-String | ConvertFrom-Json)
+        Assert-True (@($editResult.integrityWarnings).Count -gt 0) "Admin edit should return integrity warnings when it creates inconsistent counters."
+        Assert-True ($editResult.snapshot.hasIntegrityWarnings -eq $true) "Snapshot should expose integrity warnings after inconsistent admin edits."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-EnvironmentFailureRefundsAttempts
@@ -3185,5 +3390,8 @@ Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen
 Test-TlaMergeLockRemediation
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
+Test-RunHistoryCapturesLaunchSequence
+Test-StateIntegrityWarnsOnDuplicateLaunchSequence
+Test-AdminEditTaskReturnsIntegrityWarnings
 
 Write-Host "Scheduler regression checks passed."
