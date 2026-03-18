@@ -155,6 +155,7 @@ Then snapshot the queue again so the full active queue now includes:
 - running tasks
 - queued tasks
 - retry-scheduled tasks
+- any `manual_debug_needed` tasks
 - pending-merge tasks
 - the newly registered tasks
 
@@ -224,6 +225,7 @@ Tell the user:
 - which tasks were started now
 - which tasks were queued for later waves
 - whether any tasks are currently retry-scheduled
+- whether any tasks are paused as `manual_debug_needed`
 - whether the circuit breaker is open
 - the projected queue cost from `usageProjection`
 - the launch-gate numbers for this wave:
@@ -293,6 +295,8 @@ Treat these task states as retryable scheduled work:
 - inconclusive outcomes
 - merge conflicts
 - build failures during merge preparation
+
+If a task enters `manual_debug_needed`, do not treat it as an ordinary scheduled retry. Report that repeated inconclusive investigation produced no new evidence and that the task now waits for repo changes, replanning, or explicit requeue.
 
 Each task gets at most 3 full attempts.
 

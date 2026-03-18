@@ -383,6 +383,11 @@ function Is-QueueState {
     return $State -in @("queued", "retry_scheduled")
 }
 
+function Is-ManualDebugState {
+    param([string]$State)
+    return $State -eq "manual_debug_needed"
+}
+
 function Is-MergeRetryState {
     param([string]$State)
     return $State -eq "merge_retry_scheduled"
@@ -442,6 +447,8 @@ function New-LatestRunRecord {
         summary = ""
         feedback = ""
         noChangeReason = ""
+        investigationConclusion = ""
+        reproductionConfirmed = $false
         actualFiles = @()
         branchName = ""
         artifacts = $null
@@ -547,6 +554,8 @@ function Normalize-LatestRun {
             "summary",
             "feedback",
             "noChangeReason",
+            "investigationConclusion",
+            "reproductionConfirmed",
             "branchName",
             "artifacts",
             "runDir",
@@ -578,6 +587,8 @@ function Normalize-RunRecords {
             summary = [string]$run.summary
             feedback = [string]$run.feedback
             noChangeReason = [string]$run.noChangeReason
+            investigationConclusion = [string]$run.investigationConclusion
+            reproductionConfirmed = [bool]$run.reproductionConfirmed
             actualFiles = @(Normalize-StringArray -Value $run.actualFiles)
             branchName = [string]$run.branchName
             resultFile = [string]$run.resultFile
@@ -646,6 +657,9 @@ function Normalize-TaskRecord {
     if ($null -eq $Task.lastEnvironmentFailureCategory) {
         Set-ObjectProperty -Object $Task -Name "lastEnvironmentFailureCategory" -Value ""
     }
+    if ($null -eq $Task.manualDebugReason) {
+        Set-ObjectProperty -Object $Task -Name "manualDebugReason" -Value ""
+    }
     Set-ObjectProperty -Object $Task -Name "latestRun" -Value (Normalize-LatestRun -LatestRun $Task.latestRun -ResultFile ([string]$Task.resultFile))
     if (-not $Task.merge) {
         Set-ObjectProperty -Object $Task -Name "merge" -Value (New-MergeRecord)
@@ -679,6 +693,7 @@ function Ensure-TaskShape {
     if ($null -eq $Task.mergeAttemptsRemaining) { $Task | Add-Member -NotePropertyName mergeAttemptsRemaining -NotePropertyValue 3 -Force }
     if ($null -eq $Task.environmentRepairAttemptsRemaining) { $Task | Add-Member -NotePropertyName environmentRepairAttemptsRemaining -NotePropertyValue 2 -Force }
     if ($null -eq $Task.lastEnvironmentFailureCategory) { $Task | Add-Member -NotePropertyName lastEnvironmentFailureCategory -NotePropertyValue "" -Force }
+    if ($null -eq $Task.manualDebugReason) { $Task | Add-Member -NotePropertyName manualDebugReason -NotePropertyValue "" -Force }
     if ($null -eq $Task.blockedBy) { $Task | Add-Member -NotePropertyName blockedBy -NotePropertyValue @() -Force }
     if ($null -eq $Task.declaredDependencies) { $Task | Add-Member -NotePropertyName declaredDependencies -NotePropertyValue @() -Force }
     if ($null -eq $Task.declaredPriority) { $Task | Add-Member -NotePropertyName declaredPriority -NotePropertyValue "normal" -Force }
@@ -869,6 +884,7 @@ function Get-PhaseDisplayLabel {
         "running" { return "Running" }
         "retry_scheduled" { return "Retry scheduled" }
         "environment_retry_scheduled" { return "Environment repair scheduled" }
+        "manual_debug_needed" { return "Manual debug needed" }
         "merge_retry_scheduled" { return "Merge retry scheduled" }
         "pending_merge" { return "Pending merge" }
         "merge_prepared" { return "Merge prepared" }
@@ -930,6 +946,7 @@ function Get-TaskProgress {
         }
         "retry_scheduled" { "Waiting for replanning before a new worker attempt." }
         "environment_retry_scheduled" { "Waiting for environment replan before rerunning the worker." }
+        "manual_debug_needed" { "Waiting for repo changes, replanning, or explicit requeue before another worker attempt." }
         "merge_retry_scheduled" { "Waiting for another merge preparation attempt." }
         "pending_merge" { "Waiting for merge turn after the current wave finishes." }
         "waiting_user_test" { "Waiting for user testing before the merge commit." }
@@ -941,6 +958,7 @@ function Get-TaskProgress {
         "running" { "Continue the current worker phase." }
         "retry_scheduled" { "Replan and rerun the worker." }
         "environment_retry_scheduled" { "Replan the task and then rerun the worker in a fresh environment." }
+        "manual_debug_needed" { "Resume only after new evidence, repo changes, or an explicit requeue." }
         "merge_retry_scheduled" { "Retry merge preparation with the preserved branch." }
         "pending_merge" { "Prepare the merge when the scheduler surfaces this task." }
         "merge_prepared" { "Resolve the prepared merge." }
@@ -956,6 +974,7 @@ function Get-TaskProgress {
         "queued" { "info" }
         "retry_scheduled" { "warning" }
         "environment_retry_scheduled" { "warning" }
+        "manual_debug_needed" { "blocked" }
         "merge_retry_scheduled" { "warning" }
         "pending_merge" { "info" }
         "merge_prepared" { "success" }
@@ -971,6 +990,7 @@ function Get-TaskProgress {
         "queued" { "Queued for wave $([int]$Task.waveNumber): $([string]$Task.taskText)" }
         "retry_scheduled" { "Worker retry scheduled: $([string]$Task.taskText)" }
         "environment_retry_scheduled" { "Environment repair scheduled: $([string]$Task.taskText)" }
+        "manual_debug_needed" { "Manual debug needed: $([string]$Task.taskText)" }
         "merge_retry_scheduled" { "Merge retry scheduled: $([string]$Task.taskText)" }
         "pending_merge" { "Pending merge: $([string]$Task.taskText)" }
         "merge_prepared" { "Merge prepared: $([string]$Task.taskText)" }
@@ -988,6 +1008,7 @@ function Get-TaskProgress {
         "queued" { $blockerSummary }
         "retry_scheduled" { if ($Task.merge.reason) { [string]$Task.merge.reason } elseif ($Task.latestRun.feedback) { [string]$Task.latestRun.feedback } else { $blockerSummary } }
         "environment_retry_scheduled" { if ($Task.lastEnvironmentFailureCategory) { "Last environment failure: $([string]$Task.lastEnvironmentFailureCategory)." } elseif ($Task.latestRun.feedback) { [string]$Task.latestRun.feedback } else { $blockerSummary } }
+        "manual_debug_needed" { if ($Task.manualDebugReason) { [string]$Task.manualDebugReason } elseif ($Task.latestRun.feedback) { [string]$Task.latestRun.feedback } else { $blockerSummary } }
         "merge_retry_scheduled" { if ($Task.merge.reason) { [string]$Task.merge.reason } else { $blockerSummary } }
         "pending_merge" { $blockerSummary }
         "merge_prepared" { "Merge is prepared and ready for resolution." }
@@ -1028,7 +1049,8 @@ function Get-RecentQueueEvents {
         "circuit_breaker_cleared",
         "external_merge_detected",
         "environment_failure_detected",
-        "environment_retry_scheduled"
+        "environment_retry_scheduled",
+        "manual_debug_needed"
     )
     $events = @(Read-JsonLinesFile -Path $EventsFile -MaxEntries 40 | Where-Object { $allowedKinds -contains [string]$_.kind } | Select-Object -Last 8)
     return @($events | ForEach-Object {
@@ -1052,6 +1074,7 @@ function Get-QueueProgressSummary {
         queuedCount = @($tasks | Where-Object { $_.state -eq "queued" }).Count
         retryCount = @($tasks | Where-Object { $_.state -eq "retry_scheduled" }).Count
         environmentRetryCount = @($tasks | Where-Object { $_.state -eq "environment_retry_scheduled" }).Count
+        manualDebugCount = @($tasks | Where-Object { $_.state -eq "manual_debug_needed" }).Count
         mergeRetryCount = @($tasks | Where-Object { $_.state -eq "merge_retry_scheduled" }).Count
         pendingMergeCount = @($tasks | Where-Object { $_.state -eq "pending_merge" }).Count
         waitingUserTestCount = @($tasks | Where-Object { $_.state -eq "waiting_user_test" }).Count
@@ -1192,6 +1215,7 @@ function ConvertTo-TaskSnapshot {
         environmentRepairAttemptsUsed = [int]$Task.environmentRepairAttemptsUsed
         environmentRepairAttemptsRemaining = [int]$Task.environmentRepairAttemptsRemaining
         lastEnvironmentFailureCategory = [string]$Task.lastEnvironmentFailureCategory
+        manualDebugReason = [string]$Task.manualDebugReason
         retryScheduled = [bool]$Task.retryScheduled
         usageCostClass = [string]$Task.usageCostClass
         usageEstimateMinutes = [int]$Task.usageEstimateMinutes
@@ -1596,6 +1620,63 @@ function Remove-TaskBranch {
     Invoke-NativeCommand -Command "git" -Arguments @("branch", "-D", $BranchName) -WorkingDirectory $RepoRoot | Out-Null
 }
 
+function Get-NormalizedComparisonText {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+    return (([string]$Text).ToLowerInvariant() -replace '\s+', ' ').Trim()
+}
+
+function Get-InvestigationEvidenceSignature {
+    param($RunRecord)
+
+    if (-not $RunRecord) { return "" }
+
+    $reproMarker = if ([bool]$RunRecord.reproductionConfirmed) { "repro-confirmed" } else { "repro-unconfirmed" }
+
+    $parts = @(
+        (Get-NormalizedComparisonText -Text ([string]$RunRecord.finalCategory)),
+        (Get-NormalizedComparisonText -Text ([string]$RunRecord.investigationConclusion)),
+        $reproMarker,
+        (Get-NormalizedComparisonText -Text ([string]$RunRecord.summary)),
+        (Get-NormalizedComparisonText -Text ([string]$RunRecord.feedback)),
+        ((Normalize-StringArray -Value $RunRecord.actualFiles) -join "|")
+    )
+    $payload = ($parts -join "`n")
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+    return ([System.BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+}
+
+function Test-InvestigationRetryHasNewEvidence {
+    param(
+        $PreviousRun,
+        $CurrentRun
+    )
+
+    if (-not $PreviousRun -or -not $CurrentRun) { return $true }
+    if ([string]$PreviousRun.finalCategory -ne "INVESTIGATION_INCONCLUSIVE") { return $true }
+    if ([string]$CurrentRun.finalCategory -ne "INVESTIGATION_INCONCLUSIVE") { return $true }
+
+    $previousSignature = Get-InvestigationEvidenceSignature -RunRecord $PreviousRun
+    $currentSignature = Get-InvestigationEvidenceSignature -RunRecord $CurrentRun
+    return ($previousSignature -ne $currentSignature)
+}
+
+function Get-ManualDebugReason {
+    param($Task)
+
+    $latestSummary = Get-NormalizedComparisonText -Text ([string]$Task.latestRun.summary)
+    $latestFeedback = Get-NormalizedComparisonText -Text ([string]$Task.latestRun.feedback)
+    if ($latestFeedback -match 'reached max turns') {
+        return "Repeated inconclusive investigation hit the same max-turn limit without new evidence."
+    }
+    if ($latestSummary -match 'reliable change path') {
+        return "Repeated inconclusive investigation could not identify a reliable change path."
+    }
+    return "Repeated inconclusive investigation produced no new evidence, so another cold retry would likely be blind."
+}
+
 function Get-RetryableResult {
     param(
         $Task,
@@ -1612,6 +1693,7 @@ function Get-RetryableResult {
         $Task.mergeState = ""
         $Task.merge.state = ""
         $Task.merge.reason = $Reason
+        $Task.manualDebugReason = ""
     } else {
         $Task.state = "completed_failed_terminal"
         $Task.retryScheduled = $false
@@ -1619,7 +1701,27 @@ function Get-RetryableResult {
         $Task.mergeState = "failed_terminal"
         $Task.merge.state = "failed_terminal"
         $Task.merge.reason = $Reason
+        $Task.manualDebugReason = ""
     }
+    $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
+}
+
+function Get-ManualDebugResult {
+    param(
+        $Task,
+        [string]$Reason
+    )
+
+    $Task.state = "manual_debug_needed"
+    $Task.retryScheduled = $false
+    $Task.waitingUserTest = $false
+    $Task.waveNumber = 0
+    $Task.blockedBy = @()
+    $Task.mergeState = ""
+    $Task.merge.state = ""
+    $Task.merge.reason = ""
+    $Task.merge.branchName = ""
+    $Task.manualDebugReason = if ($Reason) { [string]$Reason } else { "Repeated inconclusive investigation produced no new evidence." }
     $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
 }
 
@@ -1644,6 +1746,7 @@ function Get-EnvironmentRetryableResult {
     $Task.merge.state = ""
     $Task.merge.reason = [string]$Reason
     $Task.merge.branchName = ""
+    $Task.manualDebugReason = ""
 
     if ([int]$Task.environmentRepairAttemptsUsed -le [int]$Task.maxEnvironmentRepairAttempts) {
         $Task.state = "environment_retry_scheduled"
@@ -1669,6 +1772,7 @@ function Get-MergeRetryableResult {
         $Task.mergeState = "retry_scheduled"
         $Task.merge.state = "retry_scheduled"
         $Task.merge.reason = $Reason
+        $Task.manualDebugReason = ""
         return $true
     }
 
@@ -1853,6 +1957,8 @@ function Apply-PipelineResultToTask {
     Set-ObjectProperty -Object $Task.latestRun -Name "summary" -Value ([string]$PipelineResult.summary)
     Set-ObjectProperty -Object $Task.latestRun -Name "feedback" -Value ([string]$PipelineResult.feedback)
     Set-ObjectProperty -Object $Task.latestRun -Name "noChangeReason" -Value ([string]$PipelineResult.noChangeReason)
+    Set-ObjectProperty -Object $Task.latestRun -Name "investigationConclusion" -Value ([string]$PipelineResult.investigationConclusion)
+    Set-ObjectProperty -Object $Task.latestRun -Name "reproductionConfirmed" -Value ([bool]$PipelineResult.reproductionConfirmed)
     Set-ObjectProperty -Object $Task.latestRun -Name "actualFiles" -Value @(Normalize-StringArray -Value $PipelineResult.files)
     Set-ObjectProperty -Object $Task.latestRun -Name "branchName" -Value ([string]$PipelineResult.branch)
     Set-ObjectProperty -Object $Task.latestRun -Name "artifacts" -Value $PipelineResult.artifacts
@@ -1865,6 +1971,8 @@ function Apply-PipelineResultToTask {
         summary = [string]$PipelineResult.summary
         feedback = [string]$PipelineResult.feedback
         noChangeReason = [string]$PipelineResult.noChangeReason
+        investigationConclusion = [string]$PipelineResult.investigationConclusion
+        reproductionConfirmed = [bool]$PipelineResult.reproductionConfirmed
         actualFiles = @($PipelineResult.files)
         branchName = [string]$PipelineResult.branch
         resultFile = [string]$Task.latestRun.resultFile
@@ -1891,6 +1999,7 @@ function Apply-PipelineResultToTask {
             $Task.merge.state = "pending"
             $Task.merge.branchName = [string]$PipelineResult.branch
             $Task.merge.reason = ""
+            $Task.manualDebugReason = ""
         }
         "NO_CHANGE" {
             if ([string]$PipelineResult.finalCategory -eq "NO_CHANGE_ALREADY_SATISFIED") {
@@ -1899,11 +2008,20 @@ function Apply-PipelineResultToTask {
                 $Task.waitingUserTest = $false
                 $Task.mergeState = "no_change"
                 $Task.merge.state = "no_change"
+                $Task.manualDebugReason = ""
             } else {
                 Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
             }
         }
         "FAILED" {
+            if ([string]$PipelineResult.finalCategory -eq "INVESTIGATION_INCONCLUSIVE" -and $Task.runs.Count -ge 2) {
+                $currentRun = @($Task.runs)[-1]
+                $previousRun = @($Task.runs)[-2]
+                if ([string]$previousRun.finalCategory -eq "INVESTIGATION_INCONCLUSIVE" -and -not (Test-InvestigationRetryHasNewEvidence -PreviousRun $previousRun -CurrentRun $currentRun)) {
+                    Get-ManualDebugResult -Task $Task -Reason (Get-ManualDebugReason -Task $Task)
+                    break
+                }
+            }
             Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
         }
         default {
@@ -2034,6 +2152,7 @@ function New-TaskRecord {
         environmentRepairAttemptsUsed = 0
         environmentRepairAttemptsRemaining = 2
         lastEnvironmentFailureCategory = ""
+        manualDebugReason = ""
         maxMergeAttempts = 3
         mergeAttemptsUsed = 0
         mergeAttemptsRemaining = 3
@@ -2311,7 +2430,7 @@ function Get-SnapshotPayload {
             progress = $_.progress
         }
     })
-    $queuedTaskProgress = @($taskSnapshots | Where-Object { $_.state -in @("queued", "retry_scheduled", "environment_retry_scheduled", "merge_retry_scheduled") } | ForEach-Object {
+    $queuedTaskProgress = @($taskSnapshots | Where-Object { $_.state -in @("queued", "retry_scheduled", "environment_retry_scheduled", "manual_debug_needed", "merge_retry_scheduled") } | ForEach-Object {
         [pscustomobject]@{
             taskId = [string]$_.taskId
             taskText = [string]$_.taskText
@@ -2344,6 +2463,7 @@ function Get-SnapshotPayload {
         queuedTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "queued" } | ForEach-Object { [string]$_.taskId })
         retryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "retry_scheduled" } | ForEach-Object { [string]$_.taskId })
         environmentRetryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "environment_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+        manualDebugTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "manual_debug_needed" } | ForEach-Object { [string]$_.taskId })
         mergeRetryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "merge_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
         pendingMergeTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "pending_merge" } | ForEach-Object { [string]$_.taskId })
         startableTaskIds = @(Get-StartableTaskIds -State $State)
@@ -2455,8 +2575,12 @@ function Apply-Plan {
             if ($assignment.plannerMetadata) {
                 $task.plannerMetadata = $assignment.plannerMetadata
             }
-            if ($assignment.plannedState -and ([string]$task.state -in @("queued", "retry_scheduled", "environment_retry_scheduled"))) {
+            if ($assignment.plannedState -and ([string]$task.state -in @("queued", "retry_scheduled", "environment_retry_scheduled", "manual_debug_needed"))) {
                 $task.state = [string]$assignment.plannedState
+            }
+            if ([string]$task.state -eq "manual_debug_needed" -and [int]$task.waveNumber -gt 0 -and -not $assignment.plannedState) {
+                $task.state = "queued"
+                $task.retryScheduled = $false
             }
             Update-TaskUsageEstimate -State $state -Task $task
             Write-TaskResultFile -Task $task
@@ -2543,6 +2667,7 @@ function Run-Task {
         $task.state = "running"
         $task.retryScheduled = $false
         $task.waitingUserTest = $false
+        $task.manualDebugReason = ""
         $task.mergeState = ""
         $task.mergeAttemptsUsed = 0
         $task.mergeAttemptsRemaining = [int]$task.maxMergeAttempts
@@ -2733,6 +2858,13 @@ function Run-Task {
             Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "environment_retry_scheduled" -Message "Task will retry after recreating the execution environment." -Data @{
                 finalCategory = [string]$task.latestRun.finalCategory
                 state = [string]$task.state
+            }
+        }
+        if ([string]$task.state -eq "manual_debug_needed") {
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "manual_debug_needed" -Message "Task paused because repeated inconclusive investigation produced no new evidence." -Data @{
+                finalCategory = [string]$task.latestRun.finalCategory
+                manualDebugReason = [string]$task.manualDebugReason
+                attemptsUsed = [int]$task.attemptsUsed
             }
         }
         if ($task.plannerFeedback.predictionEvaluated) {
@@ -2947,7 +3079,7 @@ function Admin-Edit-Task {
             throw "Task '$taskId' was not found."
         }
 
-        foreach ($field in @("state", "waveNumber", "retryScheduled", "waitingUserTest", "mergeState", "attemptsUsed", "attemptsRemaining", "mergeAttemptsUsed", "mergeAttemptsRemaining")) {
+        foreach ($field in @("state", "waveNumber", "retryScheduled", "waitingUserTest", "mergeState", "attemptsUsed", "attemptsRemaining", "mergeAttemptsUsed", "mergeAttemptsRemaining", "manualDebugReason")) {
             if ($null -ne $updates.$field) {
                 Set-ObjectProperty -Object $task -Name $field -Value $updates.$field
             }

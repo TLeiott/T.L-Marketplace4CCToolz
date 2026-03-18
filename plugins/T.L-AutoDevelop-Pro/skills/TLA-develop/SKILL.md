@@ -141,6 +141,7 @@ The planner input must include:
 - all running tasks
 - all queued tasks
 - all retry-scheduled tasks
+- any `manual_debug_needed` tasks
 - all pending-merge tasks
 - the newly added tasks
 - recent planner feedback from the queue snapshot
@@ -187,6 +188,7 @@ Report to the user:
 - which startable tasks were deferred because they did not fit the projected 5h budget
 - which tasks were queued
 - which tasks are retry-scheduled
+- which tasks are paused as `manual_debug_needed`
 - whether the circuit breaker is open
 - the projected queue cost from `usageProjection`
 - the launch-gate numbers for this wave:
@@ -245,6 +247,8 @@ Treat these task states as retryable scheduled work:
 - inconclusive outcomes
 - merge conflicts
 - build failures during merge preparation
+
+If a task enters `manual_debug_needed`, do not treat it as an ordinary scheduled retry. Report that repeated inconclusive investigation produced no new evidence and that the task now waits for repo changes, replanning, or explicit requeue.
 
 Each task gets at most 3 full attempts.
 
