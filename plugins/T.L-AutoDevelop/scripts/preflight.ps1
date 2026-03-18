@@ -56,6 +56,36 @@ $runSummary = [ordered]@{
     startedAt = (Get-Date).ToString('o')
 }
 
+if (-not (Test-Path -LiteralPath $SolutionPath -ErrorAction SilentlyContinue)) {
+    $blocker = @{
+        check = "environment"
+        file = $SolutionPath
+        message = "Solution path does not exist in the current worktree."
+        suggestion = "Recreate the worktree and rerun the worker."
+    }
+    $result = @{
+        passed = $false
+        blockers = @($blocker)
+        warnings = @()
+        environmentFailure = $true
+        environmentCategory = "SOLUTION_PATH_MISSING"
+        environmentDetails = @{
+            solutionPath = $SolutionPath
+            solutionExists = $false
+            currentDirectory = (Get-Location).Path
+        }
+    }
+    $runSummary.completedAt = (Get-Date).ToString('o')
+    $runSummary.passed = $false
+    $runSummary.blockers = @($blocker)
+    $runSummary.warnings = @()
+    $runSummary.environmentFailure = $true
+    $runSummary.environmentCategory = "SOLUTION_PATH_MISSING"
+    Save-DebugJson -Object $runSummary | Out-Null
+    $result | ConvertTo-Json -Depth 6
+    return
+}
+
 # Add blocker and warning entries with optional line and suggestion metadata
 function Add-Blocker($check, $file, $message, [int]$line = 0, [string]$suggestion = "") {
     $entry = @{ check = $check; file = $file; message = $message }

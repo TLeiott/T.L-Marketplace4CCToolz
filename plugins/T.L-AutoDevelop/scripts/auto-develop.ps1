@@ -193,6 +193,97 @@ function Add-TimelineEvent {
     })
 }
 
+function Test-WorktreeEnvironment {
+    param(
+        [string]$WorktreePath,
+        [string]$SolutionPath,
+        [string]$RepoRoot = "",
+        [string]$Phase = ""
+    )
+
+    $worktreeExists = [bool]($WorktreePath -and (Test-Path -LiteralPath $WorktreePath -ErrorAction SilentlyContinue))
+    $gitMarkerPath = if ($WorktreePath) { Join-Path $WorktreePath ".git" } else { "" }
+    $gitMarkerExists = [bool]($gitMarkerPath -and (Test-Path -LiteralPath $gitMarkerPath -ErrorAction SilentlyContinue))
+    $solutionExists = [bool]($SolutionPath -and (Test-Path -LiteralPath $SolutionPath -ErrorAction SilentlyContinue))
+    $currentLocation = (Get-Location).Path
+    $cwdInsideWorktree = $false
+    if ($WorktreePath) {
+        try {
+            $fullWorktreePath = [System.IO.Path]::GetFullPath($WorktreePath)
+            $fullCurrentLocation = [System.IO.Path]::GetFullPath($currentLocation)
+            $cwdInsideWorktree = $fullCurrentLocation.StartsWith($fullWorktreePath, [System.StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            $cwdInsideWorktree = $false
+        }
+    }
+
+    $topLevelEntries = @()
+    if ($worktreeExists) {
+        try {
+            $topLevelEntries = @(Get-ChildItem -LiteralPath $WorktreePath -Force -ErrorAction Stop | Select-Object -ExpandProperty Name)
+        } catch {
+            $topLevelEntries = @()
+        }
+    }
+    $nonGitTopLevelEntries = @($topLevelEntries | Where-Object { $_ -ne ".git" })
+    $looksEmpty = $worktreeExists -and $nonGitTopLevelEntries.Count -eq 0
+
+    $isValid = $worktreeExists -and $gitMarkerExists -and $solutionExists -and ($looksEmpty -eq $false)
+    return [pscustomobject]@{
+        isValid = [bool]$isValid
+        phase = [string]$Phase
+        repoRoot = [string]$RepoRoot
+        worktreePath = [string]$WorktreePath
+        solutionPath = [string]$SolutionPath
+        gitMarkerPath = [string]$gitMarkerPath
+        worktreeExists = [bool]$worktreeExists
+        gitMarkerExists = [bool]$gitMarkerExists
+        solutionExists = [bool]$solutionExists
+        worktreeLooksEmpty = [bool]$looksEmpty
+        currentLocation = [string]$currentLocation
+        cwdInsideWorktree = [bool]$cwdInsideWorktree
+        topLevelEntries = @($topLevelEntries | Select-Object -First 12)
+    }
+}
+
+function Resolve-WorktreeEnvironmentFailureCategory {
+    param($Validation)
+
+    if (-not $Validation.worktreeExists -or -not $Validation.gitMarkerExists -or [bool]$Validation.worktreeLooksEmpty) {
+        return "WORKTREE_INVALID"
+    }
+    if (-not $Validation.solutionExists) {
+        return "SOLUTION_PATH_MISSING"
+    }
+    return "WORKTREE_ENVIRONMENT_ERROR"
+}
+
+function Fail-WorktreeEnvironment {
+    param(
+        $Validation,
+        [string]$Phase,
+        [string]$Summary = ""
+    )
+
+    $script:currentPhase = if ($Phase) { $Phase } else { $script:currentPhase }
+    $category = Resolve-WorktreeEnvironmentFailureCategory -Validation $Validation
+    $message = if ($Summary) { $Summary } else { "The worker environment is invalid for phase $Phase." }
+    $details = ($Validation | ConvertTo-Json -Depth 6)
+    Add-TimelineEvent -Phase $script:currentPhase -Message "Worktree environment validation failed." -Category $category -Data @{
+        worktreePath = [string]$Validation.worktreePath
+        solutionPath = [string]$Validation.solutionPath
+        worktreeExists = [bool]$Validation.worktreeExists
+        gitMarkerExists = [bool]$Validation.gitMarkerExists
+        solutionExists = [bool]$Validation.solutionExists
+        worktreeLooksEmpty = [bool]$Validation.worktreeLooksEmpty
+    }
+    $script:finalStatus = "ERROR"
+    $script:finalCategory = $category
+    $script:finalSummary = $message
+    $script:finalFeedback = $details
+    throw [System.Exception]::new("TERMINAL_$category")
+}
+
 function New-EmptyReproductionTests {
     return [ordered]@{
         testProjects = @()
@@ -2239,6 +2330,10 @@ try {
     $targetUri = [System.Uri]::new($SolutionPath)
     $relSln = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
     $worktreeSln = Join-Path $worktreePath $relSln
+    $initialWorktreeValidation = Test-WorktreeEnvironment -WorktreePath $worktreePath -SolutionPath $worktreeSln -RepoRoot $repoRoot -Phase "WORKTREE"
+    if (-not $initialWorktreeValidation.isValid) {
+        Fail-WorktreeEnvironment -Validation $initialWorktreeValidation -Phase "WORKTREE" -Summary "The created worktree is invalid before the pipeline can continue."
+    }
     Write-DebugManifest
     Write-SchedulerSnapshot
 
@@ -3139,6 +3234,10 @@ SUMMARY:
                 $targetedVerificationPassed = $true
             }
             $currentPhase = "PREFLIGHT"
+            $preflightValidation = Test-WorktreeEnvironment -WorktreePath $worktreePath -SolutionPath $worktreeSln -RepoRoot $repoRoot -Phase "PREFLIGHT"
+            if (-not $preflightValidation.isValid) {
+                Fail-WorktreeEnvironment -Validation $preflightValidation -Phase "PREFLIGHT" -Summary "The worktree became invalid before preflight validation."
+            }
             Write-Host "[PREFLIGHT] Cycle $cycleLabel..."
             $pfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflightScript, "-SolutionPath", $worktreeSln)
             $preflightDebugDir = Join-Path (Ensure-DebugDir) "preflight\$cycleLabel"
@@ -3158,6 +3257,17 @@ SUMMARY:
             }
 
             if (-not $preflight.passed) {
+                if ($preflight.environmentFailure) {
+                    $environmentCategory = if ($preflight.environmentCategory) { [string]$preflight.environmentCategory } else { "WORKTREE_ENVIRONMENT_ERROR" }
+                    $environmentFeedback = if ($preflight.environmentDetails) { ($preflight.environmentDetails | ConvertTo-Json -Depth 6) } else { $preflightJson }
+                    Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "PREFLIGHT" -Category $environmentCategory -Feedback $environmentFeedback
+                    Add-TimelineEvent -Phase "PREFLIGHT" -Message "Preflight detected an invalid worker environment." -Category $environmentCategory
+                    $finalStatus = "ERROR"
+                    $finalCategory = $environmentCategory
+                    $finalSummary = "Preflight could not run against a valid solution path in the current worktree."
+                    $finalFeedback = $environmentFeedback
+                    throw [System.Exception]::new("TERMINAL_$environmentCategory")
+                }
                 $blockerText = ($preflight.blockers | ForEach-Object {
                     $entry = "- [$($_.check)] $($_.file)"
                     if ($_.line) { $entry += " L$($_.line)" }
@@ -3353,6 +3463,10 @@ SUMMARY:
     Write-PipelineLog -RepoRoot $repoRoot -Task $taskLine -Status $finalStatus -FinalCategory $finalCategory -FailureReasons $failureReasons -Files $changedFiles
 
     if ($finalStatus -eq "ACCEPTED") {
+        $finalizeValidation = Test-WorktreeEnvironment -WorktreePath $worktreePath -SolutionPath $worktreeSln -RepoRoot $repoRoot -Phase "FINALIZE"
+        if (-not $finalizeValidation.isValid) {
+            Fail-WorktreeEnvironment -Validation $finalizeValidation -Phase "FINALIZE" -Summary "The worktree became invalid before the final commit."
+        }
         Invoke-NativeCommand git @("-C", $worktreePath, "add", "-A") | Out-Null
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null

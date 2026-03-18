@@ -408,6 +408,198 @@ function Test-CompletedAtRoundTrip {
     }
 }
 
+function Test-EnvironmentFailureRefundsAttempts {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-env-attempt-1-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ERROR"
+            finalCategory = "WORKTREE_INVALID"
+            summary = "worktree missing"
+            feedback = "The worktree is empty."
+            noChangeReason = ""
+            files = @()
+            branch = ""
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-env"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "environment broken"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-env.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-env-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).ToString("o")
+                        completedAt = ""
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-env" })[0]
+        Assert-True ([string]$task.state -eq "environment_retry_scheduled") "Environment failures should enter environment_retry_scheduled."
+        Assert-True ([int]$task.attemptsUsed -eq 0) "Environment failures should refund the consumed task attempt."
+        Assert-True ([int]$task.environmentRepairAttemptsUsed -eq 1) "Environment repair budget should be consumed."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKTREE_INVALID") "Environment failure category should be preserved."
+        Assert-True ([int]$task.waveNumber -eq 0) "Environment retries should detach from their original wave."
+        Assert-True (@($task.blockedBy).Count -eq 0) "Environment retries should clear stale dependency blockers."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-EnvironmentRetryDoesNotBecomeDirectlyStartable {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-merge-ready"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "merge ready"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-merge-ready.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = New-TestLatestRun -AttemptNumber 1 -TaskName "develop-task-merge-ready-a1" -ResultFile (Join-Path $repo.tasksDir "merge-ready-result.json") -StartedAt ((Get-Date).ToString("o"))
+                    runs = @()
+                    merge = [pscustomobject]@{ state = "pending"; preparedAt = ""; commitMessage = ""; commitSha = ""; reason = ""; branchName = "auto/merge-ready" }
+                },
+                [pscustomobject]@{
+                    taskId = "task-env"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "environment detached"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-env.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKTREE_INVALID"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = New-TestLatestRun -AttemptNumber 1 -TaskName "develop-task-env-a1" -ResultFile (Join-Path $repo.tasksDir "env-result.json") -StartedAt ((Get-Date).ToString("o"))
+                    runs = @()
+                    merge = New-TestMergeRecord
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.nextMergeTaskId -eq "task-merge-ready") "Detached environment retries must not block merge readiness."
+        Assert-True (@($snapshot.startableTaskIds).Count -eq 0) "Detached environment retries must not become directly startable."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts {
+    $prefix = "develop"
+    $token = "taskabcd"
+    $attemptsUsed = 0
+    $workerLaunchSequence = 2
+    $taskName = "$prefix-$token-a$workerLaunchSequence"
+    $resultPath = "task-1-launch-$workerLaunchSequence-result.json"
+
+    Assert-True ($attemptsUsed -eq 0) "Attempt refund scenario should allow zero consumed normal attempts."
+    Assert-True ($taskName -eq "develop-taskabcd-a2") "Worker identity must come from launch sequence, not refunded attempts."
+    Assert-True ($resultPath -eq "task-1-launch-2-result.json") "Result artifacts must use launch sequence naming."
+}
+
+function Test-PreflightMissingSolutionIsEnvironmentFailure {
+    $repo = New-TestRepo
+    try {
+        $missingSolution = Join-Path $repo.root "Missing.slnx"
+        $scriptPath = 'D:\Repos\T.L-Marketplace\plugins\T.L-AutoDevelop\scripts\preflight.ps1'
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -SolutionPath $missingSolution
+        $result = ($raw | Out-String | ConvertFrom-Json)
+        Assert-True ($result.passed -eq $false) "Missing solution path should fail preflight."
+        Assert-True ($result.environmentFailure -eq $true) "Missing solution path should be marked as environment failure."
+        Assert-True ([string]$result.environmentCategory -eq "SOLUTION_PATH_MISSING") "Preflight should classify missing solution paths explicitly."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-SnapshotResilience {
     $repo = New-TestRepo
     try {
@@ -2048,6 +2240,10 @@ function Test-AdminEditTask {
 
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
+Test-EnvironmentFailureRefundsAttempts
+Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
+Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
+Test-PreflightMissingSolutionIsEnvironmentFailure
 Test-SnapshotResilience
 Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-BlockedByNormalization
