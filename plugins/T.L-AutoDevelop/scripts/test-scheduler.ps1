@@ -116,6 +116,21 @@ function Invoke-SchedulerJson {
     return ($raw | Out-String | ConvertFrom-Json)
 }
 
+function Get-TestGitDir {
+    param([string]$RepoRoot)
+
+    Push-Location $RepoRoot
+    try {
+        $gitDir = (& git rev-parse --git-dir | Out-String).Trim()
+        if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+            $gitDir = Join-Path $RepoRoot $gitDir
+        }
+        return [System.IO.Path]::GetFullPath($gitDir)
+    } finally {
+        Pop-Location
+    }
+}
+
 function Get-FunctionDefinitionText {
     param(
         [string]$ScriptPath,
@@ -3351,6 +3366,451 @@ function Test-AdminEditTaskReturnsIntegrityWarnings {
     }
 }
 
+function Test-PrepareEnvironmentReportsReadyOnCleanState {
+    $repo = New-TestRepo
+    try {
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ($result.ready -eq $true) "prepare-environment should mark a clean repo as ready."
+        Assert-True ([string]$result.status -eq "ready") "Clean state should report ready status."
+        Assert-True (@($result.cleanupActions).Count -eq 0) "Clean state should not perform cleanup."
+        Assert-True ($result.snapshot.schedulerHealthy -eq $true) "Prepare should return a healthy post-prepare snapshot."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentBlocksDirtyRepository {
+    $repo = New-TestRepo
+    try {
+        Set-Content -LiteralPath (Join-Path $repo.root "dirty.txt") -Value "dirty" -Encoding UTF8
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ($result.ready -eq $false) "Dirty repo should block prepare-environment."
+        Assert-True ([string]$result.status -eq "blocked") "Dirty repo should report blocked status."
+        Assert-True (@($result.dirtyFiles).Count -gt 0) "Dirty repo should surface dirty files."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentBlocksUnresolvedGitOperation {
+    $repo = New-TestRepo
+    try {
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        Set-Content -LiteralPath (Join-Path $gitDir "MERGE_HEAD") -Value ("1" * 40) -Encoding ASCII
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ($result.ready -eq $false) "Unresolved merge state should block prepare-environment."
+        Assert-True ([string]$result.status -eq "blocked") "Unresolved merge state should report blocked status."
+        Assert-True (@($result.repoState.operationBlockers).Count -gt 0) "Prepare should surface git operation blockers."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentCleansStaleAutoDevelopRemnants {
+    $repo = New-TestRepo
+    $worktreePath = $null
+    try {
+        Push-Location $repo.root
+        try {
+            git branch "auto/stale-prepared" | Out-Null
+        } finally {
+            Pop-Location
+        }
+
+        $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
+        New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
+        $worktreePath = Join-Path $worktreeBase ("stale-prepare-" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $worktreePath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $worktreePath "orphan.txt") -Value "orphan" -Encoding UTF8
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        $fakeGitPointer = "gitdir: {0}" -f (Join-Path $gitDir "worktrees\stale-prepare")
+        Set-Content -LiteralPath (Join-Path $worktreePath ".git") -Value $fakeGitPointer -Encoding UTF8
+
+        $orphanRunDir = Join-Path $repo.root ".claude-develop-logs\runs\stale-prepare-artifact"
+        New-Item -ItemType Directory -Path $orphanRunDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $orphanRunDir "timeline.json") -Value "{}" -Encoding UTF8
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ($result.ready -eq $true) "Stale AutoDevelop remnants should be cleaned without blocking prepare."
+        Assert-True ([string]$result.status -eq "cleaned") "Cleanup should report cleaned status."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_branch" }).Count) -eq 1) "Prepare should remove stale merged auto branches."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_worktree" }).Count) -eq 1) "Prepare should remove orphaned AutoDevelop worktree directories."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_run_artifact" }).Count) -eq 1) "Prepare should remove orphaned run artifact directories."
+
+        Push-Location $repo.root
+        try {
+            $branchList = (& git branch --format "%(refname:short)" --list "auto/stale-prepared" | Out-String).Trim()
+            Assert-True (-not $branchList) "Stale auto branch should be deleted."
+        } finally {
+            Pop-Location
+        }
+        Assert-True (-not (Test-Path -LiteralPath $worktreePath)) "Orphaned AutoDevelop worktree should be deleted."
+        Assert-True (-not (Test-Path -LiteralPath $orphanRunDir)) "Orphaned run artifact dir should be deleted."
+    } finally {
+        if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+            Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentCleansHistoricalOnlyBranchAndArtifacts {
+    $repo = New-TestRepo
+    $worktreePath = $null
+    try {
+        $taskName = "develop-historycleanup-a1"
+        $branchName = "auto/history-cleanup-a1"
+
+        Push-Location $repo.root
+        try {
+            git branch $branchName | Out-Null
+        } finally {
+            Pop-Location
+        }
+
+        $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
+        New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
+        $worktreePath = Join-Path $worktreeBase $taskName
+        New-Item -ItemType Directory -Path $worktreePath -Force | Out-Null
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        $fakeGitPointer = "gitdir: {0}" -f (Join-Path $gitDir "worktrees\history-cleanup")
+        Set-Content -LiteralPath (Join-Path $worktreePath ".git") -Value $fakeGitPointer -Encoding UTF8
+
+        $orphanRunDir = Join-Path $repo.root (".claude-develop-logs\\runs\\" + $taskName)
+        New-Item -ItemType Directory -Path $orphanRunDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $orphanRunDir "timeline.json") -Value "{}" -Encoding UTF8
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "historical-cleanup"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "completed task"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "historical-cleanup.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "merged"
+                    state = "merged"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "" -ResultFile (Join-Path $repo.resultsDir "historical-cleanup.json"))
+                    runs = @(
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = $taskName
+                            finalStatus = "ACCEPTED"
+                            finalCategory = "IMPLEMENTED"
+                            summary = ""
+                            feedback = ""
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $true
+                            actualFiles = @("src/File.cs")
+                            branchName = $branchName
+                            resultFile = "historical-result.json"
+                            completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                            artifacts = $null
+                        }
+                    )
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ([string]$result.status -eq "cleaned") "Historical-only leftovers should be cleanup-eligible."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_branch" }).Count) -eq 1) "Historical-only auto branch should be removed."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_worktree" }).Count) -eq 1) "Historical-only worktree should be removed."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_run_artifact" }).Count) -eq 1) "Historical-only artifact dir should be removed."
+    } finally {
+        if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+            Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentPreservesRunningLaunchArtifactsAndBranch {
+    $repo = New-TestRepo
+    $worktreePath = $null
+    $sleepProcess = $null
+    try {
+        $taskName = "develop-activecleanup-a1"
+        $branchName = "auto/active-cleanup-a1"
+
+        Push-Location $repo.root
+        try {
+            git branch $branchName | Out-Null
+        } finally {
+            Pop-Location
+        }
+
+        $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
+        New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
+        $worktreePath = Join-Path $worktreeBase $taskName
+        New-Item -ItemType Directory -Path $worktreePath -Force | Out-Null
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        $fakeGitPointer = "gitdir: {0}" -f (Join-Path $gitDir "worktrees\active-cleanup")
+        Set-Content -LiteralPath (Join-Path $worktreePath ".git") -Value $fakeGitPointer -Encoding UTF8
+
+        $runDir = Join-Path $repo.root (".claude-develop-logs\\runs\\" + $taskName)
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $runDir "timeline.json") -Value "{}" -Encoding UTF8
+
+        $sleepProcess = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 30") -PassThru -WindowStyle Hidden
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "active-cleanup"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "running task"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "active-cleanup.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName $taskName -ResultFile (Join-Path $repo.resultsDir "active-cleanup.json") -ProcessId $sleepProcess.Id)
+                    runs = @(
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = $taskName
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = ""
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @("src/File.cs")
+                            branchName = $branchName
+                            resultFile = "active-result.json"
+                            completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                            artifacts = $null
+                        }
+                    )
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $state = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $state.tasks[0].latestRun.branchName = $branchName
+        Write-StateFile -StateFile $repo.stateFile -State $state
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ([string]$result.status -eq "warning" -or [string]$result.status -eq "ready") "Running launch artifacts and branch should not be cleaned."
+        Assert-True ((@($result.cleanupActions).Count) -eq 0) "Prepare should not clean the currently running branch/worktree/artifact."
+        Push-Location $repo.root
+        try {
+            $branchList = (& git branch --format "%(refname:short)" --list $branchName | Out-String).Trim()
+            Assert-True ([string]$branchList -eq $branchName) "Active auto branch should be preserved."
+        } finally {
+            Pop-Location
+        }
+        Assert-True (Test-Path -LiteralPath $worktreePath) "Active worktree should be preserved."
+        Assert-True (Test-Path -LiteralPath $runDir) "Active run artifact dir should be preserved."
+    } finally {
+        if ($sleepProcess -and -not $sleepProcess.HasExited) {
+            Stop-Process -Id $sleepProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+            Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentCleansRetryScheduledLaunchArtifactsButPreservesNoBranchByDefault {
+    $repo = New-TestRepo
+    $worktreePath = $null
+    try {
+        $taskName = "develop-retryleftover-a1"
+        $branchName = "auto/retry-leftover-a1"
+
+        Push-Location $repo.root
+        try {
+            git branch $branchName | Out-Null
+        } finally {
+            Pop-Location
+        }
+
+        $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
+        New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
+        $worktreePath = Join-Path $worktreeBase $taskName
+        New-Item -ItemType Directory -Path $worktreePath -Force | Out-Null
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        $fakeGitPointer = "gitdir: {0}" -f (Join-Path $gitDir "worktrees\retry-leftover")
+        Set-Content -LiteralPath (Join-Path $worktreePath ".git") -Value $fakeGitPointer -Encoding UTF8
+
+        $runDir = Join-Path $repo.root (".claude-develop-logs\\runs\\" + $taskName)
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $runDir "timeline.json") -Value "{}" -Encoding UTF8
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "retry-leftover"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "retry task"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "retry-leftover.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName $taskName -ResultFile (Join-Path $repo.resultsDir "retry-leftover.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $state = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $state.tasks[0].latestRun.branchName = $branchName
+        Write-StateFile -StateFile $repo.stateFile -State $state
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_worktree" }).Count) -eq 1) "Retry-scheduled tasks should not protect old worktree leftovers."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_run_artifact" }).Count) -eq 1) "Retry-scheduled tasks should not protect old run artifacts."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_branch" }).Count) -eq 1) "Retry-scheduled tasks should not protect stale old branches by default."
+    } finally {
+        if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+            Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArtifacts {
+    $repo = New-TestRepo
+    $worktreePath = $null
+    try {
+        $taskName = "develop-pendingmerge-a1"
+        $branchName = "auto/pending-merge-a1"
+
+        Push-Location $repo.root
+        try {
+            git branch $branchName | Out-Null
+        } finally {
+            Pop-Location
+        }
+
+        $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
+        New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
+        $worktreePath = Join-Path $worktreeBase $taskName
+        New-Item -ItemType Directory -Path $worktreePath -Force | Out-Null
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        $fakeGitPointer = "gitdir: {0}" -f (Join-Path $gitDir "worktrees\pending-merge")
+        Set-Content -LiteralPath (Join-Path $worktreePath ".git") -Value $fakeGitPointer -Encoding UTF8
+
+        $runDir = Join-Path $repo.root (".claude-develop-logs\\runs\\" + $taskName)
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $runDir "timeline.json") -Value "{}" -Encoding UTF8
+
+        $merge = New-TestMergeRecord
+        $merge.branchName = $branchName
+        $merge.state = "pending"
+        $merge.reason = ""
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "pending-merge-leftover"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "pending merge"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "pending-merge-leftover.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName $taskName -ResultFile (Join-Path $repo.resultsDir "pending-merge-leftover.json"))
+                    runs = @()
+                    merge = $merge
+                }
+            )
+        })
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_branch" }).Count) -eq 0) "Pending-merge branch must be preserved."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_auto_worktree" }).Count) -eq 1) "Pending-merge state should not protect old worktree leftovers."
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_run_artifact" }).Count) -eq 1) "Pending-merge state should not protect old run artifacts."
+    } finally {
+        if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+            Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-EnvironmentFailureRefundsAttempts
@@ -3393,5 +3853,13 @@ Test-AdminEditTask
 Test-RunHistoryCapturesLaunchSequence
 Test-StateIntegrityWarnsOnDuplicateLaunchSequence
 Test-AdminEditTaskReturnsIntegrityWarnings
+Test-PrepareEnvironmentReportsReadyOnCleanState
+Test-PrepareEnvironmentBlocksDirtyRepository
+Test-PrepareEnvironmentBlocksUnresolvedGitOperation
+Test-PrepareEnvironmentCleansStaleAutoDevelopRemnants
+Test-PrepareEnvironmentCleansHistoricalOnlyBranchAndArtifacts
+Test-PrepareEnvironmentPreservesRunningLaunchArtifactsAndBranch
+Test-PrepareEnvironmentCleansRetryScheduledLaunchArtifactsButPreservesNoBranchByDefault
+Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArtifacts
 
 Write-Host "Scheduler regression checks passed."

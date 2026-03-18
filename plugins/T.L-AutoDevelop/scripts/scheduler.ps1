@@ -1,6 +1,6 @@
 # scheduler.ps1 -- Repo-scoped queue scheduler for AutoDevelop v4
 param(
-    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge", "admin-edit-task", "admin-clear-breaker")][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge", "admin-edit-task", "admin-clear-breaker", "prepare-environment")][string]$Mode,
     [string]$SolutionPath = "",
     [string]$TasksFile = "",
     [string]$PlanFile = "",
@@ -117,6 +117,22 @@ function Get-CanonicalRepoRoot {
     return (Get-CanonicalPath -Path $result.output)
 }
 
+function Get-GitDirPath {
+    param([string]$RepoRoot)
+
+    $result = Invoke-NativeCommand -Command "git" -Arguments @("rev-parse", "--git-dir") -WorkingDirectory $RepoRoot
+    if ($result.exitCode -ne 0 -or -not $result.output) {
+        throw "Could not resolve the git directory for '$RepoRoot'."
+    }
+
+    $gitDir = [string]$result.output
+    if (-not [System.IO.Path]::IsPathRooted($gitDir)) {
+        $gitDir = Join-Path $RepoRoot $gitDir
+    }
+
+    return (Get-CanonicalPath -Path $gitDir)
+}
+
 function Get-StatePaths {
     param([string]$RepoRoot)
     $baseDir = Join-Path $RepoRoot ".claude-develop-logs\scheduler"
@@ -128,6 +144,10 @@ function Get-StatePaths {
         tasksDir = Join-Path $baseDir "tasks"
         resultsDir = Join-Path $baseDir "results"
     }
+}
+
+function Get-AutoDevelopWorktreeBase {
+    return (Join-Path $env:TEMP "claude-worktrees")
 }
 
 function New-EmptyState {
@@ -1842,6 +1862,62 @@ function Get-KnownBranches {
     )
 }
 
+function Get-KnownTaskNames {
+    param($State)
+
+    return @(
+        @((Get-Tasks -State $State) | ForEach-Object {
+            if ($_.latestRun.taskName) { [string]$_.latestRun.taskName }
+            foreach ($run in @($_.runs)) {
+                if ($run.taskName) { [string]$run.taskName }
+            }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
+}
+
+function Is-PrepareProtectedBranchState {
+    param([string]$State)
+
+    return $State -in @(
+        "running",
+        "pending_merge",
+        "merge_retry_scheduled",
+        "merge_prepared",
+        "waiting_user_test"
+    )
+}
+
+function Is-PrepareProtectedLaunchArtifactState {
+    param([string]$State)
+
+    return $State -eq "running"
+}
+
+function Get-PrepareProtectedBranchReferences {
+    param($State)
+
+    return @(
+        @((Get-Tasks -State $State) | Where-Object {
+            Is-PrepareProtectedBranchState -State ([string]$_.state)
+        } | ForEach-Object {
+            if ($_.merge.branchName) { [string]$_.merge.branchName }
+            elseif ($_.latestRun.branchName) { [string]$_.latestRun.branchName }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
+}
+
+function Get-PrepareProtectedLaunchArtifactReferences {
+    param($State)
+
+    return @(
+        @((Get-Tasks -State $State) | Where-Object {
+            Is-PrepareProtectedLaunchArtifactState -State ([string]$_.state)
+        } | ForEach-Object {
+            if ($_.latestRun.taskName) { [string]$_.latestRun.taskName }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
+}
+
 function Get-UnknownAutoBranches {
     param(
         [string]$RepoRoot,
@@ -1858,10 +1934,173 @@ function Get-UnknownAutoBranches {
     )
 }
 
+function Get-CurrentBranchName {
+    param([string]$RepoRoot)
+
+    $result = Invoke-NativeCommand -Command "git" -Arguments @("branch", "--show-current") -WorkingDirectory $RepoRoot
+    if ($result.exitCode -ne 0) { return "" }
+    return ([string]$result.output).Trim()
+}
+
+function Get-GitWorktreeEntries {
+    param([string]$RepoRoot)
+
+    $result = Invoke-NativeCommand -Command "git" -Arguments @("worktree", "list", "--porcelain") -WorkingDirectory $RepoRoot
+    if ($result.exitCode -ne 0 -or -not $result.output) {
+        return @()
+    }
+
+    $entries = [System.Collections.ArrayList]::new()
+    $current = $null
+    foreach ($line in @($result.output -split "\r?\n")) {
+        $trimmed = [string]$line
+        if (-not $trimmed) {
+            if ($current) {
+                [void]$entries.Add([pscustomobject]$current)
+                $current = $null
+            }
+            continue
+        }
+
+        if ($trimmed.StartsWith("worktree ")) {
+            if ($current) {
+                [void]$entries.Add([pscustomobject]$current)
+            }
+            $current = [ordered]@{
+                path = Get-CanonicalPath -Path ($trimmed.Substring(9).Trim())
+                branch = ""
+                head = ""
+                bare = $false
+                detached = $false
+            }
+            continue
+        }
+
+        if (-not $current) { continue }
+        if ($trimmed.StartsWith("branch ")) {
+            $current.branch = ($trimmed.Substring(7).Trim() -replace '^refs/heads/', '')
+        } elseif ($trimmed.StartsWith("HEAD ")) {
+            $current.head = $trimmed.Substring(5).Trim()
+        } elseif ($trimmed -eq "bare") {
+            $current.bare = $true
+        } elseif ($trimmed -eq "detached") {
+            $current.detached = $true
+        }
+    }
+
+    if ($current) {
+        [void]$entries.Add([pscustomobject]$current)
+    }
+
+    return @($entries)
+}
+
+function Get-UnknownAutoWorktrees {
+    param(
+        [string]$RepoRoot,
+        [string[]]$KnownTaskNames,
+        [object[]]$GitWorktreeEntries
+    )
+
+    $worktreeBase = Get-AutoDevelopWorktreeBase
+    if (-not (Test-Path -LiteralPath $worktreeBase)) {
+        return @()
+    }
+
+    $registeredPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($GitWorktreeEntries)) {
+        if ($entry.path) {
+            [void]$registeredPaths.Add((Get-CanonicalPath -Path ([string]$entry.path)))
+        }
+    }
+
+    $gitDir = Get-GitDirPath -RepoRoot $RepoRoot
+    $worktreesMarker = (Join-Path $gitDir "worktrees").Replace("/", "\")
+
+    return @(
+        @(Get-ChildItem -LiteralPath $worktreeBase -Directory -ErrorAction SilentlyContinue | Where-Object {
+            $name = [string]$_.Name
+            $fullPath = Get-CanonicalPath -Path $_.FullName
+            $gitPointerPath = Join-Path $_.FullName ".git"
+            $gitPointerContent = if (Test-Path -LiteralPath $gitPointerPath) {
+                try { [System.IO.File]::ReadAllText($gitPointerPath) } catch { "" }
+            } else {
+                ""
+            }
+            $isRepoOwned = $gitPointerContent -and (($gitPointerContent.Replace("/", "\")).IndexOf($worktreesMarker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+            $isRepoOwned -and ($KnownTaskNames -notcontains $name) -and (-not $registeredPaths.Contains($fullPath))
+        } | ForEach-Object {
+            [pscustomobject]@{
+                name = [string]$_.Name
+                path = [string]$_.FullName
+            }
+        })
+    )
+}
+
+function Get-OrphanedRunArtifacts {
+    param(
+        [string]$RepoRoot,
+        [string[]]$KnownTaskNames
+    )
+
+    $runsRoot = Join-Path $RepoRoot ".claude-develop-logs\runs"
+    if (-not (Test-Path -LiteralPath $runsRoot)) {
+        return @()
+    }
+
+    return @(
+        @(Get-ChildItem -LiteralPath $runsRoot -Directory -ErrorAction SilentlyContinue | Where-Object {
+            $KnownTaskNames -notcontains ([string]$_.Name)
+        } | ForEach-Object {
+            [pscustomobject]@{
+                name = [string]$_.Name
+                path = [string]$_.FullName
+            }
+        })
+    )
+}
+
 function Invoke-GitCleanCheck {
     param([string]$RepoRoot)
     $status = Invoke-NativeCommand -Command "git" -Arguments @("status", "--porcelain") -WorkingDirectory $RepoRoot
     return (-not $status.output)
+}
+
+function Get-GitStatusLines {
+    param([string]$RepoRoot)
+
+    $status = Invoke-NativeCommand -Command "git" -Arguments @("status", "--porcelain") -WorkingDirectory $RepoRoot
+    if ($status.exitCode -ne 0 -or -not $status.output) {
+        return @()
+    }
+
+    return @($status.output -split "\r?\n" | ForEach-Object { $_.TrimEnd() } | Where-Object { $_ })
+}
+
+function Get-RepoOperationBlockers {
+    param([string]$RepoRoot)
+
+    $gitDir = Get-GitDirPath -RepoRoot $RepoRoot
+    $checks = @(
+        @{ name = "merge"; path = Join-Path $gitDir "MERGE_HEAD"; message = "Repository has an unresolved merge in progress." }
+        @{ name = "rebase"; path = Join-Path $gitDir "REBASE_HEAD"; message = "Repository has an unresolved rebase in progress." }
+        @{ name = "rebase"; path = Join-Path $gitDir "rebase-merge"; message = "Repository has an unresolved rebase in progress." }
+        @{ name = "rebase"; path = Join-Path $gitDir "rebase-apply"; message = "Repository has an unresolved rebase in progress." }
+        @{ name = "cherry-pick"; path = Join-Path $gitDir "CHERRY_PICK_HEAD"; message = "Repository has an unresolved cherry-pick in progress." }
+        @{ name = "revert"; path = Join-Path $gitDir "REVERT_HEAD"; message = "Repository has an unresolved revert in progress." }
+        @{ name = "bisect"; path = Join-Path $gitDir "BISECT_LOG"; message = "Repository is in the middle of a git bisect." }
+    )
+
+    return @(
+        @($checks | Where-Object { Test-Path -LiteralPath $_.path } | ForEach-Object {
+            [pscustomobject]@{
+                kind = [string]$_.name
+                path = [string]$_.path
+                message = [string]$_.message
+            }
+        })
+    )
 }
 
 function Test-BranchMergedIntoHead {
@@ -2891,6 +3130,140 @@ function Snapshot-Queue {
     }
 }
 
+function Prepare-Environment {
+    param([string]$ResolvedSolutionPath)
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $reconcileErrors = @(Reconcile-State -State $state -EventsFile $context.paths.eventsFile)
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
+
+        $dirtyFiles = @(Get-GitStatusLines -RepoRoot $context.repoRoot)
+        $repoBlockers = @(Get-RepoOperationBlockers -RepoRoot $context.repoRoot)
+        $protectedBranchReferences = @(Get-PrepareProtectedBranchReferences -State $state)
+        $protectedLaunchArtifactReferences = @(Get-PrepareProtectedLaunchArtifactReferences -State $state)
+        $gitWorktreeEntries = @(Get-GitWorktreeEntries -RepoRoot $context.repoRoot)
+        $unknownAutoBranches = @(Get-UnknownAutoBranches -RepoRoot $context.repoRoot -KnownBranches $protectedBranchReferences)
+        $unknownAutoWorktrees = @(Get-UnknownAutoWorktrees -RepoRoot $context.repoRoot -KnownTaskNames $protectedLaunchArtifactReferences -GitWorktreeEntries $gitWorktreeEntries)
+        $orphanedRunArtifacts = @(Get-OrphanedRunArtifacts -RepoRoot $context.repoRoot -KnownTaskNames $protectedLaunchArtifactReferences)
+        $cleanupActions = [System.Collections.ArrayList]::new()
+        $cleanupWarnings = [System.Collections.ArrayList]::new()
+
+        $repoState = [pscustomobject]@{
+            repoRoot = $context.repoRoot
+            dirty = ($dirtyFiles.Count -gt 0)
+            dirtyFiles = @($dirtyFiles)
+            operationBlockers = @($repoBlockers)
+            gitWorktreeCount = @($gitWorktreeEntries).Count
+        }
+
+        $blocked = ($dirtyFiles.Count -gt 0) -or ($repoBlockers.Count -gt 0) -or ($reconcileErrors.Count -gt 0)
+        if (-not $blocked) {
+            $currentBranch = Get-CurrentBranchName -RepoRoot $context.repoRoot
+            $attachedWorktreeBranches = @($gitWorktreeEntries | ForEach-Object { [string]$_.branch } | Where-Object { $_ } | Select-Object -Unique)
+
+            Invoke-NativeCommand -Command "git" -Arguments @("worktree", "prune") -WorkingDirectory $context.repoRoot | Out-Null
+
+            foreach ($branchName in $unknownAutoBranches) {
+                if ($branchName -eq $currentBranch -or $attachedWorktreeBranches -contains $branchName) {
+                    [void]$cleanupWarnings.Add("AutoDevelop branch '$branchName' was left in place because it is currently checked out or attached to a worktree.")
+                    continue
+                }
+
+                if (-not (Test-BranchMergedIntoHead -RepoRoot $context.repoRoot -BranchName $branchName)) {
+                    [void]$cleanupWarnings.Add("AutoDevelop branch '$branchName' was left in place because it is not merged into HEAD.")
+                    continue
+                }
+
+                Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName $branchName
+                [void]$cleanupActions.Add([pscustomobject]@{
+                    kind = "remove_auto_branch"
+                    target = [string]$branchName
+                    detail = "Removed stale merged AutoDevelop branch."
+                })
+                Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId "" -Kind "prepare_cleanup" -Message "Removed stale AutoDevelop branch." -Data @{ branchName = [string]$branchName }
+            }
+
+            foreach ($worktree in $unknownAutoWorktrees) {
+                try {
+                    Remove-Item -LiteralPath ([string]$worktree.path) -Recurse -Force -ErrorAction Stop
+                    [void]$cleanupActions.Add([pscustomobject]@{
+                        kind = "remove_auto_worktree"
+                        target = [string]$worktree.path
+                        detail = "Removed stale AutoDevelop worktree directory."
+                    })
+                    Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId "" -Kind "prepare_cleanup" -Message "Removed stale AutoDevelop worktree directory." -Data @{ path = [string]$worktree.path }
+                } catch {
+                    [void]$cleanupWarnings.Add("Failed to remove stale AutoDevelop worktree '$([string]$worktree.path)': $($_.Exception.Message)")
+                }
+            }
+
+            foreach ($artifact in $orphanedRunArtifacts) {
+                try {
+                    Remove-Item -LiteralPath ([string]$artifact.path) -Recurse -Force -ErrorAction Stop
+                    [void]$cleanupActions.Add([pscustomobject]@{
+                        kind = "remove_run_artifact"
+                        target = [string]$artifact.path
+                        detail = "Removed orphaned AutoDevelop run artifact directory."
+                    })
+                    Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId "" -Kind "prepare_cleanup" -Message "Removed orphaned AutoDevelop run artifact directory." -Data @{ path = [string]$artifact.path }
+                } catch {
+                    [void]$cleanupWarnings.Add("Failed to remove orphaned run artifact '$([string]$artifact.path)': $($_.Exception.Message)")
+                }
+            }
+        }
+
+        Save-State -StateFile $context.paths.stateFile -State $state
+
+        $postProtectedBranchReferences = @(Get-PrepareProtectedBranchReferences -State $state)
+        $postProtectedLaunchArtifactReferences = @(Get-PrepareProtectedLaunchArtifactReferences -State $state)
+        $postGitWorktreeEntries = @(Get-GitWorktreeEntries -RepoRoot $context.repoRoot)
+        $postUnknownAutoBranches = @(Get-UnknownAutoBranches -RepoRoot $context.repoRoot -KnownBranches $postProtectedBranchReferences)
+        $postUnknownAutoWorktrees = @(Get-UnknownAutoWorktrees -RepoRoot $context.repoRoot -KnownTaskNames $postProtectedLaunchArtifactReferences -GitWorktreeEntries $postGitWorktreeEntries)
+        $snapshot = Get-SnapshotPayload -State $state -EventsFile $context.paths.eventsFile -ReconcileErrors $reconcileErrors
+        $status = if ($blocked) {
+            "blocked"
+        } elseif ($cleanupActions.Count -gt 0) {
+            "cleaned"
+        } elseif ($cleanupWarnings.Count -gt 0 -or $postUnknownAutoBranches.Count -gt 0 -or $postUnknownAutoWorktrees.Count -gt 0 -or [string]$snapshot.stateIntegrity.status -eq "warning") {
+            "warning"
+        } else {
+            "ready"
+        }
+
+        $summary = switch ($status) {
+            "blocked" { "Prepare blocked because the repository or scheduler state is not safe for AutoDevelop startup." }
+            "cleaned" { "Prepare cleaned stale AutoDevelop-owned leftovers and reconciled the scheduler state." }
+            "warning" { "Prepare completed with warnings; AutoDevelop can continue, but some leftovers or integrity warnings remain." }
+            default { "Prepare confirmed that the repository and scheduler state are ready." }
+        }
+
+        return [pscustomobject]@{
+            ready = [bool]($status -ne "blocked")
+            status = $status
+            summary = $summary
+            repoState = $repoState
+            schedulerState = [pscustomobject]@{
+                healthy = [bool]($reconcileErrors.Count -eq 0)
+                reconcileErrors = @($reconcileErrors)
+                queueStall = $snapshot.queueStall
+                circuitBreaker = $snapshot.circuitBreaker
+            }
+            cleanupActions = @($cleanupActions)
+            cleanupWarnings = @($cleanupWarnings)
+            unknownAutoBranches = @($postUnknownAutoBranches)
+            unknownAutoWorktrees = @($postUnknownAutoWorktrees)
+            dirtyFiles = @($dirtyFiles)
+            integrityWarnings = @($snapshot.stateIntegrity.taskWarnings)
+            snapshot = $snapshot
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
 function Register-Tasks {
     param(
         [string]$ResolvedSolutionPath,
@@ -3684,6 +4057,10 @@ $resolvedPlanFile = if ($PlanFile) { Get-CanonicalPath -Path $PlanFile } else { 
 $resolvedEditFile = if ($EditFile) { Get-CanonicalPath -Path $EditFile } else { "" }
 
 switch ($Mode) {
+    "prepare-environment" {
+        Write-JsonOutput -Object (Prepare-Environment -ResolvedSolutionPath $resolvedSolutionPath)
+        break
+    }
     "snapshot-queue" {
         Write-JsonOutput -Object (Snapshot-Queue -ResolvedSolutionPath $resolvedSolutionPath)
         break

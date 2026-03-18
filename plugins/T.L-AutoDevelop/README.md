@@ -5,10 +5,12 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 ## Command
 
 - `/develop [task text or path-to-task-file]`
+- `/develop-prepare`
 
 ## What V4 Does
 
 - keeps a shared repo-scoped queue of running, queued, retryable, and pending-merge tasks
+- adds a prepare pass that reconciles queue state and cleans safe AutoDevelop-owned leftovers before new sessions
 - accepts either a direct task text or a file containing multiple tasks
 - uses the read-only `scheduler-agent` to plan conservative execution waves
 - starts multiple worker pipes asynchronously when their likely edit scopes are disjoint
@@ -19,6 +21,7 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 ## Included Components
 
 - `skills/develop/SKILL.md` — Main-Claude interactive orchestrator
+- `skills/develop-prepare/SKILL.md` — Explicit prepare and hygiene command
 - `agents/scheduler-agent.md` — Read-only queue planner
 - `agents/reviewer.md` — Independent code reviewer
 - `scripts/scheduler.ps1` — Durable repo-local queue engine

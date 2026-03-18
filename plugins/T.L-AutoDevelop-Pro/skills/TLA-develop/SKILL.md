@@ -21,9 +21,8 @@ Do not edit repository files directly in this skill.
 
 Use one Bash call to verify:
 - `git rev-parse --is-inside-work-tree` returns `true`
-- `git status --porcelain` is empty
 
-If either check fails, stop and explain the problem.
+If the check fails, stop and explain the problem.
 
 ## 2. Resolve the Solution
 
@@ -40,6 +39,27 @@ Find `scheduler.ps1` from the installed plugin and derive:
 - `claude-usage-gate.ps1`
 
 If `scheduler.ps1` cannot be found, stop.
+
+Before doing any queue work, run the shared prepare check:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode prepare-environment -SolutionPath "<solution>"
+```
+
+Interpret the prepare result strictly:
+- `status == "blocked"`: stop and report the blocker before any autonomous queue action
+- `status == "ready"` or `status == "cleaned"`: continue
+- `status == "warning"`: continue, but report the remaining warnings
+
+Always surface:
+- cleanup actions that were performed
+- dirty repo or unresolved git-operation blockers if present
+- remaining unknown AutoDevelop branches or worktrees
+- scheduler integrity warnings
+- the compact post-prepare queue status:
+  - `queueProgressSummary`
+  - `queueStall`
+  - `circuitBreaker`
 
 ## 4. Resolve the Input as Text or File
 

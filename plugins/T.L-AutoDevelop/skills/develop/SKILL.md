@@ -11,6 +11,7 @@ CRITICAL: You are the Main-Claude orchestrator. You do not implement the request
 
 Your job is to:
 - validate the repository and solution context
+- run the shared prepare check before queue orchestration
 - resolve the argument as a direct task or a task file
 - maintain the shared scheduler queue
 - invoke the read-only `scheduler-agent` for conservative wave planning
@@ -26,9 +27,8 @@ Do not edit repository files directly in this skill.
 
 Use one Bash call to verify:
 - `git rev-parse --is-inside-work-tree` returns `true`
-- `git status --porcelain` is empty
 
-If either check fails, stop and explain the problem.
+If the check fails, stop and explain the problem.
 
 ## 2. Resolve the Solution
 
@@ -45,6 +45,27 @@ Find `scheduler.ps1` from the installed plugin and derive:
 - `claude-usage-gate.ps1`
 
 If `scheduler.ps1` cannot be found, stop.
+
+Before doing any queue work, run the shared prepare check:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode prepare-environment -SolutionPath "<solution>"
+```
+
+Interpret the prepare result strictly:
+- `status == "blocked"`: stop and explain the blocker before registering or planning anything
+- `status == "ready"` or `status == "cleaned"`: continue
+- `status == "warning"`: continue, but tell the user what warnings remain
+
+Always surface:
+- cleanup actions that were performed
+- dirty repo or unresolved git-operation blockers if present
+- remaining unknown AutoDevelop branches or worktrees
+- scheduler integrity warnings
+- the compact post-prepare queue status:
+  - `queueProgressSummary`
+  - `queueStall`
+  - `circuitBreaker`
 
 ## 4. Resolve the Input as Text or File
 
