@@ -108,15 +108,20 @@ The registration JSON for each task should include:
 
 Run the usage gate in `probe` mode with `-ThresholdPercent 90`.
 
-Interpret the result strictly:
+Use this initial probe only to:
+- detect fatal gate errors
+- show the current 5h status to the user
+- confirm whether statusline/cache data is currently available
+
+Interpret the initial probe strictly:
 - `processStatus == "fatal"`: stop and show the error.
-- `ok == true` and `fiveHourUtilization < 90`: continue.
-- `ok == true` and `fiveHourUtilization >= 90`: ask the user whether this scheduling cycle may overrun the 5h budget.
-- `ok == false` or the script is unavailable: ask whether the 5h limit should be ignored for this scheduling cycle.
+- `ok == true`: continue to queue planning.
+- `ok == false` or the script is unavailable: continue, but remember that the later launch decision will need an explicit fallback question.
 
-Do not silently wait for the budget to drop. The user must explicitly approve a launch above the threshold.
-
-If the user declines, stop after leaving the queue unchanged.
+Important:
+- Do not treat this initial probe as sufficient for the rest of the session.
+- Before every actual worker launch set, you must run a fresh usage probe again.
+- The real launch decision is based on the projected cost of the next launch set, not only the current usage seen here.
 
 ## 7. Snapshot the Existing Queue
 
@@ -131,6 +136,7 @@ Read the returned JSON and keep:
 - `startableTaskIds`
 - `nextMergeTaskId`
 - `mergePreparedTaskId`
+- `queueStall`
 - `plannerFeedbackSummary`
 - `usageProjection`
 - `circuitBreaker`
@@ -150,6 +156,7 @@ Then snapshot the queue again so the full active queue now includes:
 - running tasks
 - queued tasks
 - retry-scheduled tasks
+- any `manual_debug_needed` tasks
 - pending-merge tasks
 - the newly registered tasks
 
@@ -178,11 +185,44 @@ Save that JSON to a plan file and apply it through the scheduler:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode apply-plan -SolutionPath "<solution>" -PlanFile "<plan.json>"
 ```
 
-## 10. Start Ready Pipes
+## 10. Gate And Start Ready Pipes
 
 Snapshot the queue again after applying the plan.
 
-For every task id in `startableTaskIds` that is not already running, launch a background worker:
+If that snapshot reports `queueStall.status == "stalled"`, do one automatic stall-recovery cycle before any launch attempt:
+1. call the `scheduler-agent` again on the latest snapshot
+2. `apply-plan`
+3. `snapshot-queue` again
+4. only continue if the new snapshot is no longer stalled
+
+If the same `queueStall.signature` is still stalled after that single recovery cycle, stop and report the stalled queue state instead of looping or silently doing nothing.
+
+Before starting any task in `startableTaskIds`, run a fresh launch-gate check for this exact launch set.
+
+Launch-gate procedure:
+1. Build the candidate launch set from `startableTaskIds`, preserving order and excluding tasks already running.
+2. Let `pipeCount = count(candidate launch set)`.
+3. If `pipeCount == 0`, do not run the gate and do not start anything.
+3. Run the usage gate again in `probe` mode with `-ThresholdPercent 90`.
+4. Compute:
+   - `currentUsage = fiveHourUtilization`
+   - `estimatedWaveCost = pipeCount * 5`
+   - `projectedUsage = currentUsage + estimatedWaveCost`
+5. Interpret the result:
+   - fatal gate error -> stop
+   - unavailable gate -> ask the user whether this launch set may ignore the 5h limit
+   - available gate and `projectedUsage < 90` -> launch
+   - available gate and `projectedUsage >= 90` -> ask the user whether this launch set may overrun the 5h budget
+6. If the user declines, leave the tasks queued and do not start them.
+
+The question must be about the current launch set only, not about the whole session.
+Always mention:
+- current 5h utilization
+- number of pipes about to start
+- estimated wave cost (`5% * pipeCount`)
+- projected usage after this launch set
+
+For every task id in the candidate launch set, launch a background worker:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode run-task -SolutionPath "<solution>" -TaskId "<task id>"
@@ -194,8 +234,14 @@ Tell the user:
 - which tasks were started now
 - which tasks were queued for later waves
 - whether any tasks are currently retry-scheduled
+- whether any tasks are paused as `manual_debug_needed`
 - whether the circuit breaker is open
 - the projected queue cost from `usageProjection`
+- the launch-gate numbers for this wave:
+  - current 5h utilization
+  - number of pipes started
+  - estimated wave cost
+  - projected usage
 - a compact progress snapshot from:
   - `queueProgressSummary`
   - `runningTaskProgress`
@@ -210,16 +256,22 @@ Do not reduce this to only "started" / "queued" lines when richer progress data 
 
 Whenever you are re-entered after one or more tasks completed, always do this in order:
 1. Snapshot the queue.
-2. Before any merge handling, show a compact progress snapshot for the user from:
+2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
+   - call the `scheduler-agent` on the latest snapshot
+   - `apply-plan`
+   - `snapshot-queue` again
+   - if the same `queueStall.signature` is still stalled, report that the queue remains stalled and stop instead of looping
+3. Before any merge handling, show a compact progress snapshot for the user from:
    - `queueProgressSummary`
    - `runningTaskProgress`
    - `queuedTaskProgress`
    - `mergeTaskProgress`
    - `recentQueueEvents`
-3. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
-4. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
-5. Snapshot again after `prepare-merge`.
-6. Start any newly startable tasks only after the merge situation is resolved.
+4. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
+5. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
+6. Snapshot again after `prepare-merge`.
+7. Start any newly startable tasks only after the merge situation is resolved.
+8. Before starting them, run the same fresh launch-gate procedure from section 10.
 
 `nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
@@ -258,6 +310,8 @@ Treat these task states as retryable scheduled work:
 - merge conflicts
 - build failures during merge preparation
 
+If a task enters `manual_debug_needed`, do not treat it as an ordinary scheduled retry. Report that repeated inconclusive investigation produced no new evidence and that the task now waits for repo changes, replanning, or explicit requeue.
+
 Each task gets at most 3 full attempts.
 
 If a task is reported as `retry_scheduled`, do not treat it as done. It must stay in the queue and go back through planning.
@@ -273,8 +327,10 @@ Run the scheduler-agent planning pass whenever the queue materially changes:
 - retry scheduling
 - merge resolution
 - circuit-breaker clear
+- `queueStall.status == "stalled"`
 
 Do not rely on stale wave assignments once the queue changes.
+Do not rely on stale usage information either. Every launch decision must use a fresh usage probe plus projected wave cost.
 
 ## 14. User-Facing Tone
 

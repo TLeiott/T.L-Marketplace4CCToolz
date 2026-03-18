@@ -162,6 +162,56 @@ function Get-NormalizedPathSet {
     )
 }
 
+function Test-LikelyRepoRelativePath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $value = ([string]$Path).Trim()
+    if (-not $value) { return $false }
+    if ($value -match '^(?i)(fatal:|warning:|usage:|error:|git(?:\.exe)?\s*:|at line:|categoryinfo|fullyqualifiederrorid|parsererror:|exception:)') { return $false }
+    if ($value -match '^(?i)(use --help|see ''git .*--help''|the most similar command is|did you mean)') { return $false }
+    if ($value -match '[\*\?<>\|"`]') { return $false }
+    if ($value -match '^\s*-{1,2}[a-z]') { return $false }
+    if ($value -match '^[A-Za-z]:\\$') { return $false }
+    return $true
+}
+
+function ConvertTo-StructuredPathList {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+
+    return @(
+        @(($Text -split "`0|`r?`n") | ForEach-Object {
+            $candidate = $_.Trim()
+            if (Test-LikelyRepoRelativePath -Path $candidate) {
+                $normalized = Normalize-RepoRelativePath -Path $candidate
+                if ($normalized) { $normalized }
+            }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
+}
+
+function Get-ChangedFilesResult {
+    $diffResult = Invoke-NativeCommand git @("diff", "--name-only", "-z", "HEAD")
+    $untrackedResult = Invoke-NativeCommand git @("ls-files", "--others", "--exclude-standard", "-z")
+    $errors = [System.Collections.ArrayList]::new()
+    if ($diffResult.exitCode -ne 0) {
+        [void]$errors.Add([pscustomobject]@{ command = "git diff --name-only -z HEAD"; exitCode = [int]$diffResult.exitCode; output = [string]$diffResult.output })
+    }
+    if ($untrackedResult.exitCode -ne 0) {
+        [void]$errors.Add([pscustomobject]@{ command = "git ls-files --others --exclude-standard -z"; exitCode = [int]$untrackedResult.exitCode; output = [string]$untrackedResult.output })
+    }
+
+    return [pscustomobject]@{
+        ok = ($errors.Count -eq 0)
+        files = if ($errors.Count -eq 0) {
+            @((ConvertTo-StructuredPathList -Text $diffResult.output) + (ConvertTo-StructuredPathList -Text $untrackedResult.output) | Where-Object { $_ } | Select-Object -Unique)
+        } else {
+            @()
+        }
+        sourceErrors = @($errors)
+    }
+}
+
 function Get-TaskClaimGuardrail {
     param(
         [string]$TaskText,
@@ -191,6 +241,97 @@ function Add-TimelineEvent {
         category = $Category
         data = $Data
     })
+}
+
+function Test-WorktreeEnvironment {
+    param(
+        [string]$WorktreePath,
+        [string]$SolutionPath,
+        [string]$RepoRoot = "",
+        [string]$Phase = ""
+    )
+
+    $worktreeExists = [bool]($WorktreePath -and (Test-Path -LiteralPath $WorktreePath -ErrorAction SilentlyContinue))
+    $gitMarkerPath = if ($WorktreePath) { Join-Path $WorktreePath ".git" } else { "" }
+    $gitMarkerExists = [bool]($gitMarkerPath -and (Test-Path -LiteralPath $gitMarkerPath -ErrorAction SilentlyContinue))
+    $solutionExists = [bool]($SolutionPath -and (Test-Path -LiteralPath $SolutionPath -ErrorAction SilentlyContinue))
+    $currentLocation = (Get-Location).Path
+    $cwdInsideWorktree = $false
+    if ($WorktreePath) {
+        try {
+            $fullWorktreePath = [System.IO.Path]::GetFullPath($WorktreePath)
+            $fullCurrentLocation = [System.IO.Path]::GetFullPath($currentLocation)
+            $cwdInsideWorktree = $fullCurrentLocation.StartsWith($fullWorktreePath, [System.StringComparison]::OrdinalIgnoreCase)
+        } catch {
+            $cwdInsideWorktree = $false
+        }
+    }
+
+    $topLevelEntries = @()
+    if ($worktreeExists) {
+        try {
+            $topLevelEntries = @(Get-ChildItem -LiteralPath $WorktreePath -Force -ErrorAction Stop | Select-Object -ExpandProperty Name)
+        } catch {
+            $topLevelEntries = @()
+        }
+    }
+    $nonGitTopLevelEntries = @($topLevelEntries | Where-Object { $_ -ne ".git" })
+    $looksEmpty = $worktreeExists -and $nonGitTopLevelEntries.Count -eq 0
+
+    $isValid = $worktreeExists -and $gitMarkerExists -and $solutionExists -and ($looksEmpty -eq $false)
+    return [pscustomobject]@{
+        isValid = [bool]$isValid
+        phase = [string]$Phase
+        repoRoot = [string]$RepoRoot
+        worktreePath = [string]$WorktreePath
+        solutionPath = [string]$SolutionPath
+        gitMarkerPath = [string]$gitMarkerPath
+        worktreeExists = [bool]$worktreeExists
+        gitMarkerExists = [bool]$gitMarkerExists
+        solutionExists = [bool]$solutionExists
+        worktreeLooksEmpty = [bool]$looksEmpty
+        currentLocation = [string]$currentLocation
+        cwdInsideWorktree = [bool]$cwdInsideWorktree
+        topLevelEntries = @($topLevelEntries | Select-Object -First 12)
+    }
+}
+
+function Resolve-WorktreeEnvironmentFailureCategory {
+    param($Validation)
+
+    if (-not $Validation.worktreeExists -or -not $Validation.gitMarkerExists -or [bool]$Validation.worktreeLooksEmpty) {
+        return "WORKTREE_INVALID"
+    }
+    if (-not $Validation.solutionExists) {
+        return "SOLUTION_PATH_MISSING"
+    }
+    return "WORKTREE_ENVIRONMENT_ERROR"
+}
+
+function Fail-WorktreeEnvironment {
+    param(
+        $Validation,
+        [string]$Phase,
+        [string]$Summary = ""
+    )
+
+    $script:currentPhase = if ($Phase) { $Phase } else { $script:currentPhase }
+    $category = Resolve-WorktreeEnvironmentFailureCategory -Validation $Validation
+    $message = if ($Summary) { $Summary } else { "The worker environment is invalid for phase $Phase." }
+    $details = ($Validation | ConvertTo-Json -Depth 6)
+    Add-TimelineEvent -Phase $script:currentPhase -Message "Worktree environment validation failed." -Category $category -Data @{
+        worktreePath = [string]$Validation.worktreePath
+        solutionPath = [string]$Validation.solutionPath
+        worktreeExists = [bool]$Validation.worktreeExists
+        gitMarkerExists = [bool]$Validation.gitMarkerExists
+        solutionExists = [bool]$Validation.solutionExists
+        worktreeLooksEmpty = [bool]$Validation.worktreeLooksEmpty
+    }
+    $script:finalStatus = "ERROR"
+    $script:finalCategory = $category
+    $script:finalSummary = $message
+    $script:finalFeedback = $details
+    throw [System.Exception]::new("TERMINAL_$category")
 }
 
 function New-EmptyReproductionTests {
@@ -2149,13 +2290,26 @@ function Get-ImplementationOutcome {
 }
 
 function Get-ChangedFiles {
-    $diffFiles = (Invoke-NativeCommand git @("diff", "--name-only", "HEAD")).output
-    $untrackedFiles = (Invoke-NativeCommand git @("ls-files", "--others", "--exclude-standard")).output
-    return @(
-        @(($diffFiles + "`n" + $untrackedFiles) -split "`r?`n" | ForEach-Object {
-            $_.Trim()
-        } | Where-Object { $_ } | Select-Object -Unique)
+    return @((Get-ChangedFilesResult).files)
+}
+
+function Fail-ChangedFilesDetection {
+    param(
+        $ChangedFilesResult,
+        [string]$Phase = ""
     )
+
+    $script:currentPhase = if ($Phase) { $Phase } else { $script:currentPhase }
+    $details = [ordered]@{
+        phase = [string]$script:currentPhase
+        sourceErrors = @($ChangedFilesResult.sourceErrors)
+    }
+    Add-TimelineEvent -Phase $script:currentPhase -Message "Changed-files detection failed." -Category "WORKTREE_ENVIRONMENT_ERROR" -Data $details
+    $script:finalStatus = "ERROR"
+    $script:finalCategory = "WORKTREE_ENVIRONMENT_ERROR"
+    $script:finalSummary = "The worker could not determine changed files reliably."
+    $script:finalFeedback = ($details | ConvertTo-Json -Depth 8)
+    throw [System.Exception]::new("TERMINAL_CHANGED_FILES_DETECTION_FAILED")
 }
 
 function Reset-Worktree {
@@ -2239,6 +2393,10 @@ try {
     $targetUri = [System.Uri]::new($SolutionPath)
     $relSln = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace("/", "\")
     $worktreeSln = Join-Path $worktreePath $relSln
+    $initialWorktreeValidation = Test-WorktreeEnvironment -WorktreePath $worktreePath -SolutionPath $worktreeSln -RepoRoot $repoRoot -Phase "WORKTREE"
+    if (-not $initialWorktreeValidation.isValid) {
+        Fail-WorktreeEnvironment -Validation $initialWorktreeValidation -Phase "WORKTREE" -Summary "The created worktree is invalid before the pipeline can continue."
+    }
     Write-DebugManifest
     Write-SchedulerSnapshot
 
@@ -2984,7 +3142,11 @@ SUMMARY:
         }
 
         $implOutcome = Get-ImplementationOutcome -Output $implResult.output
-        $changedFiles = Get-ChangedFiles
+        $changedFilesResult = Get-ChangedFilesResult
+        if (-not $changedFilesResult.ok) {
+            Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
+        }
+        $changedFiles = @($changedFilesResult.files)
         Save-Artifact -Name "implement-v$implementAttempt-changed-files.txt" -Content (($changedFiles -join "`n").Trim()) | Out-Null
 
         if ($changedFiles.Count -eq 0) {
@@ -3066,7 +3228,11 @@ IMPORTANT:
                 if ($repairImplResult.success) {
                     $implResult = $repairImplResult
                     $implOutcome = Get-ImplementationOutcome -Output $implResult.output
-                    $changedFiles = Get-ChangedFiles
+                    $changedFilesResult = Get-ChangedFilesResult
+                    if (-not $changedFilesResult.ok) {
+                        Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
+                    }
+                    $changedFiles = @($changedFilesResult.files)
                     if ($changedFiles.Count -gt 0) {
                         Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Repair implementation changed files." -Category "CHANGE_APPLIED"
                         Write-SchedulerSnapshot
@@ -3139,6 +3305,10 @@ SUMMARY:
                 $targetedVerificationPassed = $true
             }
             $currentPhase = "PREFLIGHT"
+            $preflightValidation = Test-WorktreeEnvironment -WorktreePath $worktreePath -SolutionPath $worktreeSln -RepoRoot $repoRoot -Phase "PREFLIGHT"
+            if (-not $preflightValidation.isValid) {
+                Fail-WorktreeEnvironment -Validation $preflightValidation -Phase "PREFLIGHT" -Summary "The worktree became invalid before preflight validation."
+            }
             Write-Host "[PREFLIGHT] Cycle $cycleLabel..."
             $pfArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $preflightScript, "-SolutionPath", $worktreeSln)
             $preflightDebugDir = Join-Path (Ensure-DebugDir) "preflight\$cycleLabel"
@@ -3158,6 +3328,17 @@ SUMMARY:
             }
 
             if (-not $preflight.passed) {
+                if ($preflight.environmentFailure) {
+                    $environmentCategory = if ($preflight.environmentCategory) { [string]$preflight.environmentCategory } else { "WORKTREE_ENVIRONMENT_ERROR" }
+                    $environmentFeedback = if ($preflight.environmentDetails) { ($preflight.environmentDetails | ConvertTo-Json -Depth 6) } else { $preflightJson }
+                    Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "PREFLIGHT" -Category $environmentCategory -Feedback $environmentFeedback
+                    Add-TimelineEvent -Phase "PREFLIGHT" -Message "Preflight detected an invalid worker environment." -Category $environmentCategory
+                    $finalStatus = "ERROR"
+                    $finalCategory = $environmentCategory
+                    $finalSummary = "Preflight could not run against a valid solution path in the current worktree."
+                    $finalFeedback = $environmentFeedback
+                    throw [System.Exception]::new("TERMINAL_$environmentCategory")
+                }
                 $blockerText = ($preflight.blockers | ForEach-Object {
                     $entry = "- [$($_.check)] $($_.file)"
                     if ($_.line) { $entry += " L$($_.line)" }
@@ -3332,7 +3513,11 @@ SUMMARY:
             if (-not $fixResult.success) {
                 Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
             }
-            $changedFiles = Get-ChangedFiles
+            $changedFilesResult = Get-ChangedFilesResult
+            if (-not $changedFilesResult.ok) {
+                Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
+            }
+            $changedFiles = @($changedFilesResult.files)
         }
 
         if ($accepted) { break }
@@ -3353,6 +3538,10 @@ SUMMARY:
     Write-PipelineLog -RepoRoot $repoRoot -Task $taskLine -Status $finalStatus -FinalCategory $finalCategory -FailureReasons $failureReasons -Files $changedFiles
 
     if ($finalStatus -eq "ACCEPTED") {
+        $finalizeValidation = Test-WorktreeEnvironment -WorktreePath $worktreePath -SolutionPath $worktreeSln -RepoRoot $repoRoot -Phase "FINALIZE"
+        if (-not $finalizeValidation.isValid) {
+            Fail-WorktreeEnvironment -Validation $finalizeValidation -Phase "FINALIZE" -Summary "The worktree became invalid before the final commit."
+        }
         Invoke-NativeCommand git @("-C", $worktreePath, "add", "-A") | Out-Null
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null

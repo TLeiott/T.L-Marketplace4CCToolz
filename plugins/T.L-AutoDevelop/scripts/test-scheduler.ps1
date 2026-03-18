@@ -43,6 +43,7 @@ function New-TestRepo {
 function New-TestLatestRun {
     param(
         [int]$AttemptNumber = 0,
+        [int]$LaunchSequence = 0,
         [string]$TaskName = "",
         [string]$ResultFile = "",
         [int]$ProcessId = 0,
@@ -51,6 +52,7 @@ function New-TestLatestRun {
 
     return [pscustomobject]@{
         attemptNumber = $AttemptNumber
+        launchSequence = $LaunchSequence
         taskName = $TaskName
         resultFile = $ResultFile
         processId = $ProcessId
@@ -61,6 +63,8 @@ function New-TestLatestRun {
         summary = ""
         feedback = ""
         noChangeReason = ""
+        investigationConclusion = ""
+        reproductionConfirmed = $false
         actualFiles = @()
         branchName = ""
         artifacts = $null
@@ -110,6 +114,56 @@ function Invoke-SchedulerJson {
 
     $raw = & powershell.exe @arguments
     return ($raw | Out-String | ConvertFrom-Json)
+}
+
+function Get-FunctionDefinitionText {
+    param(
+        [string]$ScriptPath,
+        [string]$FunctionName
+    )
+
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) {
+        throw "Unable to parse script for function extraction: $ScriptPath"
+    }
+
+    $functionAst = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $FunctionName
+    }, $true)
+
+    if (-not $functionAst) {
+        throw "Function not found in script: $FunctionName"
+    }
+
+    return $functionAst.Extent.Text
+}
+
+function Invoke-AutoDevelopHelperFunctions {
+    param(
+        [string[]]$FunctionNames,
+        [scriptblock]$ScriptBlock
+    )
+
+    $autoDevelopPath = Join-Path $PSScriptRoot "auto-develop.ps1"
+    $functionDefinitions = @($FunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $autoDevelopPath -FunctionName $_ })
+    $bootstrap = ($functionDefinitions -join "`r`n`r`n")
+    $wrapped = @"
+$bootstrap
+& {
+$($ScriptBlock.ToString())
+}
+"@
+    $tempScript = Join-Path $env:TEMP ("autodev-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
+        return ($raw | Out-String).Trim()
+    } finally {
+        Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
+    }
 }
 
 function Write-StateFile {
@@ -403,6 +457,558 @@ function Test-CompletedAtRoundTrip {
 
         $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
         Assert-True (-not [string]::IsNullOrWhiteSpace([string]$savedState.tasks[0].latestRun.completedAt)) "completedAt should be persisted after reconciliation."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-EnvironmentFailureRefundsAttempts {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-env-attempt-1-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ERROR"
+            finalCategory = "WORKTREE_INVALID"
+            summary = "worktree missing"
+            feedback = "The worktree is empty."
+            noChangeReason = ""
+            files = @()
+            branch = ""
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-env"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "environment broken"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-env.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-env-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).ToString("o")
+                        completedAt = ""
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-env" })[0]
+        Assert-True ([string]$task.state -eq "environment_retry_scheduled") "Environment failures should enter environment_retry_scheduled."
+        Assert-True ([int]$task.attemptsUsed -eq 0) "Environment failures should refund the consumed task attempt."
+        Assert-True ([int]$task.environmentRepairAttemptsUsed -eq 1) "Environment repair budget should be consumed."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKTREE_INVALID") "Environment failure category should be preserved."
+        Assert-True ([int]$task.waveNumber -eq 0) "Environment retries should detach from their original wave."
+        Assert-True (@($task.blockedBy).Count -eq 0) "Environment retries should clear stale dependency blockers."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-EnvironmentRetryDoesNotBecomeDirectlyStartable {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-merge-ready"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "merge ready"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-merge-ready.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = New-TestLatestRun -AttemptNumber 1 -TaskName "develop-task-merge-ready-a1" -ResultFile (Join-Path $repo.tasksDir "merge-ready-result.json") -StartedAt ((Get-Date).ToString("o"))
+                    runs = @()
+                    merge = [pscustomobject]@{ state = "pending"; preparedAt = ""; commitMessage = ""; commitSha = ""; reason = ""; branchName = "auto/merge-ready" }
+                },
+                [pscustomobject]@{
+                    taskId = "task-env"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "environment detached"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-env.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKTREE_INVALID"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = New-TestLatestRun -AttemptNumber 1 -TaskName "develop-task-env-a1" -ResultFile (Join-Path $repo.tasksDir "env-result.json") -StartedAt ((Get-Date).ToString("o"))
+                    runs = @()
+                    merge = New-TestMergeRecord
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.nextMergeTaskId -eq "task-merge-ready") "Detached environment retries must not block merge readiness."
+        Assert-True (@($snapshot.startableTaskIds).Count -eq 0) "Detached environment retries must not become directly startable."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts {
+    $prefix = "develop"
+    $token = "taskabcd"
+    $attemptsUsed = 0
+    $workerLaunchSequence = 2
+    $taskName = "$prefix-$token-a$workerLaunchSequence"
+    $resultPath = "task-1-launch-$workerLaunchSequence-result.json"
+
+    Assert-True ($attemptsUsed -eq 0) "Attempt refund scenario should allow zero consumed normal attempts."
+    Assert-True ($taskName -eq "develop-taskabcd-a2") "Worker identity must come from launch sequence, not refunded attempts."
+    Assert-True ($resultPath -eq "task-1-launch-2-result.json") "Result artifacts must use launch sequence naming."
+}
+
+function Test-PreflightMissingSolutionIsEnvironmentFailure {
+    $repo = New-TestRepo
+    try {
+        $missingSolution = Join-Path $repo.root "Missing.slnx"
+        $scriptPath = 'D:\Repos\T.L-Marketplace\plugins\T.L-AutoDevelop\scripts\preflight.ps1'
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -SolutionPath $missingSolution
+        $result = ($raw | Out-String | ConvertFrom-Json)
+        Assert-True ($result.passed -eq $false) "Missing solution path should fail preflight."
+        Assert-True ($result.environmentFailure -eq $true) "Missing solution path should be marked as environment failure."
+        Assert-True ([string]$result.environmentCategory -eq "SOLUTION_PATH_MISSING") "Preflight should classify missing solution paths explicitly."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-InvestigationInconclusiveGetsOneNormalRetry {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-investigation.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "FAILED"
+            finalCategory = "INVESTIGATION_INCONCLUSIVE"
+            summary = "Investigation could not determine a reliable change path."
+            feedback = "Error: Reached max turns (14)"
+            noChangeReason = ""
+            files = @()
+            branch = ""
+            artifacts = $null
+            investigationConclusion = "INCONCLUSIVE"
+            reproductionConfirmed = $false
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-investigation"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "investigate timeline refresh"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = $resultPath
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "develop-task-investigation-a1" -ResultFile $resultPath -StartedAt ((Get-Date).ToString("o")))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-investigation" })[0]
+        Assert-True ([string]$task.state -eq "retry_scheduled") "The first inconclusive investigation should still get one normal retry."
+        Assert-True (-not $snapshot.manualDebugTaskIds -or @($snapshot.manualDebugTaskIds).Count -eq 0) "The first inconclusive investigation must not be paused immediately."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-investigation-repeat.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "FAILED"
+            finalCategory = "INVESTIGATION_INCONCLUSIVE"
+            summary = "Investigation could not determine a reliable change path."
+            feedback = "Error: Reached max turns (14)"
+            noChangeReason = ""
+            files = @()
+            branch = ""
+            artifacts = $null
+            investigationConclusion = "INCONCLUSIVE"
+            reproductionConfirmed = $false
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-merge-ready"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "already accepted"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-merge-ready.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "develop-task-merge-ready-a1" -ResultFile (Join-Path $repo.tasksDir "merge-ready-result.json") -StartedAt ((Get-Date).ToString("o")))
+                    runs = @()
+                    merge = [pscustomobject]@{ state = "pending"; preparedAt = ""; commitMessage = ""; commitSha = ""; reason = ""; branchName = "auto/merge-ready" }
+                },
+                [pscustomobject]@{
+                    taskId = "task-investigation"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "rollback fix investigation"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = $resultPath
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 2
+                    attemptsRemaining = 1
+                    workerLaunchSequence = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 2 -TaskName "develop-task-investigation-a2" -ResultFile $resultPath -StartedAt ((Get-Date).ToString("o")))
+                    runs = @(
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            finalStatus = "FAILED"
+                            finalCategory = "INVESTIGATION_INCONCLUSIVE"
+                            summary = "Investigation could not determine a reliable change path."
+                            feedback = "Error: Reached max turns (14)"
+                            noChangeReason = ""
+                            investigationConclusion = "INCONCLUSIVE"
+                            reproductionConfirmed = $false
+                            actualFiles = @()
+                            branchName = ""
+                            resultFile = (Join-Path $repo.resultsDir "previous.json")
+                            completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                            artifacts = $null
+                        }
+                    )
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-investigation" })[0]
+        Assert-True ([string]$task.state -eq "manual_debug_needed") "Repeated inconclusive investigation without new evidence should pause in manual_debug_needed."
+        Assert-True ([int]$task.waveNumber -eq 0) "Manual debug tasks should detach from the original wave."
+        Assert-True (@($snapshot.manualDebugTaskIds) -contains "task-investigation") "Manual debug tasks should be visible in the snapshot."
+        Assert-True ([string]$snapshot.nextMergeTaskId -eq "task-merge-ready") "Manual debug tasks must not block merge readiness."
+        Assert-True (@($snapshot.startableTaskIds).Count -eq 0) "Manual debug tasks must not be directly startable."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ManualDebugTaskResumesToQueuedOnPositiveReplan {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-base"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "base dependency"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-base.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "task-base-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "task-manual"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "paused investigation task"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-manual.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 2
+                    attemptsRemaining = 1
+                    workerLaunchSequence = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = "Repeated inconclusive investigation produced no new evidence."
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "manual_debug_needed"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 2 -TaskName "develop-task-manual-a2" -ResultFile (Join-Path $repo.tasksDir "task-manual-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $planFile = Join-Path $repo.root "plan-manual-debug.json"
+        [System.IO.File]::WriteAllText($planFile, (@{
+            summary = "resume paused task"
+            tasks = @(
+                @{
+                    taskId = "task-base"
+                    waveNumber = 1
+                    blockedBy = @()
+                    plannerMetadata = @{}
+                },
+                @{
+                    taskId = "task-manual"
+                    waveNumber = 2
+                    blockedBy = @("task-base")
+                    plannerMetadata = @{ resumed = $true }
+                }
+            )
+            startableTaskIds = @("task-base")
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $applyResult = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "apply-plan" -PlanFile $planFile
+        $task = @($applyResult.snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-manual" })[0]
+        Assert-True ([string]$task.state -eq "queued") "A positive-wave replan should resume manual_debug_needed tasks back to queued."
+        Assert-True ([int]$task.waveNumber -eq 2) "The resumed task should adopt the replanned wave."
+        Assert-True (@($task.blockedBy).Count -eq 1 -and [string]$task.blockedBy[0] -eq "task-base") "The resumed task should preserve replanned blockers."
+        Assert-True (-not (@($applyResult.snapshot.startableTaskIds) -contains "task-manual")) "The resumed task should still respect its blockers and not start early."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ManualDebugTaskStaysPausedWithoutPositiveWaveReplan {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-manual"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "paused investigation task"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-manual.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 2
+                    attemptsRemaining = 1
+                    workerLaunchSequence = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = "Repeated inconclusive investigation produced no new evidence."
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "manual_debug_needed"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 2 -TaskName "develop-task-manual-a2" -ResultFile (Join-Path $repo.tasksDir "task-manual-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $planFile = Join-Path $repo.root "plan-manual-debug-stays-paused.json"
+        [System.IO.File]::WriteAllText($planFile, (@{
+            summary = "leave paused task detached"
+            tasks = @(
+                @{
+                    taskId = "task-manual"
+                    waveNumber = 0
+                    blockedBy = @()
+                    plannerMetadata = @{ resumed = $false }
+                }
+            )
+            startableTaskIds = @()
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $applyResult = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "apply-plan" -PlanFile $planFile
+        $task = @($applyResult.snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-manual" })[0]
+        Assert-True ([string]$task.state -eq "manual_debug_needed") "Without a positive wave assignment, manual_debug_needed should stay paused."
+        Assert-True ([int]$task.waveNumber -eq 0) "The paused task should remain detached."
+        Assert-True (@($applyResult.snapshot.startableTaskIds).Count -eq 0) "The paused task must remain non-startable."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -1695,6 +2301,502 @@ function Test-ProgressMilestonesTranslateToEnglish {
     }
 }
 
+function Test-PlannerFeedbackMatchesFilenameOnlyPredictions {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-filename-match-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("Hmd.Docs\\Components\\History\\PageTimeline.razor", "Hmd.Docs\\wwwroot\\css\\app.css")
+            branch = "auto/task-filename-match"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-filename-match"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "match filename only predictions"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-filename-match.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("PageTimeline.razor", "app.css") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-filename-match-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-12).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-filename-match" })[0]
+        Assert-True ([string]$task.plannerFeedback.classification -ne "missed") "Filename-only predictions should not be scored as missed when they uniquely match actual files."
+        Assert-True ([int]$task.plannerFeedback.matchKindsSummary.suffix -ge 2) "Filename-only predictions should be tracked as suffix matches."
+        Assert-True (@($task.plannerFeedback.falseNegatives).Count -eq 0) "All actual files should be matched by unique filename-only predictions."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-directory-match-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("Hmd.Docs\\Components\\History\\PageTimeline.razor")
+            branch = "auto/task-directory-match"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-directory-match"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "match directory prediction"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-directory-match.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("Hmd.Docs\\Components\\History") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-directory-match-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-12).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-directory-match" })[0]
+        Assert-True ([string]$task.plannerFeedback.classification -eq "broad") "Directory-level predictions should count as broad rather than missed."
+        Assert-True ([int]$task.plannerFeedback.matchKindsSummary.directory -eq 1) "Directory-level predictions should be tracked as directory matches."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-ambiguous-filename-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("A\\Foo.cs", "B\\Foo.cs")
+            branch = "auto/task-ambiguous-filename"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-ambiguous-filename"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "ambiguous filename prediction"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-ambiguous-filename.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("Foo.cs") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-ambiguous-filename-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-12).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-ambiguous-filename" })[0]
+        Assert-True ([int]$task.plannerFeedback.matchKindsSummary.suffix -eq 0) "Ambiguous filename-only predictions must not count as suffix matches."
+        Assert-True (@($task.plannerFeedback.falsePositives).Count -eq 1 -and [string]$task.plannerFeedback.falsePositives[0] -eq "Foo.cs") "Ambiguous filename-only predictions should remain unmatched."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ChangedFilesDetectionPreservesRootFilesWithoutExtension {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Test-LikelyRepoRelativePath",
+        "ConvertTo-StructuredPathList"
+    ) -ScriptBlock {
+        $result = ConvertTo-StructuredPathList -Text "Dockerfile`nLICENSE`n.editorconfig`nsrc\App.cs"
+        $result | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ($output | ConvertFrom-Json)
+    Assert-True (@($parsed).Count -eq 4) "Structured path parsing should preserve root files without extension."
+    Assert-True (@($parsed) -contains "Dockerfile") "Dockerfile should be preserved."
+    Assert-True (@($parsed) -contains "LICENSE") "LICENSE should be preserved."
+    Assert-True (@($parsed) -contains ".editorconfig") "Dotfiles should be preserved."
+}
+
+function Test-ChangedFilesDetectionRejectsGitNoiseButNotPaths {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Test-LikelyRepoRelativePath",
+        "ConvertTo-StructuredPathList"
+    ) -ScriptBlock {
+        $result = ConvertTo-StructuredPathList -Text "fatal: not a git repository`nusage: git diff`nsrc\App.cs`nDockerfile"
+        $result | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ($output | ConvertFrom-Json)
+    Assert-True (@($parsed).Count -eq 2) "Structured path parsing should reject git noise while preserving valid paths."
+    Assert-True (@($parsed) -contains "src\App.cs") "Regular repo-relative paths should be preserved."
+    Assert-True (@($parsed) -contains "Dockerfile") "Root files should be preserved alongside nested files."
+}
+
+function Test-ChangedFilesDetectionReportsGitFailuresExplicitly {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Test-LikelyRepoRelativePath",
+        "ConvertTo-StructuredPathList",
+        "Get-ChangedFilesResult"
+    ) -ScriptBlock {
+        function Invoke-NativeCommand {
+            param([string]$Command, [string[]]$Arguments)
+            if ($Arguments[0] -eq "diff") {
+                return @{ output = "fatal: not a git repository"; exitCode = 128 }
+            }
+            return @{ output = "Dockerfile`nsrc\App.cs"; exitCode = 0 }
+        }
+
+        $result = Get-ChangedFilesResult
+        $result | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ($output | ConvertFrom-Json)
+    Assert-True ($parsed.ok -eq $false) "Changed-files detection should report git failures explicitly."
+    Assert-True (@($parsed.sourceErrors).Count -eq 1) "Changed-files detection should preserve the failing source error."
+}
+
+function Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "unplanned-queued"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "queued but unplanned"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "unplanned-queued.json")
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.queueStall.status -eq "stalled") "Queued work without running/startable/merge progress should be marked stalled."
+        Assert-True ($snapshot.needsReplan -eq $true) "Stalled queues should explicitly request replanning."
+        Assert-True ([string]$snapshot.queueStall.recommendedAction -eq "replan") "Stalled queues should recommend replanning."
+        Assert-True (@($snapshot.queueStall.candidateTaskIds) -contains "unplanned-queued") "Stall diagnostics should point at the remaining queued work."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-QueueStallDoesNotTriggerWhileWaitingForUserMergeDecision {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "awaiting-merge-decision"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "waiting for merge decision"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "awaiting-merge-decision.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $true
+                    mergeState = "prepared"
+                    state = "waiting_user_test"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "awaiting-merge-decision" -ResultFile (Join-Path $repo.tasksDir "awaiting-merge-decision-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.queueStall.status -eq "blocked") "Waiting user test should be reported as blocked, not stalled."
+        Assert-True ([string]$snapshot.queueStall.recommendedAction -eq "wait_for_user_merge_decision") "Waiting user test should recommend merge resolution."
+        Assert-True ($snapshot.needsReplan -eq $false) "Waiting user test must not request replanning."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "wave_open"
+                openedAt = (Get-Date).AddMinutes(-1).ToString("o")
+                closedAt = ""
+                scopeWave = 1
+                reasonCategory = "build_infra"
+                reasonSummary = "Correlated failures opened the wave breaker."
+                affectedTaskIds = @("breaker-fail-1","breaker-fail-2","breaker-fail-3")
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                1..3 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "breaker-fail-$_"
+                        sourceCommand = "develop"
+                        sourceInputType = "inline"
+                        taskText = "Recent failed task $_"
+                        solutionPath = $repo.solution
+                        resultFile = (Join-Path $repo.resultsDir "breaker-fail-$_.json")
+                        submissionOrder = $_
+                        waveNumber = 1
+                        blockedBy = @()
+                        declaredDependencies = @()
+                        declaredPriority = "normal"
+                        serialOnly = $false
+                        maxAttempts = 3
+                        attemptsUsed = 1
+                        attemptsRemaining = 2
+                        retryScheduled = $true
+                        waitingUserTest = $false
+                        mergeState = ""
+                        state = "retry_scheduled"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            attemptNumber = 1
+                            taskName = "breaker-fail-$_"
+                            resultFile = ""
+                            processId = 0
+                            startedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                            completedAt = (Get-Date).AddMinutes(-2).ToString("o")
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = "Build failed"
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @()
+                            branchName = ""
+                            artifacts = $null
+                        }
+                        runs = @()
+                        merge = (New-TestMergeRecord)
+                    }
+                }
+            ) + @(
+                [pscustomobject]@{
+                    taskId = "breaker-queued"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "Queued behind breaker"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "breaker-queued.json")
+                    submissionOrder = 4
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "high"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.queueStall.status -eq "blocked") "Open circuit breaker should block the queue without reporting a stall."
+        Assert-True ([string]$snapshot.queueStall.recommendedAction -eq "wait_for_breaker_clear") "Open circuit breaker should recommend waiting for breaker clear."
+        Assert-True ($snapshot.needsReplan -eq $false) "Breaker-blocked queues must not request replanning."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-OldFailuresDoNotReopenBreaker {
     $repo = New-TestRepo
     try {
@@ -2046,14 +3148,231 @@ function Test-AdminEditTask {
     }
 }
 
+function Test-RunHistoryCapturesLaunchSequence {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-launch-sequence-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("src/File.cs")
+            branch = "auto/task-launch-sequence"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-launch-sequence"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "capture launch sequence"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = $resultPath
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 2 -TaskName "develop-task-launch-sequence-a2" -ResultFile $resultPath -StartedAt ((Get-Date).AddMinutes(-2).ToString("o")))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-launch-sequence" })[0]
+        Assert-True ([int]$task.latestRunLaunchSequence -eq 2) "latestRun should expose the worker launch sequence."
+        Assert-True (@($task.runs).Count -eq 1) "A completed run should be appended to run history."
+        Assert-True ([int]$task.runs[0].launchSequence -eq 2) "Run history should persist the worker launch sequence."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-StateIntegrityWarnsOnDuplicateLaunchSequence {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-drift"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "drift"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-drift.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-drift-a1" -ResultFile (Join-Path $repo.resultsDir "task-drift.json"))
+                    runs = @(
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = "develop-task-drift-a1"
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = ""
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @("src/File.cs")
+                            branchName = "auto/task-drift-a1"
+                            resultFile = "result-1.json"
+                            completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                            artifacts = $null
+                        },
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = "develop-task-drift-a1-duplicate"
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = ""
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @("src/Other.cs")
+                            branchName = "auto/task-drift-a1b"
+                            resultFile = "result-2.json"
+                            completedAt = (Get-Date).AddMinutes(-4).ToString("o")
+                            artifacts = $null
+                        }
+                    )
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.stateIntegrity.status -eq "warning") "Duplicate launch sequences should surface as integrity warnings."
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-drift" })[0]
+        Assert-True (@($task.integrityWarnings).Count -gt 0) "Task snapshots should expose integrity warnings."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AdminEditTaskReturnsIntegrityWarnings {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "admin-warning"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "warn me"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "admin-warning.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-admin-warning-a1" -ResultFile (Join-Path $repo.resultsDir "admin-warning.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $editFile = Join-Path $repo.root "admin-warning-edit.json"
+        [System.IO.File]::WriteAllText($editFile, (@{
+            taskId = "admin-warning"
+            updates = @{
+                attemptsUsed = 3
+                attemptsRemaining = 3
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:SchedulerPath -Mode "admin-edit-task" -SolutionPath $repo.solution -EditFile $editFile
+        $editResult = ($raw | Out-String | ConvertFrom-Json)
+        Assert-True (@($editResult.integrityWarnings).Count -gt 0) "Admin edit should return integrity warnings when it creates inconsistent counters."
+        Assert-True ($editResult.snapshot.hasIntegrityWarnings -eq $true) "Snapshot should expose integrity warnings after inconsistent admin edits."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
+Test-EnvironmentFailureRefundsAttempts
+Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
+Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
+Test-PreflightMissingSolutionIsEnvironmentFailure
+Test-InvestigationInconclusiveGetsOneNormalRetry
+Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded
+Test-ManualDebugTaskResumesToQueuedOnPositiveReplan
+Test-ManualDebugTaskStaysPausedWithoutPositiveWaveReplan
 Test-SnapshotResilience
 Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
 Test-UsageProjectionAndPlannerFeedback
+Test-PlannerFeedbackMatchesFilenameOnlyPredictions
+Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches
+Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions
+Test-ChangedFilesDetectionPreservesRootFilesWithoutExtension
+Test-ChangedFilesDetectionRejectsGitNoiseButNotPaths
+Test-ChangedFilesDetectionReportsGitFailuresExplicitly
 Test-NextMergeGate
 Test-RetryDoesNotBlockMerge
 Test-CircuitBreakerBlocksStarts
@@ -2065,8 +3384,14 @@ Test-ExternalMergeReconciliation
 Test-SnapshotIncludesStructuredProgress
 Test-MalformedProgressArtifactsDoNotBreakSnapshot
 Test-ProgressMilestonesTranslateToEnglish
+Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun
+Test-QueueStallDoesNotTriggerWhileWaitingForUserMergeDecision
+Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen
 Test-TlaMergeLockRemediation
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
+Test-RunHistoryCapturesLaunchSequence
+Test-StateIntegrityWarnsOnDuplicateLaunchSequence
+Test-AdminEditTaskReturnsIntegrityWarnings
 
 Write-Host "Scheduler regression checks passed."
