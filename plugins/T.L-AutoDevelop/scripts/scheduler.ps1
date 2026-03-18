@@ -368,13 +368,28 @@ function Get-TaskPrefix {
     return "develop"
 }
 
-function Get-ShortTaskToken {
+function Get-ShortTaskLabel {
     param([string]$TaskId)
     if (-not $TaskId) { return "task" }
     $clean = ($TaskId -replace "[^A-Za-z0-9]", "").ToLowerInvariant()
     if (-not $clean) { return "task" }
-    if ($clean.Length -gt 8) { return $clean.Substring(0, 8) }
+    if ($clean.Length -gt 6) { return $clean.Substring(0, 6) }
     return $clean
+}
+
+function Get-TaskIdentityToken {
+    param([string]$TaskId)
+
+    $label = Get-ShortTaskLabel -TaskId $TaskId
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$TaskId)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($bytes)
+    } finally {
+        $sha.Dispose()
+    }
+    $hashText = [System.BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant().Substring(0, 10)
+    return "$label-$hashText"
 }
 
 function Get-AttemptTaskName {
@@ -385,7 +400,7 @@ function Get-AttemptTaskName {
     )
 
     $prefix = Get-TaskPrefix -SourceCommand $SourceCommand
-    return "$prefix-$(Get-ShortTaskToken -TaskId $TaskId)-a$LaunchSequence"
+    return "$prefix-$(Get-TaskIdentityToken -TaskId $TaskId)-a$LaunchSequence"
 }
 
 function Is-TerminalState {
@@ -635,6 +650,11 @@ function Normalize-TaskRecord {
     if (-not $Task.resultFile) {
         Set-ObjectProperty -Object $Task -Name "resultFile" -Value (Get-DefaultTaskResultPath -RepoRoot $RepoRoot -TaskId $Task.taskId)
     }
+    if (-not $Task.taskToken) {
+        Set-ObjectProperty -Object $Task -Name "taskToken" -Value (Get-TaskIdentityToken -TaskId ([string]$Task.taskId))
+    }
+    Set-ObjectProperty -Object $Task -Name "promptFile" -Value ([string]$Task.promptFile).Trim()
+    Set-ObjectProperty -Object $Task -Name "taskText" -Value ([string]$Task.taskText).Trim()
 
     Set-ObjectProperty -Object $Task -Name "blockedBy" -Value @(Normalize-StringArray -Value $Task.blockedBy)
     Set-ObjectProperty -Object $Task -Name "runs" -Value @(Normalize-RunRecords -Runs $Task.runs)
@@ -729,6 +749,7 @@ function Ensure-TaskShape {
     if ($null -eq $Task.runs) { $Task | Add-Member -NotePropertyName runs -NotePropertyValue @() -Force }
     if (-not $Task.plannerMetadata) { $Task | Add-Member -NotePropertyName plannerMetadata -NotePropertyValue ([pscustomobject]@{}) -Force }
     if (-not $Task.plannerFeedback) { $Task | Add-Member -NotePropertyName plannerFeedback -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if (-not $Task.taskToken) { $Task | Add-Member -NotePropertyName taskToken -NotePropertyValue (Get-TaskIdentityToken -TaskId ([string]$Task.taskId)) -Force }
     if ($null -eq $Task.latestRun) { $Task | Add-Member -NotePropertyName latestRun -NotePropertyValue (New-LatestRunRecord) -Force }
     if (-not $Task.merge) {
         $Task | Add-Member -NotePropertyName merge -NotePropertyValue (New-MergeRecord) -Force
@@ -1384,6 +1405,7 @@ function ConvertTo-TaskSnapshot {
 
     return [pscustomobject]@{
         taskId = [string]$Task.taskId
+        taskToken = [string]$Task.taskToken
         sourceCommand = [string]$Task.sourceCommand
         sourceInputType = [string]$Task.sourceInputType
         taskText = [string]$Task.taskText
@@ -2190,6 +2212,15 @@ function Get-TaskIntegrityWarnings {
     if ([int]$Task.workerLaunchSequence -lt [int]$maxLaunchSequence) {
         [void]$warnings.Add("workerLaunchSequence is lower than recorded run launchSequence history.")
     }
+    if (-not [string]$Task.taskText) {
+        [void]$warnings.Add("taskText is missing.")
+    }
+    if (([string]$Task.state -in @("queued", "retry_scheduled", "environment_retry_scheduled", "running", "pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test")) -and -not [string]$Task.promptFile) {
+        [void]$warnings.Add("promptFile is missing for a runnable task.")
+    }
+    if ([string]$Task.promptFile -and -not (Test-Path -LiteralPath ([string]$Task.promptFile))) {
+        [void]$warnings.Add("promptFile path does not exist.")
+    }
 
     $latestRun = $Task.latestRun
     if ($latestRun) {
@@ -2731,6 +2762,50 @@ function Reconcile-State {
     return @($errors)
 }
 
+function Test-ActiveTaskState {
+    param([string]$State)
+    return $State -in @("queued", "retry_scheduled", "environment_retry_scheduled", "running", "pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test")
+}
+
+function Assert-TaskRecordValid {
+    param(
+        $Task,
+        [string]$Operation
+    )
+
+    $taskId = [string]$Task.taskId
+    if (-not [string]$Task.taskText) {
+        throw "$Operation rejected task '$taskId' because taskText is missing."
+    }
+    if (-not [string]$Task.solutionPath) {
+        throw "$Operation rejected task '$taskId' because solutionPath is missing."
+    }
+    if (-not (Test-Path -LiteralPath ([string]$Task.solutionPath))) {
+        throw "$Operation rejected task '$taskId' because solutionPath does not exist: $([string]$Task.solutionPath)"
+    }
+    if ((Test-ActiveTaskState -State ([string]$Task.state)) -and -not [string]$Task.promptFile) {
+        throw "$Operation rejected task '$taskId' because promptFile is missing."
+    }
+    if ([string]$Task.promptFile -and -not (Test-Path -LiteralPath ([string]$Task.promptFile))) {
+        throw "$Operation rejected task '$taskId' because promptFile does not exist: $([string]$Task.promptFile)"
+    }
+}
+
+function Assert-TaskIdentityUnique {
+    param(
+        $State,
+        $Task
+    )
+
+    $matches = @((Get-Tasks -State $State) | Where-Object {
+        $_.taskId -ne $Task.taskId -and
+        [string]$_.taskToken -eq [string]$Task.taskToken
+    })
+    if ($matches.Count -gt 0) {
+        throw "Task id '$([string]$Task.taskId)' collides with existing task identity token '$([string]$Task.taskToken)'."
+    }
+}
+
 function New-TaskRecord {
     param(
         [string]$RepoRoot,
@@ -2750,6 +2825,7 @@ function New-TaskRecord {
 
     return [pscustomobject]@{
         taskId = $taskId
+        taskToken = (Get-TaskIdentityToken -TaskId $taskId)
         sourceCommand = if ($InputTask.sourceCommand) { [string]$InputTask.sourceCommand } else { "develop" }
         sourceInputType = if ($InputTask.sourceInputType) { [string]$InputTask.sourceInputType } else { "inline" }
         taskText = [string]$InputTask.taskText
@@ -2897,6 +2973,32 @@ function Get-AutoDevelopScriptPath {
     return (Join-Path (Split-Path -Path $PSCommandPath -Parent) "auto-develop.ps1")
 }
 
+function Get-WorkerPowerShellLauncher {
+    $explicit = ([string]$env:AUTODEV_POWERSHELL_COMMAND).Trim()
+    if ($explicit) {
+        $resolvedExplicit = Get-Command -Name $explicit -ErrorAction SilentlyContinue
+        if (-not $resolvedExplicit) {
+            throw "Configured AUTODEV_POWERSHELL_COMMAND '$explicit' could not be resolved."
+        }
+        return [pscustomobject]@{
+            command = [string]$resolvedExplicit.Source
+            source = "AUTODEV_POWERSHELL_COMMAND"
+        }
+    }
+
+    foreach ($candidate in @("pwsh", "pwsh.exe", "powershell.exe")) {
+        $resolved = Get-Command -Name $candidate -ErrorAction SilentlyContinue
+        if ($resolved) {
+            return [pscustomobject]@{
+                command = [string]$resolved.Source
+                source = if ($candidate -like "pwsh*") { "pwsh_auto" } else { "powershell_fallback" }
+            }
+        }
+    }
+
+    throw "No supported PowerShell launcher was found. Set AUTODEV_POWERSHELL_COMMAND or install pwsh/powershell.exe."
+}
+
 function ConvertTo-PowerShellSingleQuotedLiteral {
     param([string]$Value)
 
@@ -2926,7 +3028,7 @@ function Get-EncodedWorkerLaunchCommand {
     $allowNugetFragment = if ($AllowNuget) { " -AllowNuget" } else { "" }
 
     $commandText = @"
-$ErrorActionPreference = 'Stop'
+`$ErrorActionPreference = 'Stop'
 & $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
 exit `$LASTEXITCODE
 "@
@@ -3283,17 +3385,13 @@ function Register-Tasks {
 
         foreach ($inputTask in $registrationTasks) {
             $task = New-TaskRecord -RepoRoot $context.repoRoot -DefaultSolutionPath $ResolvedSolutionPath -InputTask $inputTask -SubmissionOrder $submissionOrder
-            if (-not $task.solutionPath) {
-                throw "Task '$($task.taskId)' has no solution path after registration fallback."
-            }
-            if (-not (Test-Path -LiteralPath $task.solutionPath)) {
-                throw "Task '$($task.taskId)' references a solution that does not exist: $($task.solutionPath)"
-            }
             Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+            Assert-TaskRecordValid -Task $task -Operation "register-tasks"
             Update-TaskUsageEstimate -State $state -Task $task
             if (Get-TaskById -State $state -TaskId $task.taskId) {
                 throw "Task id '$($task.taskId)' is already registered."
             }
+            Assert-TaskIdentityUnique -State $state -Task $task
             $state.tasks = @($state.tasks) + @($task)
             Write-TaskResultFile -Task $task
             Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "registered" -Message "Task registered." -Data @{ sourceCommand = $task.sourceCommand; sourceInputType = $task.sourceInputType }
@@ -3404,6 +3502,7 @@ function Run-Task {
     if (-not (Test-Path -LiteralPath $autoDevelopScript)) {
         throw "auto-develop.ps1 was not found."
     }
+    $workerLauncher = Get-WorkerPowerShellLauncher
 
     $task = $null
     $pipelineResultPath = ""
@@ -3427,6 +3526,7 @@ function Run-Task {
         if ((Get-StartableTaskIds -State $state) -notcontains $TaskId) {
             throw "Task '$TaskId' is not startable in the current wave."
         }
+        Assert-TaskRecordValid -Task $task -Operation "run-task"
 
         $task.state = "running"
         $task.retryScheduled = $false
@@ -3463,11 +3563,12 @@ function Run-Task {
             runDir = $artifactPointers.runDir
             timeline = $artifactPointers.timelinePath
             schedulerSnapshot = $artifactPointers.schedulerSnapshotPath
+            workerLauncher = $workerLauncher.command
         }
         Write-TaskResultFile -Task $task
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
-        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "started" -Message "Task pipeline started." -Data @{ attempt = $attemptNumber; launchSequence = $launchSequence; waveNumber = $task.waveNumber }
+        Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "started" -Message "Task pipeline started." -Data @{ attempt = $attemptNumber; launchSequence = $launchSequence; waveNumber = $task.waveNumber; workerLauncher = $workerLauncher.command; workerLauncherSource = $workerLauncher.source }
     } finally {
         Release-Lock -LockHandle $lock
     }
@@ -3495,7 +3596,7 @@ function Run-Task {
     [Console]::Error.WriteLine(("[START] {0}" -f ([string](Get-TaskProgress -RepoRoot $context.repoRoot -Task $task).headline)))
 
     try {
-        $process = Start-Process -FilePath "powershell.exe" `
+        $process = Start-Process -FilePath $workerLauncher.command `
             -ArgumentList $arguments `
             -WorkingDirectory $context.repoRoot `
             -RedirectStandardOutput $workerOutputFile `

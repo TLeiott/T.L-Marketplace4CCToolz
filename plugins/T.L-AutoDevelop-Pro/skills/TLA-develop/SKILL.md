@@ -101,6 +101,9 @@ For each new task create:
 - a registration JSON record
 - a scheduler result file path
 
+The prompt file must exist on disk before `register-tasks` is called.
+The scheduler now rejects registrations with a missing, empty, or unreadable `promptFile`.
+
 Each task prompt file must contain:
 
 ```md
@@ -208,6 +211,11 @@ For each task in the allowed fitting launch set, launch:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode run-task -SolutionPath "<solution>" -TaskId "<task id>"
 ```
+
+The scheduler resolves worker PowerShell in this order:
+- `AUTODEV_POWERSHELL_COMMAND`
+- `pwsh` / `pwsh.exe`
+- `powershell.exe`
 
 These workers may run in parallel when their current wave allows it.
 
