@@ -24,6 +24,7 @@ function New-TestRepo {
         git config user.email "autodev-tests@example.com"
         git config user.name "AutoDevelop Tests"
         Set-Content -LiteralPath (Join-Path $root "Test.slnx") -Value "{}" -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $root "task-prompt.md") -Value "## Task`nTest prompt" -Encoding UTF8
         Set-Content -LiteralPath (Join-Path $root ".gitignore") -Value ".claude-develop-logs/" -Encoding UTF8
         git add . | Out-Null
         git commit -m "init" | Out-Null
@@ -34,6 +35,7 @@ function New-TestRepo {
     return [pscustomobject]@{
         root = $root
         solution = Join-Path $root "Test.slnx"
+        promptFile = Join-Path $root "task-prompt.md"
         stateFile = Join-Path $root ".claude-develop-logs\scheduler\state.json"
         tasksDir = Join-Path $root ".claude-develop-logs\scheduler\tasks"
         resultsDir = Join-Path $root ".claude-develop-logs\scheduler\results"
@@ -172,6 +174,35 @@ $($ScriptBlock.ToString())
 }
 "@
     $tempScript = Join-Path $env:TEMP ("autodev-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
+        return ($raw | Out-String).Trim()
+    } finally {
+        Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-SchedulerHelperFunctions {
+    param(
+        [string[]]$FunctionNames,
+        [scriptblock]$ScriptBlock,
+        [object[]]$Arguments = @()
+    )
+
+    $functionDefinitions = @($FunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $script:SchedulerPath -FunctionName $_ })
+    $bootstrap = ($functionDefinitions -join "`r`n`r`n")
+    $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
+    $wrapped = @"
+$bootstrap
+`$__codexArgs = ConvertFrom-Json @'
+$argumentsJson
+'@
+& {
+$($ScriptBlock.ToString())
+} @`$__codexArgs
+"@
+    $tempScript = Join-Path $env:TEMP ("scheduler-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
         $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
@@ -375,7 +406,7 @@ function Test-SolutionPathFallback {
                 taskText = "uses scheduler solution"
                 sourceCommand = "develop"
                 sourceInputType = "inline"
-                promptFile = ""
+                promptFile = $repo.promptFile
                 resultFile = (Join-Path $repo.resultsDir "task-fallback.json")
                 allowNuget = $false
             }
@@ -422,7 +453,7 @@ function Test-CompletedAtRoundTrip {
                     sourceInputType = "inline"
                     taskText = "test task"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-1.json")
                     allowNuget = $false
@@ -506,7 +537,7 @@ function Test-EnvironmentFailureRefundsAttempts {
                     sourceInputType = "inline"
                     taskText = "environment broken"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-env.json")
                     allowNuget = $false
@@ -576,7 +607,7 @@ function Test-EnvironmentRetryDoesNotBecomeDirectlyStartable {
                     sourceInputType = "inline"
                     taskText = "merge ready"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-merge-ready.json")
                     allowNuget = $false
@@ -606,7 +637,7 @@ function Test-EnvironmentRetryDoesNotBecomeDirectlyStartable {
                     sourceInputType = "inline"
                     taskText = "environment detached"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-env.json")
                     allowNuget = $false
@@ -642,15 +673,15 @@ function Test-EnvironmentRetryDoesNotBecomeDirectlyStartable {
 }
 
 function Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts {
-    $prefix = "develop"
-    $token = "taskabcd"
     $attemptsUsed = 0
     $workerLaunchSequence = 2
-    $taskName = "$prefix-$token-a$workerLaunchSequence"
+    $taskName = Invoke-SchedulerHelperFunctions -FunctionNames @("Get-TaskPrefix", "Get-ShortTaskLabel", "Get-TaskIdentityToken", "Get-AttemptTaskName") -ScriptBlock {
+        Get-AttemptTaskName -TaskId "task-abcdef-1234" -SourceCommand "develop" -LaunchSequence 2
+    }
     $resultPath = "task-1-launch-$workerLaunchSequence-result.json"
 
     Assert-True ($attemptsUsed -eq 0) "Attempt refund scenario should allow zero consumed normal attempts."
-    Assert-True ($taskName -eq "develop-taskabcd-a2") "Worker identity must come from launch sequence, not refunded attempts."
+    Assert-True ($taskName -match '^develop-taskab-[a-z0-9]{10}-a2$') "Worker identity must come from launch sequence and a collision-safe task token."
     Assert-True ($resultPath -eq "task-1-launch-2-result.json") "Result artifacts must use launch sequence naming."
 }
 
@@ -700,7 +731,7 @@ function Test-InvestigationInconclusiveGetsOneNormalRetry {
                     sourceInputType = "inline"
                     taskText = "investigate timeline refresh"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = $resultPath
                     allowNuget = $false
@@ -768,7 +799,7 @@ function Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded {
                     sourceInputType = "inline"
                     taskText = "already accepted"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-merge-ready.json")
                     allowNuget = $false
@@ -799,7 +830,7 @@ function Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded {
                     sourceInputType = "inline"
                     taskText = "rollback fix investigation"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = $resultPath
                     allowNuget = $false
@@ -871,7 +902,7 @@ function Test-ManualDebugTaskResumesToQueuedOnPositiveReplan {
                     sourceInputType = "inline"
                     taskText = "base dependency"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-base.json")
                     allowNuget = $false
@@ -902,7 +933,7 @@ function Test-ManualDebugTaskResumesToQueuedOnPositiveReplan {
                     sourceInputType = "inline"
                     taskText = "paused investigation task"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-manual.json")
                     allowNuget = $false
@@ -977,7 +1008,7 @@ function Test-ManualDebugTaskStaysPausedWithoutPositiveWaveReplan {
                     sourceInputType = "inline"
                     taskText = "paused investigation task"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-manual.json")
                     allowNuget = $false
@@ -1045,7 +1076,7 @@ function Test-SnapshotResilience {
                     sourceInputType = "inline"
                     taskText = "broken"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "bad-task.json")
                     allowNuget = $false
@@ -1088,26 +1119,126 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     $taskId = 'task-spaces'
     $commandType = 'develop'
 
-    $quote = {
-        param([string]$Value)
-        if ($null -eq $Value) { return "''" }
-        return "'" + ([string]$Value).Replace("'", "''") + "'"
+    $encoded = Invoke-SchedulerHelperFunctions -FunctionNames @("ConvertTo-PowerShellSingleQuotedLiteral", "Get-EncodedWorkerLaunchCommand") -ScriptBlock {
+        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
     }
-
-    $commandText = @"
-$ErrorActionPreference = 'Stop'
-& $(& $quote $scriptPath) -PromptFile $(& $quote $promptFile) -SolutionPath $(& $quote $solutionPath) -ResultFile $(& $quote $resultFile) -TaskName $(& $quote $taskName) -SchedulerTaskId $(& $quote $taskId) -CommandType $(& $quote $commandType)
-exit `$LASTEXITCODE
-"@
-    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
 
     $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(([string]$encoded).Trim()))
 
+    Assert-True ($decoded -match [regex]::Escape("`$ErrorActionPreference = 'Stop'")) "Encoded worker launch must preserve the literal ErrorActionPreference assignment."
     Assert-True ($decoded -match [regex]::Escape($scriptPath)) "Encoded worker launch must preserve the full spaced script path."
     Assert-True ($decoded -match [regex]::Escape($promptFile)) "Encoded worker launch must preserve the full spaced prompt path."
     Assert-True ($decoded -match [regex]::Escape($solutionPath)) "Encoded worker launch must preserve the full spaced solution path."
     Assert-True ($decoded -match [regex]::Escape($resultFile)) "Encoded worker launch must preserve the full spaced result path."
     Assert-True ($decoded -notmatch '-File\s+C:\\Users\\Example') "Encoded worker launch must not rely on a raw -File argument that can split at spaces."
+}
+
+function Test-RegistrationRejectsMissingPromptFile {
+    $repo = New-TestRepo
+    try {
+        $tasksFile = Join-Path $repo.root "tasks-missing-prompt.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            @{
+                taskId = "task-missing-prompt"
+                taskText = "A"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                solutionPath = $repo.solution
+                resultFile = (Join-Path $repo.resultsDir "task-missing-prompt.json")
+            }
+        ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $stdout = Join-Path $repo.root "register-missing-prompt.stdout.txt"
+        $stderr = Join-Path $repo.root "register-missing-prompt.stderr.txt"
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "register-tasks",
+            "-SolutionPath", $repo.solution,
+            "-TasksFile", $tasksFile
+        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $combined = ""
+        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
+        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+
+        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile is missing."
+        Assert-True ($combined -match "promptFile is missing") "register-tasks should explain the missing promptFile."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames {
+    $firstName = Invoke-SchedulerHelperFunctions -FunctionNames @("Get-TaskPrefix", "Get-ShortTaskLabel", "Get-TaskIdentityToken", "Get-AttemptTaskName") -ScriptBlock {
+        Get-AttemptTaskName -TaskId "tla-20260318-151706-t01" -SourceCommand "TLA-develop" -LaunchSequence 1
+    }
+    $secondName = Invoke-SchedulerHelperFunctions -FunctionNames @("Get-TaskPrefix", "Get-ShortTaskLabel", "Get-TaskIdentityToken", "Get-AttemptTaskName") -ScriptBlock {
+        Get-AttemptTaskName -TaskId "tla-20260318-151706-t99" -SourceCommand "TLA-develop" -LaunchSequence 1
+    }
+
+    Assert-True ($firstName -ne $secondName) "Different task ids with the same short prefix must generate unique task names."
+}
+
+function Test-SnapshotSurfacesMissingPromptFileIntegrityError {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-bad-prompt"
+                    taskToken = "taskba-deadbeef00"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "bad prompt"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-bad-prompt.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.resultsDir "task-bad-prompt.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.stateIntegrity.status -eq "warning") "snapshot-queue should warn on malformed runnable tasks with missing prompt files."
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-bad-prompt" })[0]
+        Assert-True (@($task.integrityWarnings).Count -gt 0) "Task snapshots should expose prompt integrity warnings."
+        Assert-True (@($task.integrityWarnings) -contains "promptFile is missing for a runnable task.") "Integrity warning should explain the missing prompt file."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WorkerPowerShellLauncherHonorsEnvironmentOverride {
+    $resolved = Invoke-WithEnvironment -Variables @{ AUTODEV_POWERSHELL_COMMAND = "powershell.exe" } -ScriptBlock {
+        Invoke-SchedulerHelperFunctions -FunctionNames @("Get-WorkerPowerShellLauncher") -ScriptBlock {
+            (Get-WorkerPowerShellLauncher | ConvertTo-Json -Compress)
+        } | ConvertFrom-Json
+    }
+
+    Assert-True ([string]$resolved.source -eq "AUTODEV_POWERSHELL_COMMAND") "Explicit AUTODEV_POWERSHELL_COMMAND should be honored."
+    Assert-True ([string]$resolved.command -match 'powershell(\.exe)?$') "Resolved override should point at powershell.exe."
 }
 
 function Test-BlockedByNormalization {
@@ -1121,7 +1252,7 @@ function Test-BlockedByNormalization {
                 sourceCommand = "develop"
                 sourceInputType = "inline"
                 solutionPath = $repo.solution
-                promptFile = ""
+                promptFile = $repo.promptFile
                 resultFile = (Join-Path $repo.resultsDir "task-a.json")
                 allowNuget = $false
             },
@@ -1131,7 +1262,7 @@ function Test-BlockedByNormalization {
                 sourceCommand = "develop"
                 sourceInputType = "inline"
                 solutionPath = $repo.solution
-                promptFile = ""
+                promptFile = $repo.promptFile
                 resultFile = (Join-Path $repo.resultsDir "task-b.json")
                 allowNuget = $false
             }
@@ -1184,7 +1315,7 @@ function Test-NextMergeGate {
                     sourceInputType = "inline"
                     taskText = "merge"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-merge.json")
                     allowNuget = $false
@@ -1209,7 +1340,7 @@ function Test-NextMergeGate {
                     sourceInputType = "inline"
                     taskText = "queued"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-queued.json")
                     allowNuget = $false
@@ -1249,6 +1380,7 @@ function Test-DeclaredDependencyValidation {
                 sourceCommand = "develop"
                 sourceInputType = "inline"
                 solutionPath = $repo.solution
+                promptFile = $repo.promptFile
                 resultFile = (Join-Path $repo.resultsDir "task-a.json")
             },
             @{
@@ -1257,6 +1389,7 @@ function Test-DeclaredDependencyValidation {
                 sourceCommand = "develop"
                 sourceInputType = "inline"
                 solutionPath = $repo.solution
+                promptFile = $repo.promptFile
                 resultFile = (Join-Path $repo.resultsDir "task-b.json")
                 declaredDependencies = @("task-a")
             }
@@ -1423,7 +1556,7 @@ function Test-UsageProjectionAndPlannerFeedback {
                     sourceInputType = "inline"
                     taskText = "Investigate and fix build issue with tests"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-feedback.json")
                     allowNuget = $false
@@ -1488,7 +1621,7 @@ function Test-RetryDoesNotBlockMerge {
                     sourceInputType = "inline"
                     taskText = "merge"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-ready-merge.json")
                     allowNuget = $false
@@ -1516,7 +1649,7 @@ function Test-RetryDoesNotBlockMerge {
                     sourceInputType = "inline"
                     taskText = "retry later"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-worker-retry.json")
                     allowNuget = $false
@@ -1569,7 +1702,7 @@ function Test-TlaMergeLockRemediation {
                     sourceInputType = "inline"
                     taskText = "merge autonomously"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "tla-merge.json")
                     allowNuget = $false
@@ -1653,7 +1786,7 @@ function Test-CircuitBreakerBlocksStarts {
                         sourceInputType = "inline"
                         taskText = "Build task $_"
                         solutionPath = $repo.solution
-                        promptFile = ""
+                        promptFile = $repo.promptFile
                         planFile = ""
                         resultFile = (Join-Path $repo.resultsDir "task-fail-$_.json")
                         allowNuget = $false
@@ -1699,7 +1832,7 @@ function Test-CircuitBreakerBlocksStarts {
                     sourceInputType = "inline"
                     taskText = "queued"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-queued.json")
                     allowNuget = $false
@@ -2346,7 +2479,7 @@ function Test-PlannerFeedbackMatchesFilenameOnlyPredictions {
                     sourceInputType = "inline"
                     taskText = "match filename only predictions"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-filename-match.json")
                     allowNuget = $false
@@ -2426,7 +2559,7 @@ function Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches {
                     sourceInputType = "inline"
                     taskText = "match directory prediction"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-directory-match.json")
                     allowNuget = $false
@@ -2505,7 +2638,7 @@ function Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions {
                     sourceInputType = "inline"
                     taskText = "ambiguous filename prediction"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-ambiguous-filename.json")
                     allowNuget = $false
@@ -3038,7 +3171,7 @@ function Test-MergeBuildFailurePreservesBranch {
                     sourceInputType = "inline"
                     taskText = "preserve branch on build fail"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "merge-build-retry.json")
                     allowNuget = $false
@@ -3106,7 +3239,7 @@ function Test-AdminEditTask {
                     sourceInputType = "inline"
                     taskText = "repair me"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "admin-fix.json")
                     allowNuget = $false
@@ -3193,7 +3326,7 @@ function Test-RunHistoryCapturesLaunchSequence {
                     sourceInputType = "inline"
                     taskText = "capture launch sequence"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = $resultPath
                     allowNuget = $false
@@ -3242,7 +3375,7 @@ function Test-StateIntegrityWarnsOnDuplicateLaunchSequence {
                     sourceInputType = "inline"
                     taskText = "drift"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "task-drift.json")
                     allowNuget = $false
@@ -3325,7 +3458,7 @@ function Test-AdminEditTaskReturnsIntegrityWarnings {
                     sourceInputType = "inline"
                     taskText = "warn me"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "admin-warning.json")
                     allowNuget = $false
@@ -3493,7 +3626,7 @@ function Test-PrepareEnvironmentCleansHistoricalOnlyBranchAndArtifacts {
                     sourceInputType = "inline"
                     taskText = "completed task"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "historical-cleanup.json")
                     allowNuget = $false
@@ -3589,7 +3722,7 @@ function Test-PrepareEnvironmentPreservesRunningLaunchArtifactsAndBranch {
                     sourceInputType = "inline"
                     taskText = "running task"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "active-cleanup.json")
                     allowNuget = $false
@@ -3695,7 +3828,7 @@ function Test-PrepareEnvironmentCleansRetryScheduledLaunchArtifactsButPreservesN
                     sourceInputType = "inline"
                     taskText = "retry task"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "retry-leftover.json")
                     allowNuget = $false
@@ -3777,7 +3910,7 @@ function Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArt
                     sourceInputType = "inline"
                     taskText = "pending merge"
                     solutionPath = $repo.solution
-                    promptFile = ""
+                    promptFile = $repo.promptFile
                     planFile = ""
                     resultFile = (Join-Path $repo.resultsDir "pending-merge-leftover.json")
                     allowNuget = $false
@@ -3816,6 +3949,7 @@ Test-CompletedAtRoundTrip
 Test-EnvironmentFailureRefundsAttempts
 Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
 Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
+Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames
 Test-PreflightMissingSolutionIsEnvironmentFailure
 Test-InvestigationInconclusiveGetsOneNormalRetry
 Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded
@@ -3823,6 +3957,8 @@ Test-ManualDebugTaskResumesToQueuedOnPositiveReplan
 Test-ManualDebugTaskStaysPausedWithoutPositiveWaveReplan
 Test-SnapshotResilience
 Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
+Test-RegistrationRejectsMissingPromptFile
+Test-SnapshotSurfacesMissingPromptFileIntegrityError
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
@@ -3853,6 +3989,7 @@ Test-AdminEditTask
 Test-RunHistoryCapturesLaunchSequence
 Test-StateIntegrityWarnsOnDuplicateLaunchSequence
 Test-AdminEditTaskReturnsIntegrityWarnings
+Test-WorkerPowerShellLauncherHonorsEnvironmentOverride
 Test-PrepareEnvironmentReportsReadyOnCleanState
 Test-PrepareEnvironmentBlocksDirtyRepository
 Test-PrepareEnvironmentBlocksUnresolvedGitOperation

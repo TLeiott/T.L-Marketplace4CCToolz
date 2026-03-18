@@ -1536,7 +1536,7 @@ function Restore-WorktreeBaseline {
     if ($PatchContent -and $PatchContent.Trim()) {
         $tempDir = Join-Path $env:TEMP "claude-develop"
         if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
-        $patchFile = Join-Path $tempDir "repro-baseline-$(New-Guid).patch"
+        $patchFile = Join-Path $tempDir "repro-baseline-$([guid]::NewGuid()).patch"
         [System.IO.File]::WriteAllText($patchFile, $PatchContent, [System.Text.Encoding]::UTF8)
         try {
             $applyResult = Invoke-NativeCommand git @("apply", "--whitespace=nowarn", $patchFile)
@@ -1884,8 +1884,8 @@ function Invoke-ClaudeWithTimeout {
     )
     Ensure-DebugDir | Out-Null
     $startedAt = Get-Date
-    $tempPromptFile = Join-Path $env:TEMP "claude-develop\claude-input-$(New-Guid).md"
-    $tempOutputFile = Join-Path $env:TEMP "claude-develop\claude-output-$(New-Guid).txt"
+    $tempPromptFile = Join-Path $env:TEMP "claude-develop\claude-input-$([guid]::NewGuid()).md"
+    $tempOutputFile = Join-Path $env:TEMP "claude-develop\claude-output-$([guid]::NewGuid()).txt"
     $tempDir = Split-Path $tempPromptFile -Parent
     if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
     $debugSubdir = $PhaseName
