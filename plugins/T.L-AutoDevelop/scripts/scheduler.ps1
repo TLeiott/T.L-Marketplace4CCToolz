@@ -1302,12 +1302,15 @@ function Evaluate-PlannerPrediction {
         }
     }
 
-    $overlap = @($predictedFiles | Where-Object { $actualFiles -contains $_ } | Select-Object -Unique)
-    $falsePositives = @($predictedFiles | Where-Object { $actualFiles -notcontains $_ } | Select-Object -Unique)
-    $falseNegatives = @($actualFiles | Where-Object { $predictedFiles -notcontains $_ } | Select-Object -Unique)
+    $matchResult = Match-PlannerPredictionPaths -PredictedPaths $predictedFiles -ActualPaths $actualFiles
+    $overlap = @($matchResult.overlap)
+    $falsePositives = @($matchResult.falsePositives)
+    $falseNegatives = @($matchResult.falseNegatives)
     $denominator = [Math]::Max(1, [Math]::Max($predictedFiles.Count, $actualFiles.Count))
     $hitRate = [Math]::Round(($overlap.Count / $denominator), 2)
-    $classification = if ($hitRate -ge 0.8 -and $falseNegatives.Count -eq 0) {
+    $classification = if ($matchResult.matchKinds.directory -gt 0 -and $matchResult.matchKinds.exact -eq 0) {
+        "broad"
+    } elseif ($hitRate -ge 0.8 -and $falseNegatives.Count -eq 0 -and $matchResult.matchKinds.suffix -eq 0 -and $matchResult.matchKinds.directory -eq 0) {
         "tight"
     } elseif ($hitRate -ge 0.5) {
         "acceptable"
@@ -1317,14 +1320,30 @@ function Evaluate-PlannerPrediction {
         "missed"
     }
 
+    $matchKindSummary = @()
+    if ($matchResult.matchKinds.exact -gt 0) { $matchKindSummary += "$($matchResult.matchKinds.exact) exact" }
+    if ($matchResult.matchKinds.suffix -gt 0) { $matchKindSummary += "$($matchResult.matchKinds.suffix) suffix" }
+    if ($matchResult.matchKinds.directory -gt 0) { $matchKindSummary += "$($matchResult.matchKinds.directory) directory" }
+    $notes = "Predicted $($predictedFiles.Count) file(s), actual $($actualFiles.Count) file(s), overlap $($overlap.Count)."
+    if ($matchKindSummary.Count -gt 0) {
+        $notes += " Match kinds: $($matchKindSummary -join ', ')."
+    }
+
     return [pscustomobject]@{
         predictionEvaluated = $true
         predictionHitRate = $hitRate
-        predictionNotes = "Predicted $($predictedFiles.Count) file(s), actual $($actualFiles.Count) file(s), overlap $($overlap.Count)."
+        predictionNotes = $notes
         falsePositives = @($falsePositives)
         falseNegatives = @($falseNegatives)
         overlap = @($overlap)
         classification = $classification
+        matchKindsSummary = [pscustomobject]@{
+            exact = [int]$matchResult.matchKinds.exact
+            suffix = [int]$matchResult.matchKinds.suffix
+            directory = [int]$matchResult.matchKinds.directory
+        }
+        matchedPredictions = @($matchResult.matchedPredictions)
+        matchedActualFiles = @($matchResult.matchedActualFiles)
     }
 }
 
@@ -1428,6 +1447,121 @@ function Get-NormalizedPathSet {
             if ($normalized) { $normalized }
         } | Where-Object { $_ } | Select-Object -Unique)
     )
+}
+
+function Get-CanonicalComparisonPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    return (([string]$Path).Trim().Replace("/", "\").TrimStart('\')).ToLowerInvariant()
+}
+
+function Get-PathComparisonProfile {
+    param([string]$Path)
+
+    $canonical = Get-CanonicalComparisonPath -Path $Path
+    if (-not $canonical) {
+        return [pscustomobject]@{
+            original = [string]$Path
+            canonical = ""
+            baseName = ""
+            isFileLike = $false
+            segments = @()
+        }
+    }
+
+    $segments = @($canonical -split '[\\/]')
+    $baseName = if ($segments.Count -gt 0) { [string]$segments[-1] } else { "" }
+    $isFileLike = ($baseName -match '\.') -and ($segments.Count -gt 0)
+    return [pscustomobject]@{
+        original = [string]$Path
+        canonical = $canonical
+        baseName = $baseName
+        isFileLike = $isFileLike
+        segments = @($segments)
+    }
+}
+
+function Get-PlannerPredictionMatch {
+    param(
+        [string]$PredictedPath,
+        [string[]]$ActualPaths
+    )
+
+    $predicted = Get-PathComparisonProfile -Path $PredictedPath
+    $actualProfiles = @($ActualPaths | ForEach-Object { Get-PathComparisonProfile -Path ([string]$_) } | Where-Object { $_.canonical })
+    if (-not $predicted.canonical -or $actualProfiles.Count -eq 0) {
+        return [pscustomobject]@{ kind = "none"; actual = "" }
+    }
+
+    $exactMatch = @($actualProfiles | Where-Object { $_.canonical -eq $predicted.canonical } | Select-Object -First 1)
+    if ($exactMatch.Count -gt 0) {
+        return [pscustomobject]@{ kind = "exact"; actual = [string]$exactMatch[0].original }
+    }
+
+    if ($predicted.isFileLike) {
+        $suffixCandidates = @($actualProfiles | Where-Object { $_.baseName -eq $predicted.baseName })
+        if ($suffixCandidates.Count -eq 1) {
+            return [pscustomobject]@{ kind = "suffix"; actual = [string]$suffixCandidates[0].original }
+        }
+
+        $suffixByEnding = @($actualProfiles | Where-Object { $_.canonical.EndsWith("\" + $predicted.canonical) })
+        if ($suffixByEnding.Count -eq 1) {
+            return [pscustomobject]@{ kind = "suffix"; actual = [string]$suffixByEnding[0].original }
+        }
+    }
+
+    if (-not $predicted.isFileLike -and $predicted.segments.Count -gt 0) {
+        $directoryPrefix = $predicted.canonical.TrimEnd('\')
+        $directoryCandidates = @($actualProfiles | Where-Object { $_.canonical.StartsWith($directoryPrefix + "\") -or $_.canonical -eq $directoryPrefix })
+        if ($directoryCandidates.Count -gt 0) {
+            return [pscustomobject]@{ kind = "directory"; actual = [string]$directoryCandidates[0].original }
+        }
+    }
+
+    return [pscustomobject]@{ kind = "none"; actual = "" }
+}
+
+function Match-PlannerPredictionPaths {
+    param(
+        [string[]]$PredictedPaths,
+        [string[]]$ActualPaths
+    )
+
+    $matchedPredictions = [System.Collections.ArrayList]::new()
+    $matchedActualFiles = [System.Collections.ArrayList]::new()
+    $overlap = [System.Collections.ArrayList]::new()
+    $usedActuals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $matchKinds = [ordered]@{ exact = 0; suffix = 0; directory = 0 }
+    $falsePositives = [System.Collections.ArrayList]::new()
+
+    foreach ($predicted in @($PredictedPaths | Where-Object { $_ } | Select-Object -Unique)) {
+        $match = Get-PlannerPredictionMatch -PredictedPath ([string]$predicted) -ActualPaths $ActualPaths
+        if ($match.kind -eq "none" -or -not $match.actual) {
+            [void]$falsePositives.Add([string]$predicted)
+            continue
+        }
+
+        [void]$matchedPredictions.Add([string]$predicted)
+        [void]$matchedActualFiles.Add([string]$match.actual)
+        [void]$overlap.Add([string]$predicted)
+        [void]$usedActuals.Add(([string]$match.actual))
+        if ($matchKinds.Contains($match.kind)) {
+            $matchKinds[$match.kind] = [int]$matchKinds[$match.kind] + 1
+        }
+    }
+
+    $falseNegatives = @(
+        @($ActualPaths | Where-Object { $_ -and -not $usedActuals.Contains([string]$_) } | Select-Object -Unique)
+    )
+
+    return [pscustomobject]@{
+        overlap = @($overlap | Select-Object -Unique)
+        falsePositives = @($falsePositives | Select-Object -Unique)
+        falseNegatives = @($falseNegatives)
+        matchedPredictions = @($matchedPredictions | Select-Object -Unique)
+        matchedActualFiles = @($matchedActualFiles | Select-Object -Unique)
+        matchKinds = [pscustomobject]$matchKinds
+    }
 }
 
 function Get-SubmissionOrder {

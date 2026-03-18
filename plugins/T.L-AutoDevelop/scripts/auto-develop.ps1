@@ -162,6 +162,56 @@ function Get-NormalizedPathSet {
     )
 }
 
+function Test-LikelyRepoRelativePath {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $value = ([string]$Path).Trim()
+    if (-not $value) { return $false }
+    if ($value -match '^(?i)(fatal:|warning:|usage:|error:|git(?:\.exe)?\s*:|at line:|categoryinfo|fullyqualifiederrorid|parsererror:|exception:)') { return $false }
+    if ($value -match '^(?i)(use --help|see ''git .*--help''|the most similar command is|did you mean)') { return $false }
+    if ($value -match '[\*\?<>\|"`]') { return $false }
+    if ($value -match '^\s*-{1,2}[a-z]') { return $false }
+    if ($value -match '^[A-Za-z]:\\$') { return $false }
+    return $true
+}
+
+function ConvertTo-StructuredPathList {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+
+    return @(
+        @(($Text -split "`0|`r?`n") | ForEach-Object {
+            $candidate = $_.Trim()
+            if (Test-LikelyRepoRelativePath -Path $candidate) {
+                $normalized = Normalize-RepoRelativePath -Path $candidate
+                if ($normalized) { $normalized }
+            }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    )
+}
+
+function Get-ChangedFilesResult {
+    $diffResult = Invoke-NativeCommand git @("diff", "--name-only", "-z", "HEAD")
+    $untrackedResult = Invoke-NativeCommand git @("ls-files", "--others", "--exclude-standard", "-z")
+    $errors = [System.Collections.ArrayList]::new()
+    if ($diffResult.exitCode -ne 0) {
+        [void]$errors.Add([pscustomobject]@{ command = "git diff --name-only -z HEAD"; exitCode = [int]$diffResult.exitCode; output = [string]$diffResult.output })
+    }
+    if ($untrackedResult.exitCode -ne 0) {
+        [void]$errors.Add([pscustomobject]@{ command = "git ls-files --others --exclude-standard -z"; exitCode = [int]$untrackedResult.exitCode; output = [string]$untrackedResult.output })
+    }
+
+    return [pscustomobject]@{
+        ok = ($errors.Count -eq 0)
+        files = if ($errors.Count -eq 0) {
+            @((ConvertTo-StructuredPathList -Text $diffResult.output) + (ConvertTo-StructuredPathList -Text $untrackedResult.output) | Where-Object { $_ } | Select-Object -Unique)
+        } else {
+            @()
+        }
+        sourceErrors = @($errors)
+    }
+}
+
 function Get-TaskClaimGuardrail {
     param(
         [string]$TaskText,
@@ -2240,13 +2290,26 @@ function Get-ImplementationOutcome {
 }
 
 function Get-ChangedFiles {
-    $diffFiles = (Invoke-NativeCommand git @("diff", "--name-only", "HEAD")).output
-    $untrackedFiles = (Invoke-NativeCommand git @("ls-files", "--others", "--exclude-standard")).output
-    return @(
-        @(($diffFiles + "`n" + $untrackedFiles) -split "`r?`n" | ForEach-Object {
-            $_.Trim()
-        } | Where-Object { $_ } | Select-Object -Unique)
+    return @((Get-ChangedFilesResult).files)
+}
+
+function Fail-ChangedFilesDetection {
+    param(
+        $ChangedFilesResult,
+        [string]$Phase = ""
     )
+
+    $script:currentPhase = if ($Phase) { $Phase } else { $script:currentPhase }
+    $details = [ordered]@{
+        phase = [string]$script:currentPhase
+        sourceErrors = @($ChangedFilesResult.sourceErrors)
+    }
+    Add-TimelineEvent -Phase $script:currentPhase -Message "Changed-files detection failed." -Category "WORKTREE_ENVIRONMENT_ERROR" -Data $details
+    $script:finalStatus = "ERROR"
+    $script:finalCategory = "WORKTREE_ENVIRONMENT_ERROR"
+    $script:finalSummary = "The worker could not determine changed files reliably."
+    $script:finalFeedback = ($details | ConvertTo-Json -Depth 8)
+    throw [System.Exception]::new("TERMINAL_CHANGED_FILES_DETECTION_FAILED")
 }
 
 function Reset-Worktree {
@@ -3079,7 +3142,11 @@ SUMMARY:
         }
 
         $implOutcome = Get-ImplementationOutcome -Output $implResult.output
-        $changedFiles = Get-ChangedFiles
+        $changedFilesResult = Get-ChangedFilesResult
+        if (-not $changedFilesResult.ok) {
+            Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
+        }
+        $changedFiles = @($changedFilesResult.files)
         Save-Artifact -Name "implement-v$implementAttempt-changed-files.txt" -Content (($changedFiles -join "`n").Trim()) | Out-Null
 
         if ($changedFiles.Count -eq 0) {
@@ -3161,7 +3228,11 @@ IMPORTANT:
                 if ($repairImplResult.success) {
                     $implResult = $repairImplResult
                     $implOutcome = Get-ImplementationOutcome -Output $implResult.output
-                    $changedFiles = Get-ChangedFiles
+                    $changedFilesResult = Get-ChangedFilesResult
+                    if (-not $changedFilesResult.ok) {
+                        Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
+                    }
+                    $changedFiles = @($changedFilesResult.files)
                     if ($changedFiles.Count -gt 0) {
                         Add-TimelineEvent -Phase "CHANGE_VALIDATE" -Message "Repair implementation changed files." -Category "CHANGE_APPLIED"
                         Write-SchedulerSnapshot
@@ -3442,7 +3513,11 @@ SUMMARY:
             if (-not $fixResult.success) {
                 Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
             }
-            $changedFiles = Get-ChangedFiles
+            $changedFilesResult = Get-ChangedFilesResult
+            if (-not $changedFilesResult.ok) {
+                Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
+            }
+            $changedFiles = @($changedFilesResult.files)
         }
 
         if ($accepted) { break }

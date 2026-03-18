@@ -114,6 +114,56 @@ function Invoke-SchedulerJson {
     return ($raw | Out-String | ConvertFrom-Json)
 }
 
+function Get-FunctionDefinitionText {
+    param(
+        [string]$ScriptPath,
+        [string]$FunctionName
+    )
+
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+    if ($errors -and $errors.Count -gt 0) {
+        throw "Unable to parse script for function extraction: $ScriptPath"
+    }
+
+    $functionAst = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $FunctionName
+    }, $true)
+
+    if (-not $functionAst) {
+        throw "Function not found in script: $FunctionName"
+    }
+
+    return $functionAst.Extent.Text
+}
+
+function Invoke-AutoDevelopHelperFunctions {
+    param(
+        [string[]]$FunctionNames,
+        [scriptblock]$ScriptBlock
+    )
+
+    $autoDevelopPath = Join-Path $PSScriptRoot "auto-develop.ps1"
+    $functionDefinitions = @($FunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $autoDevelopPath -FunctionName $_ })
+    $bootstrap = ($functionDefinitions -join "`r`n`r`n")
+    $wrapped = @"
+$bootstrap
+& {
+$($ScriptBlock.ToString())
+}
+"@
+    $tempScript = Join-Path $env:TEMP ("autodev-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
+        return ($raw | Out-String).Trim()
+    } finally {
+        Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
+    }
+}
+
 function Write-StateFile {
     param(
         [string]$StateFile,
@@ -2249,6 +2299,301 @@ function Test-ProgressMilestonesTranslateToEnglish {
     }
 }
 
+function Test-PlannerFeedbackMatchesFilenameOnlyPredictions {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-filename-match-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("Hmd.Docs\\Components\\History\\PageTimeline.razor", "Hmd.Docs\\wwwroot\\css\\app.css")
+            branch = "auto/task-filename-match"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-filename-match"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "match filename only predictions"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-filename-match.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("PageTimeline.razor", "app.css") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-filename-match-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-12).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-filename-match" })[0]
+        Assert-True ([string]$task.plannerFeedback.classification -ne "missed") "Filename-only predictions should not be scored as missed when they uniquely match actual files."
+        Assert-True ([int]$task.plannerFeedback.matchKindsSummary.suffix -ge 2) "Filename-only predictions should be tracked as suffix matches."
+        Assert-True (@($task.plannerFeedback.falseNegatives).Count -eq 0) "All actual files should be matched by unique filename-only predictions."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-directory-match-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("Hmd.Docs\\Components\\History\\PageTimeline.razor")
+            branch = "auto/task-directory-match"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-directory-match"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "match directory prediction"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-directory-match.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("Hmd.Docs\\Components\\History") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-directory-match-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-12).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-directory-match" })[0]
+        Assert-True ([string]$task.plannerFeedback.classification -eq "broad") "Directory-level predictions should count as broad rather than missed."
+        Assert-True ([int]$task.plannerFeedback.matchKindsSummary.directory -eq 1) "Directory-level predictions should be tracked as directory matches."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "task-ambiguous-filename-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("A\\Foo.cs", "B\\Foo.cs")
+            branch = "auto/task-ambiguous-filename"
+            artifacts = $null
+            reproductionConfirmed = $true
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-ambiguous-filename"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "ambiguous filename prediction"
+                    solutionPath = $repo.solution
+                    promptFile = ""
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-ambiguous-filename.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("Foo.cs") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-ambiguous-filename-a1"
+                        resultFile = $resultPath
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-12).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-ambiguous-filename" })[0]
+        Assert-True ([int]$task.plannerFeedback.matchKindsSummary.suffix -eq 0) "Ambiguous filename-only predictions must not count as suffix matches."
+        Assert-True (@($task.plannerFeedback.falsePositives).Count -eq 1 -and [string]$task.plannerFeedback.falsePositives[0] -eq "Foo.cs") "Ambiguous filename-only predictions should remain unmatched."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ChangedFilesDetectionPreservesRootFilesWithoutExtension {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Test-LikelyRepoRelativePath",
+        "ConvertTo-StructuredPathList"
+    ) -ScriptBlock {
+        $result = ConvertTo-StructuredPathList -Text "Dockerfile`nLICENSE`n.editorconfig`nsrc\App.cs"
+        $result | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ($output | ConvertFrom-Json)
+    Assert-True (@($parsed).Count -eq 4) "Structured path parsing should preserve root files without extension."
+    Assert-True (@($parsed) -contains "Dockerfile") "Dockerfile should be preserved."
+    Assert-True (@($parsed) -contains "LICENSE") "LICENSE should be preserved."
+    Assert-True (@($parsed) -contains ".editorconfig") "Dotfiles should be preserved."
+}
+
+function Test-ChangedFilesDetectionRejectsGitNoiseButNotPaths {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Test-LikelyRepoRelativePath",
+        "ConvertTo-StructuredPathList"
+    ) -ScriptBlock {
+        $result = ConvertTo-StructuredPathList -Text "fatal: not a git repository`nusage: git diff`nsrc\App.cs`nDockerfile"
+        $result | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ($output | ConvertFrom-Json)
+    Assert-True (@($parsed).Count -eq 2) "Structured path parsing should reject git noise while preserving valid paths."
+    Assert-True (@($parsed) -contains "src\App.cs") "Regular repo-relative paths should be preserved."
+    Assert-True (@($parsed) -contains "Dockerfile") "Root files should be preserved alongside nested files."
+}
+
+function Test-ChangedFilesDetectionReportsGitFailuresExplicitly {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Test-LikelyRepoRelativePath",
+        "ConvertTo-StructuredPathList",
+        "Get-ChangedFilesResult"
+    ) -ScriptBlock {
+        function Invoke-NativeCommand {
+            param([string]$Command, [string[]]$Arguments)
+            if ($Arguments[0] -eq "diff") {
+                return @{ output = "fatal: not a git repository"; exitCode = 128 }
+            }
+            return @{ output = "Dockerfile`nsrc\App.cs"; exitCode = 0 }
+        }
+
+        $result = Get-ChangedFilesResult
+        $result | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ($output | ConvertFrom-Json)
+    Assert-True ($parsed.ok -eq $false) "Changed-files detection should report git failures explicitly."
+    Assert-True (@($parsed.sourceErrors).Count -eq 1) "Changed-files detection should preserve the failing source error."
+}
+
 function Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun {
     $repo = New-TestRepo
     try {
@@ -2817,6 +3162,12 @@ Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
 Test-UsageProjectionAndPlannerFeedback
+Test-PlannerFeedbackMatchesFilenameOnlyPredictions
+Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches
+Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions
+Test-ChangedFilesDetectionPreservesRootFilesWithoutExtension
+Test-ChangedFilesDetectionRejectsGitNoiseButNotPaths
+Test-ChangedFilesDetectionReportsGitFailuresExplicitly
 Test-NextMergeGate
 Test-RetryDoesNotBlockMerge
 Test-CircuitBreakerBlocksStarts
