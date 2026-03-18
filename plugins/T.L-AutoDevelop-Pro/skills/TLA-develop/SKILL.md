@@ -95,15 +95,23 @@ Each task prompt file must contain:
 
 Run the usage gate in `probe` mode with `-ThresholdPercent 90`.
 
-Interpret the result strictly:
+Use this initial probe only to:
+- detect fatal gate errors
+- show the current 5h status to the user
+- confirm whether statusline/cache data is currently available
+
+Interpret the initial probe strictly:
 - fatal gate error -> stop
-- `fiveHourUtilization < 90` -> continue
-- `fiveHourUtilization >= 90` -> do not ask the user; pause autonomously until the 5h budget resets, then recheck
-- unavailable statusline/cache -> do not ask the user; sleep 5 hours, then re-run the gate probe
+- available or unavailable non-fatal result -> continue to queue planning
+
+Important:
+- Do not treat this initial probe as sufficient for the rest of the session.
+- Before every actual worker launch set, you must run a fresh usage probe again.
+- The real launch decision is based on the projected cost of the next launch set, not only the current usage seen here.
 
 Autonomous wait rules:
-- If the initial probe is blocked and `fiveHourResetAt` is available, call the usage gate in `wait` mode with the same threshold and let it wait until the gate opens.
-- If the initial probe is unavailable or has no usable reset time, sleep for 5 hours, then run `probe` again.
+- If a later launch-gate probe is blocked and `fiveHourResetAt` is available, call the usage gate in `wait` mode with the same threshold and let it wait until the gate opens.
+- If a later launch-gate probe is unavailable or has no usable reset time, sleep for 5 hours, then run `probe` again.
 - If the post-fallback probe is still unavailable, stop and report that the autonomous gate state could not be determined after the 5-hour fallback.
 - If the post-fallback probe is still blocked but now provides a usable reset time, switch to the normal `wait` path.
 - Do not create an unbounded 5-hour sleep loop.
@@ -114,6 +122,10 @@ User-facing reporting:
 - include `fiveHourResetAt` when available
 - say whether TLA is using gate-script `wait` or the conservative 5-hour fallback
 - when it resumes, report how long it waited and the final utilization that allowed launch
+- when a launch set is blocked by projected cost, also report:
+  - number of pipes about to start
+  - estimated wave cost (`5% * pipeCount`)
+  - projected usage after this launch set
 
 ## 7. Snapshot, Register, and Replan the Whole Queue
 
@@ -134,9 +146,35 @@ The planner input must include:
 - recent planner feedback from the queue snapshot
 - nearby documentation markdown files relevant to the affected modules
 
-## 8. Start Ready Pipes
+## 8. Gate And Start Ready Pipes
 
-For each newly startable task, launch:
+Before starting any task in `startableTaskIds`, run a fresh launch-gate check for this exact launch set.
+
+Launch-gate procedure:
+1. Build `candidateTaskIds` from `startableTaskIds`, preserving order and excluding tasks already running.
+2. If `candidateTaskIds` is empty, do not run the gate and do not start anything.
+3. Run the usage gate again in `probe` mode with `-ThresholdPercent 90`.
+4. If the gate result is fatal, stop.
+5. If the gate result is unavailable:
+   - do not ask the user
+   - use the 5-hour fallback wait
+   - then re-run `probe`
+   - if the probe is still unavailable, stop and report that the autonomous gate state could not be determined
+6. Let `currentUsage = fiveHourUtilization` from the fresh available probe result.
+7. Compute the largest ordered prefix of `candidateTaskIds` that fits under the projected threshold using:
+   - `estimatedWaveCost = pipeCount * 5`
+   - `projectedUsage = currentUsage + estimatedWaveCost`
+   - only prefixes with `projectedUsage < 90` fit
+8. Interpret the fitting result:
+   - if the full candidate set fits, launch it
+   - if only a non-empty prefix fits, launch that fitting prefix and leave the remaining startable tasks queued
+   - if no prefix fits, do not ask the user; wait, then re-probe, then recompute the fitting prefix
+9. If `fiveHourResetAt` is available, use gate `wait` for the no-fit case. If it is not available, use the 5-hour fallback once and then re-probe.
+10. After any wait completes, recompute the fitting prefix from the fresh probe result.
+11. If no prefix fits even after the wait/re-probe cycle, stop and report that no task in the current launch set fits the projected 5h budget right now.
+12. Never launch a queued wave based only on an old probe.
+
+For each task in the allowed fitting launch set, launch:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode run-task -SolutionPath "<solution>" -TaskId "<task id>"
@@ -146,10 +184,17 @@ These workers may run in parallel when their current wave allows it.
 
 Report to the user:
 - which tasks started
+- which startable tasks were deferred because they did not fit the projected 5h budget
 - which tasks were queued
 - which tasks are retry-scheduled
 - whether the circuit breaker is open
 - the projected queue cost from `usageProjection`
+- the launch-gate numbers for this wave:
+  - current 5h utilization
+  - candidate pipe count
+  - started pipe count
+  - estimated wave cost for the started subset
+  - projected usage for the started subset
 - a compact progress snapshot from:
   - `queueProgressSummary`
   - `runningTaskProgress`
@@ -174,7 +219,7 @@ Whenever you re-enter after task completion:
 4. If `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
 5. If the prepared task has `sourceCommand = "TLA-develop"`, call `resolve-merge -Decision commit` immediately.
 6. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
-7. After each merge, snapshot again and start any newly startable tasks.
+7. After each merge, snapshot again and start any newly startable tasks only after running the same fresh launch-gate procedure from section 8.
 
 `nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
@@ -216,6 +261,7 @@ Run the scheduler-agent planning pass whenever the queue materially changes:
 - circuit-breaker clear
 
 Do not continue using stale wave assignments after the queue changed.
+Do not continue using stale usage information either. Every launch decision must use a fresh usage probe plus projected wave cost.
 
 ## 12. User-Facing Tone
 

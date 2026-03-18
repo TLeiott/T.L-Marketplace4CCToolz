@@ -9,13 +9,13 @@
       "name": "T.L-AutoDevelop",
       "source": "./plugins/T.L-AutoDevelop",
       "description": "Interactive queue-aware .NET dev orchestration. Skill: /develop. Task text and task files share one scheduler-driven queue.",
-      "version": "4.1.2"
+      "version": "4.1.5"
     },
     {
       "name": "T.L-AutoDevelop-Pro",
       "source": "./plugins/T.L-AutoDevelop-Pro",
       "description": "Autonomous addon for T.L-AutoDevelop. Skill: /TLA-develop. Uses the same queue-aware scheduler and auto-commits prepared merges. Requires T.L-AutoDevelop.",
-      "version": "4.1.3"
+      "version": "4.1.5"
     }
   ]
 }
