@@ -149,6 +149,14 @@ The planner input must include:
 
 ## 8. Gate And Start Ready Pipes
 
+Before any launch attempt, if the latest queue snapshot reports `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
+1. call the `scheduler-agent` again on the latest snapshot
+2. `apply-plan`
+3. `snapshot-queue` again
+4. only continue if the new snapshot is no longer stalled
+
+If the same `queueStall.signature` is still stalled after that single recovery cycle, stop and report the stalled queue state instead of looping.
+
 Before starting any task in `startableTaskIds`, run a fresh launch-gate check for this exact launch set.
 
 Launch-gate procedure:
@@ -211,17 +219,22 @@ Do not reduce this to only "started" / "queued" lines when richer progress data 
 
 Whenever you re-enter after task completion:
 1. Snapshot the queue.
-2. Before any merge handling, show a compact progress snapshot for the user from:
+2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
+   - call the `scheduler-agent` on the latest snapshot
+   - `apply-plan`
+   - `snapshot-queue` again
+   - if the same `queueStall.signature` is still stalled, report that the queue remains stalled and stop instead of looping
+3. Before any merge handling, show a compact progress snapshot for the user from:
    - `queueProgressSummary`
    - `runningTaskProgress`
    - `queuedTaskProgress`
    - `mergeTaskProgress`
    - `recentQueueEvents`
-3. If a merge is already prepared, inspect that task record and its `sourceCommand`.
-4. If `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
-5. If the prepared task has `sourceCommand = "TLA-develop"`, call `resolve-merge -Decision commit` immediately.
-6. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
-7. After each merge, snapshot again and start any newly startable tasks only after running the same fresh launch-gate procedure from section 8.
+4. If a merge is already prepared, inspect that task record and its `sourceCommand`.
+5. If `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
+6. If the prepared task has `sourceCommand = "TLA-develop"`, call `resolve-merge -Decision commit` immediately.
+7. If the prepared task has `sourceCommand = "develop"`, stop and ask the user to test it before any merge commit.
+8. After each merge, snapshot again and start any newly startable tasks only after running the same fresh launch-gate procedure from section 8.
 
 `nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
@@ -263,6 +276,7 @@ Run the scheduler-agent planning pass whenever the queue materially changes:
 - retry scheduling
 - merge completion
 - circuit-breaker clear
+- `queueStall.status == "stalled"`
 
 Do not continue using stale wave assignments after the queue changed.
 Do not continue using stale usage information either. Every launch decision must use a fresh usage probe plus projected wave cost.

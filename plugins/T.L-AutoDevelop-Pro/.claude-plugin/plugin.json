@@ -1,6 +1,6 @@
 {
   "name": "T.L-AutoDevelop-Pro",
-  "version": "4.1.9",
+  "version": "4.1.10",
   "description": "Autonomous addon for T.L-AutoDevelop with queue-aware scheduling, task-file intake, retries, and automatic normal merges.",
   "author": {
     "name": "TLeiott",

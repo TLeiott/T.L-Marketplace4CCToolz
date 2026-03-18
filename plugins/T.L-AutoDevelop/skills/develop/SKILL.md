@@ -136,6 +136,7 @@ Read the returned JSON and keep:
 - `startableTaskIds`
 - `nextMergeTaskId`
 - `mergePreparedTaskId`
+- `queueStall`
 - `plannerFeedbackSummary`
 - `usageProjection`
 - `circuitBreaker`
@@ -187,6 +188,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode 
 ## 10. Gate And Start Ready Pipes
 
 Snapshot the queue again after applying the plan.
+
+If that snapshot reports `queueStall.status == "stalled"`, do one automatic stall-recovery cycle before any launch attempt:
+1. call the `scheduler-agent` again on the latest snapshot
+2. `apply-plan`
+3. `snapshot-queue` again
+4. only continue if the new snapshot is no longer stalled
+
+If the same `queueStall.signature` is still stalled after that single recovery cycle, stop and report the stalled queue state instead of looping or silently doing nothing.
 
 Before starting any task in `startableTaskIds`, run a fresh launch-gate check for this exact launch set.
 
@@ -247,17 +256,22 @@ Do not reduce this to only "started" / "queued" lines when richer progress data 
 
 Whenever you are re-entered after one or more tasks completed, always do this in order:
 1. Snapshot the queue.
-2. Before any merge handling, show a compact progress snapshot for the user from:
+2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
+   - call the `scheduler-agent` on the latest snapshot
+   - `apply-plan`
+   - `snapshot-queue` again
+   - if the same `queueStall.signature` is still stalled, report that the queue remains stalled and stop instead of looping
+3. Before any merge handling, show a compact progress snapshot for the user from:
    - `queueProgressSummary`
    - `runningTaskProgress`
    - `queuedTaskProgress`
    - `mergeTaskProgress`
    - `recentQueueEvents`
-3. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
-4. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
-5. Snapshot again after `prepare-merge`.
-6. Start any newly startable tasks only after the merge situation is resolved.
-7. Before starting them, run the same fresh launch-gate procedure from section 10.
+4. If a merge is already prepared, keep focus on that task and inspect its queued task record from the latest snapshot.
+5. If no merge is prepared and `nextMergeTaskId` is present, call `prepare-merge`, then inspect the returned task record and its `sourceCommand`.
+6. Snapshot again after `prepare-merge`.
+7. Start any newly startable tasks only after the merge situation is resolved.
+8. Before starting them, run the same fresh launch-gate procedure from section 10.
 
 `nextMergeTaskId` may stay empty even when `pendingMergeTaskIds` is non-empty. This is expected while other tasks in the same wave are still `queued` or `running`. Detached worker retries no longer block merge turns for already finished wave work.
 
@@ -313,6 +327,7 @@ Run the scheduler-agent planning pass whenever the queue materially changes:
 - retry scheduling
 - merge resolution
 - circuit-breaker clear
+- `queueStall.status == "stalled"`
 
 Do not rely on stale wave assignments once the queue changes.
 Do not rely on stale usage information either. Every launch decision must use a fresh usage probe plus projected wave cost.

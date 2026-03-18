@@ -1083,6 +1083,147 @@ function Get-QueueProgressSummary {
     }
 }
 
+function Get-QueueStallSummary {
+    param(
+        $State,
+        [object[]]$StartableTaskIds = @(),
+        $NextMergeTask = $null,
+        $MergePreparedTask = $null,
+        $CircuitBreaker = $null,
+        [object[]]$ReconcileErrors = @()
+    )
+
+    $tasks = @(Get-Tasks -State $State)
+    $runningTasks = @($tasks | Where-Object { $_.state -eq "running" })
+    $waitingMergeTasks = @($tasks | Where-Object { $_.state -in @("merge_prepared", "waiting_user_test") })
+    $queueRelevantTasks = @($tasks | Where-Object { $_.state -in @("queued", "retry_scheduled", "environment_retry_scheduled", "manual_debug_needed", "pending_merge", "merge_retry_scheduled") })
+    $manualDebugTaskIds = @($tasks | Where-Object { $_.state -eq "manual_debug_needed" } | ForEach-Object { [string]$_.taskId })
+    $environmentRetryTaskIds = @($tasks | Where-Object { $_.state -eq "environment_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+    $retryTaskIds = @($tasks | Where-Object { $_.state -eq "retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+    $pendingMergeBlocked = @($tasks | Where-Object { $_.state -in @("pending_merge", "merge_retry_scheduled") } | ForEach-Object { [string]$_.taskId })
+    $queuedLikeTaskIds = @($queueRelevantTasks | ForEach-Object { [string]$_.taskId })
+    $currentWave = Get-CurrentExecutionWave -State $State
+    $nextMergeTaskId = if ($NextMergeTask) { [string]$NextMergeTask.taskId } else { "" }
+    $mergePreparedTaskId = if ($MergePreparedTask) { [string]$MergePreparedTask.taskId } else { "" }
+    $signatureParts = @(
+        "wave=$currentWave"
+        "startable=$((@($StartableTaskIds) | ForEach-Object { [string]$_ }) -join ',')"
+        "queue=$($queuedLikeTaskIds -join ',')"
+        "running=$((@($runningTasks | ForEach-Object { [string]$_.taskId })) -join ',')"
+        "merge=$nextMergeTaskId"
+        "prepared=$mergePreparedTaskId"
+    )
+
+    if ($waitingMergeTasks.Count -gt 0) {
+        return [pscustomobject]@{
+            status = "blocked"
+            reason = "A merge is waiting for explicit resolution before queue progress can continue."
+            recommendedAction = "wait_for_user_merge_decision"
+            currentWave = $currentWave
+            candidateTaskIds = @($waitingMergeTasks | ForEach-Object { [string]$_.taskId })
+            queuedLikeTaskIds = @($queuedLikeTaskIds)
+            blockingTaskIds = @($waitingMergeTasks | ForEach-Object { [string]$_.taskId })
+            mergePendingButBlocked = @($pendingMergeBlocked).Count -gt 0
+            manualDebugTaskIds = @($manualDebugTaskIds)
+            environmentRetryTaskIds = @($environmentRetryTaskIds)
+            retryTaskIds = @($retryTaskIds)
+            signature = ($signatureParts -join "|")
+            details = [pscustomobject]@{
+                runningCount = $runningTasks.Count
+                startableCount = @($StartableTaskIds).Count
+                reconcileErrorCount = @($ReconcileErrors).Count
+            }
+        }
+    }
+
+    if ($CircuitBreaker -and $CircuitBreaker.status -notin @("closed", "manual_override")) {
+        return [pscustomobject]@{
+            status = "blocked"
+            reason = "The circuit breaker is open, so no new work may start right now."
+            recommendedAction = "wait_for_breaker_clear"
+            currentWave = $currentWave
+            candidateTaskIds = @()
+            queuedLikeTaskIds = @($queuedLikeTaskIds)
+            blockingTaskIds = @($queuedLikeTaskIds)
+            mergePendingButBlocked = @($pendingMergeBlocked).Count -gt 0
+            manualDebugTaskIds = @($manualDebugTaskIds)
+            environmentRetryTaskIds = @($environmentRetryTaskIds)
+            retryTaskIds = @($retryTaskIds)
+            signature = ($signatureParts -join "|")
+            details = [pscustomobject]@{
+                runningCount = $runningTasks.Count
+                startableCount = @($StartableTaskIds).Count
+                reconcileErrorCount = @($ReconcileErrors).Count
+                breakerStatus = [string]$CircuitBreaker.status
+            }
+        }
+    }
+
+    if (@($ReconcileErrors).Count -gt 0) {
+        return [pscustomobject]@{
+            status = "blocked"
+            reason = "Scheduler reconciliation errors must be resolved before autonomous progress can continue safely."
+            recommendedAction = "investigate_reconcile_errors"
+            currentWave = $currentWave
+            candidateTaskIds = @()
+            queuedLikeTaskIds = @($queuedLikeTaskIds)
+            blockingTaskIds = @(@($ReconcileErrors | ForEach-Object { [string]$_.taskId } | Where-Object { $_ } | Select-Object -Unique))
+            mergePendingButBlocked = @($pendingMergeBlocked).Count -gt 0
+            manualDebugTaskIds = @($manualDebugTaskIds)
+            environmentRetryTaskIds = @($environmentRetryTaskIds)
+            retryTaskIds = @($retryTaskIds)
+            signature = ($signatureParts -join "|")
+            details = [pscustomobject]@{
+                runningCount = $runningTasks.Count
+                startableCount = @($StartableTaskIds).Count
+                reconcileErrorCount = @($ReconcileErrors).Count
+            }
+        }
+    }
+
+    if ($runningTasks.Count -gt 0 -or @($StartableTaskIds).Count -gt 0 -or $NextMergeTask -or $queuedLikeTaskIds.Count -eq 0) {
+        return [pscustomobject]@{
+            status = "none"
+            reason = ""
+            recommendedAction = ""
+            currentWave = $currentWave
+            candidateTaskIds = @()
+            queuedLikeTaskIds = @($queuedLikeTaskIds)
+            blockingTaskIds = @()
+            mergePendingButBlocked = @($pendingMergeBlocked).Count -gt 0
+            manualDebugTaskIds = @($manualDebugTaskIds)
+            environmentRetryTaskIds = @($environmentRetryTaskIds)
+            retryTaskIds = @($retryTaskIds)
+            signature = ($signatureParts -join "|")
+            details = [pscustomobject]@{
+                runningCount = $runningTasks.Count
+                startableCount = @($StartableTaskIds).Count
+                reconcileErrorCount = @($ReconcileErrors).Count
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        status = "stalled"
+        reason = "No running tasks, no startable tasks, and no merge candidate are available even though queued work remains."
+        recommendedAction = "replan"
+        currentWave = $currentWave
+        candidateTaskIds = @($queuedLikeTaskIds)
+        queuedLikeTaskIds = @($queuedLikeTaskIds)
+        blockingTaskIds = @($queuedLikeTaskIds)
+        mergePendingButBlocked = @($pendingMergeBlocked).Count -gt 0
+        manualDebugTaskIds = @($manualDebugTaskIds)
+        environmentRetryTaskIds = @($environmentRetryTaskIds)
+        retryTaskIds = @($retryTaskIds)
+        signature = ($signatureParts -join "|")
+        details = [pscustomobject]@{
+            runningCount = $runningTasks.Count
+            startableCount = @($StartableTaskIds).Count
+            reconcileErrorCount = @($ReconcileErrors).Count
+        }
+    }
+}
+
 function Get-UsageEstimateForTask {
     param(
         $State,
@@ -2422,6 +2563,7 @@ function Get-SnapshotPayload {
     $recentEvents = Get-RecentQueueEvents -EventsFile $EventsFile
     $tasks = @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)
     $taskSnapshots = @($tasks | ForEach-Object { ConvertTo-TaskSnapshot -Task $_ -RepoRoot $State.repoRoot })
+    $startableTaskIds = @(Get-StartableTaskIds -State $State)
     $runningTaskProgress = @($taskSnapshots | Where-Object { $_.state -eq "running" } | ForEach-Object {
         [pscustomobject]@{
             taskId = [string]$_.taskId
@@ -2453,6 +2595,7 @@ function Get-SnapshotPayload {
     } else {
         $null
     }
+    $queueStall = Get-QueueStallSummary -State $State -StartableTaskIds $startableTaskIds -NextMergeTask $nextMergeTask -MergePreparedTask $mergePreparedTask -CircuitBreaker $breaker -ReconcileErrors $ReconcileErrors
 
     return [pscustomobject]@{
         repoRoot = $State.repoRoot
@@ -2466,7 +2609,7 @@ function Get-SnapshotPayload {
         manualDebugTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "manual_debug_needed" } | ForEach-Object { [string]$_.taskId })
         mergeRetryTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "merge_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
         pendingMergeTaskIds = @((Get-Tasks -State $State) | Where-Object { $_.state -eq "pending_merge" } | ForEach-Object { [string]$_.taskId })
-        startableTaskIds = @(Get-StartableTaskIds -State $State)
+        startableTaskIds = @($startableTaskIds)
         nextMergeTaskId = if ($nextMergeTask) { [string]$nextMergeTask.taskId } else { "" }
         mergePreparedTaskId = if ($mergePreparedTask) { [string]$mergePreparedTask.taskId } else { "" }
         mergePreparedPreview = if ($mergePreparedTask) { Get-TaskMergePreview -RepoRoot $State.repoRoot -Task $mergePreparedTask } else { $null }
@@ -2474,6 +2617,8 @@ function Get-SnapshotPayload {
         plannerFeedbackSummary = $plannerFeedbackSummary
         usageProjection = $usageProjection
         circuitBreaker = $breaker
+        queueStall = $queueStall
+        needsReplan = [bool]($queueStall.status -eq "stalled")
         queueProgressSummary = Get-QueueProgressSummary -State $State
         runningTaskProgress = $runningTaskProgress
         queuedTaskProgress = $queuedTaskProgress

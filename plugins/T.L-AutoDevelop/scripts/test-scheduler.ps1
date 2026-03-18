@@ -2249,6 +2249,207 @@ function Test-ProgressMilestonesTranslateToEnglish {
     }
 }
 
+function Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "unplanned-queued"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "queued but unplanned"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "unplanned-queued.json")
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.queueStall.status -eq "stalled") "Queued work without running/startable/merge progress should be marked stalled."
+        Assert-True ($snapshot.needsReplan -eq $true) "Stalled queues should explicitly request replanning."
+        Assert-True ([string]$snapshot.queueStall.recommendedAction -eq "replan") "Stalled queues should recommend replanning."
+        Assert-True (@($snapshot.queueStall.candidateTaskIds) -contains "unplanned-queued") "Stall diagnostics should point at the remaining queued work."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-QueueStallDoesNotTriggerWhileWaitingForUserMergeDecision {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "awaiting-merge-decision"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "waiting for merge decision"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "awaiting-merge-decision.json")
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $true
+                    mergeState = "prepared"
+                    state = "waiting_user_test"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "awaiting-merge-decision" -ResultFile (Join-Path $repo.tasksDir "awaiting-merge-decision-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.queueStall.status -eq "blocked") "Waiting user test should be reported as blocked, not stalled."
+        Assert-True ([string]$snapshot.queueStall.recommendedAction -eq "wait_for_user_merge_decision") "Waiting user test should recommend merge resolution."
+        Assert-True ($snapshot.needsReplan -eq $false) "Waiting user test must not request replanning."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "wave_open"
+                openedAt = (Get-Date).AddMinutes(-1).ToString("o")
+                closedAt = ""
+                scopeWave = 1
+                reasonCategory = "build_infra"
+                reasonSummary = "Correlated failures opened the wave breaker."
+                affectedTaskIds = @("breaker-fail-1","breaker-fail-2","breaker-fail-3")
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                1..3 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "breaker-fail-$_"
+                        sourceCommand = "develop"
+                        sourceInputType = "inline"
+                        taskText = "Recent failed task $_"
+                        solutionPath = $repo.solution
+                        resultFile = (Join-Path $repo.resultsDir "breaker-fail-$_.json")
+                        submissionOrder = $_
+                        waveNumber = 1
+                        blockedBy = @()
+                        declaredDependencies = @()
+                        declaredPriority = "normal"
+                        serialOnly = $false
+                        maxAttempts = 3
+                        attemptsUsed = 1
+                        attemptsRemaining = 2
+                        retryScheduled = $true
+                        waitingUserTest = $false
+                        mergeState = ""
+                        state = "retry_scheduled"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            attemptNumber = 1
+                            taskName = "breaker-fail-$_"
+                            resultFile = ""
+                            processId = 0
+                            startedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                            completedAt = (Get-Date).AddMinutes(-2).ToString("o")
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = ""
+                            feedback = "Build failed"
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @()
+                            branchName = ""
+                            artifacts = $null
+                        }
+                        runs = @()
+                        merge = (New-TestMergeRecord)
+                    }
+                }
+            ) + @(
+                [pscustomobject]@{
+                    taskId = "breaker-queued"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "Queued behind breaker"
+                    solutionPath = $repo.solution
+                    resultFile = (Join-Path $repo.resultsDir "breaker-queued.json")
+                    submissionOrder = 4
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "high"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.queueStall.status -eq "blocked") "Open circuit breaker should block the queue without reporting a stall."
+        Assert-True ([string]$snapshot.queueStall.recommendedAction -eq "wait_for_breaker_clear") "Open circuit breaker should recommend waiting for breaker clear."
+        Assert-True ($snapshot.needsReplan -eq $false) "Breaker-blocked queues must not request replanning."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-OldFailuresDoNotReopenBreaker {
     $repo = New-TestRepo
     try {
@@ -2627,6 +2828,9 @@ Test-ExternalMergeReconciliation
 Test-SnapshotIncludesStructuredProgress
 Test-MalformedProgressArtifactsDoNotBreakSnapshot
 Test-ProgressMilestonesTranslateToEnglish
+Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun
+Test-QueueStallDoesNotTriggerWhileWaitingForUserMergeDecision
+Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen
 Test-TlaMergeLockRemediation
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
