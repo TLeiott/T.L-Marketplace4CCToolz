@@ -73,6 +73,8 @@ function New-TestLatestRun {
         runDir = ""
         schedulerSnapshotPath = ""
         timelinePath = ""
+        workerStdoutPath = ""
+        workerStderrPath = ""
     }
 }
 
@@ -590,6 +592,68 @@ function Test-EnvironmentFailureRefundsAttempts {
         Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKTREE_INVALID") "Environment failure category should be preserved."
         Assert-True ([int]$task.waveNumber -eq 0) "Environment retries should detach from their original wave."
         Assert-True (@($task.blockedBy).Count -eq 0) "Environment retries should clear stale dependency blockers."
+        Assert-True ([string]$task.progress.detail -match "worktree missing") "Environment retries should surface the summary, not only the category."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RunTaskMissingResultUsesCanonicalEnvironmentFailure {
+    $repo = New-TestRepo
+    $shimPath = Join-Path $repo.root "fake-powershell.cmd"
+    try {
+        [System.IO.File]::WriteAllText($shimPath, "@echo off`r`nexit /b 0`r`n", [System.Text.Encoding]::ASCII)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "run-missing-result"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "worker exits without result"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "run-missing-result.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.resultsDir "run-missing-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $result = Invoke-WithEnvironment -Variables @{ AUTODEV_POWERSHELL_COMMAND = $shimPath } -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "run-task" -TaskId "run-missing-result"
+        }
+
+        $task = $result.task
+        Assert-True ([string]$task.state -eq "environment_retry_scheduled") "Direct run-task missing results should become environment retries."
+        Assert-True ([string]$task.finalCategory -eq "WORKER_EXITED_WITHOUT_RESULT") "Direct run-task missing results should use the canonical environment category."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKER_EXITED_WITHOUT_RESULT") "Canonical environment category should be preserved on the task."
+        Assert-True ([string]$task.progress.artifactPointers.workerStdoutPath -match 'stdout\.log$') "Task snapshots should expose the worker stdout log path."
+        Assert-True ([string]$task.progress.artifactPointers.workerStderrPath -match 'stderr\.log$') "Task snapshots should expose the worker stderr log path."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -3948,6 +4012,81 @@ function Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArt
     }
 }
 
+function Test-PrepareEnvironmentPreservesAliveRetryLaunchArtifacts {
+    $repo = New-TestRepo
+    $worktreePath = $null
+    $sleepProcess = $null
+    try {
+        $taskName = "develop-alive-env-retry-a1"
+
+        $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
+        New-Item -ItemType Directory -Path $worktreeBase -Force | Out-Null
+        $worktreePath = Join-Path $worktreeBase $taskName
+        New-Item -ItemType Directory -Path $worktreePath -Force | Out-Null
+        $gitDir = Get-TestGitDir -RepoRoot $repo.root
+        $fakeGitPointer = "gitdir: {0}" -f (Join-Path $gitDir "worktrees\alive-env-retry")
+        Set-Content -LiteralPath (Join-Path $worktreePath ".git") -Value $fakeGitPointer -Encoding UTF8
+
+        $runDir = Join-Path $repo.root (".claude-develop-logs\\runs\\" + $taskName)
+        New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $runDir "timeline.json") -Value "{}" -Encoding UTF8
+
+        $sleepProcess = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 30") -PassThru -WindowStyle Hidden
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "alive-env-retry"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "env retry still alive"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "alive-env-retry.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName $taskName -ResultFile (Join-Path $repo.resultsDir "alive-env-retry.json") -ProcessId $sleepProcess.Id)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-environment"
+        Assert-True ((@($result.cleanupActions | Where-Object { [string]$_.kind -eq "remove_run_artifact" }).Count) -eq 0) "Alive env-retry workers should keep their run artifacts."
+        Assert-True (Test-Path -LiteralPath $runDir) "Alive env-retry run artifacts should remain on disk."
+    } finally {
+        if ($sleepProcess -and -not $sleepProcess.HasExited) {
+            Stop-Process -Id $sleepProcess.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+            Remove-Item -LiteralPath $worktreePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-WaitQueueWakesOnTaskCompletion {
     $repo = New-TestRepo
     try {
@@ -4201,6 +4340,7 @@ function Test-WaitQueueReconcilesWorkerExitWithoutResult {
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-EnvironmentFailureRefundsAttempts
+Test-RunTaskMissingResultUsesCanonicalEnvironmentFailure
 Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
 Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
 Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames
@@ -4250,6 +4390,7 @@ Test-PrepareEnvironmentBlocksUnresolvedGitOperation
 Test-PrepareEnvironmentCleansStaleAutoDevelopRemnants
 Test-PrepareEnvironmentCleansHistoricalOnlyBranchAndArtifacts
 Test-PrepareEnvironmentPreservesRunningLaunchArtifactsAndBranch
+Test-PrepareEnvironmentPreservesAliveRetryLaunchArtifacts
 Test-PrepareEnvironmentCleansRetryScheduledLaunchArtifactsButPreservesNoBranchByDefault
 Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArtifacts
 Test-WaitQueueWakesOnTaskCompletion

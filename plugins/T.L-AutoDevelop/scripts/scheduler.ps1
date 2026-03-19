@@ -497,6 +497,8 @@ function New-LatestRunRecord {
         runDir = ""
         schedulerSnapshotPath = ""
         timelinePath = ""
+        workerStdoutPath = ""
+        workerStderrPath = ""
     }
 }
 
@@ -603,7 +605,9 @@ function Normalize-LatestRun {
             "artifacts",
             "runDir",
             "schedulerSnapshotPath",
-            "timelinePath"
+            "timelinePath",
+            "workerStdoutPath",
+            "workerStderrPath"
         )) {
             if ($null -ne $LatestRun.$property) {
                 Set-ObjectProperty -Object $normalized -Name $property -Value $LatestRun.$property
@@ -809,12 +813,75 @@ function Get-TaskArtifactPointers {
         ""
     }
 
+    $workerStdoutPath = if ($Task.latestRun.workerStdoutPath) {
+        [string]$Task.latestRun.workerStdoutPath
+    } elseif ($Task.latestRun.artifacts -and $Task.latestRun.artifacts.workerStdout) {
+        [string]$Task.latestRun.artifacts.workerStdout
+    } else {
+        ""
+    }
+
+    $workerStderrPath = if ($Task.latestRun.workerStderrPath) {
+        [string]$Task.latestRun.workerStderrPath
+    } elseif ($Task.latestRun.artifacts -and $Task.latestRun.artifacts.workerStderr) {
+        [string]$Task.latestRun.artifacts.workerStderr
+    } else {
+        ""
+    }
+
     return [pscustomobject]@{
         runDir = $runDir
         schedulerSnapshotPath = $schedulerSnapshotPath
         timelinePath = $timelinePath
         resultFile = [string]$Task.latestRun.resultFile
+        workerStdoutPath = $workerStdoutPath
+        workerStderrPath = $workerStderrPath
     }
+}
+
+function Get-TaskEnvironmentFailureDetail {
+    param(
+        $Task,
+        $RecentTimelineEvent = $null
+    )
+
+    $summary = [string]$Task.latestRun.summary
+    $feedback = [string]$Task.latestRun.feedback
+    $category = [string]$Task.lastEnvironmentFailureCategory
+
+    if ($summary) {
+        $detail = $summary.Trim()
+        if ($category) {
+            return "$detail (Environment failure: $category.)"
+        }
+        return $detail
+    }
+
+    if ($feedback) {
+        $firstLine = @($feedback -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1)[0]
+        if ($firstLine) {
+            if ($category) {
+                return "$firstLine (Environment failure: $category.)"
+            }
+            return $firstLine
+        }
+    }
+
+    if ($RecentTimelineEvent -and $RecentTimelineEvent.message) {
+        $timelineDetail = ConvertTo-DisplayText -Text ([string]$RecentTimelineEvent.message)
+        if ($timelineDetail) {
+            if ($category) {
+                return "$timelineDetail (Environment failure: $category.)"
+            }
+            return $timelineDetail
+        }
+    }
+
+    if ($category) {
+        return "Last environment failure: $category."
+    }
+
+    return ""
 }
 
 function Get-RecentTimelineEvent {
@@ -1058,7 +1125,10 @@ function Get-TaskProgress {
         }
         "queued" { $blockerSummary }
         "retry_scheduled" { if ($Task.merge.reason) { [string]$Task.merge.reason } elseif ($Task.latestRun.feedback) { [string]$Task.latestRun.feedback } else { $blockerSummary } }
-        "environment_retry_scheduled" { if ($Task.lastEnvironmentFailureCategory) { "Last environment failure: $([string]$Task.lastEnvironmentFailureCategory)." } elseif ($Task.latestRun.feedback) { [string]$Task.latestRun.feedback } else { $blockerSummary } }
+        "environment_retry_scheduled" {
+            $environmentDetail = Get-TaskEnvironmentFailureDetail -Task $Task -RecentTimelineEvent $recentTimelineEvent
+            if ($environmentDetail) { $environmentDetail } else { $blockerSummary }
+        }
         "manual_debug_needed" { if ($Task.manualDebugReason) { [string]$Task.manualDebugReason } elseif ($Task.latestRun.feedback) { [string]$Task.latestRun.feedback } else { $blockerSummary } }
         "merge_retry_scheduled" { if ($Task.merge.reason) { [string]$Task.merge.reason } else { $blockerSummary } }
         "pending_merge" { $blockerSummary }
@@ -1940,12 +2010,17 @@ function Get-PrepareProtectedBranchReferences {
 function Get-PrepareProtectedLaunchArtifactReferences {
     param($State)
 
+    $protectedTaskNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($task in @(Get-Tasks -State $State)) {
+        $taskName = [string]$task.latestRun.taskName
+        if (-not $taskName) { continue }
+        if ((Is-PrepareProtectedLaunchArtifactState -State ([string]$task.state)) -or (Test-ProcessAlive -ProcessId ([int]$task.latestRun.processId))) {
+            [void]$protectedTaskNames.Add($taskName)
+        }
+    }
+
     return @(
-        @((Get-Tasks -State $State) | Where-Object {
-            Is-PrepareProtectedLaunchArtifactState -State ([string]$_.state)
-        } | ForEach-Object {
-            if ($_.latestRun.taskName) { [string]$_.latestRun.taskName }
-        } | Where-Object { $_ } | Select-Object -Unique)
+        @($protectedTaskNames | Select-Object -Unique)
     )
 }
 
@@ -3712,6 +3787,8 @@ function Run-Task {
             timeline = $artifactPointers.timelinePath
             schedulerSnapshot = $artifactPointers.schedulerSnapshotPath
             workerLauncher = $workerLauncher.command
+            workerStdout = ""
+            workerStderr = ""
         }
         Write-TaskResultFile -Task $task
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
@@ -3740,6 +3817,26 @@ function Run-Task {
     $workerOutputFile = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-stdout.log"
     $workerErrorFile = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-stderr.log"
     Remove-Item -LiteralPath $workerOutputFile, $workerErrorFile -ErrorAction SilentlyContinue
+
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $task = Get-TaskById -State $state -TaskId $TaskId
+        if ($task) {
+            Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
+            $task.latestRun.workerStdoutPath = $workerOutputFile
+            $task.latestRun.workerStderrPath = $workerErrorFile
+            if (-not $task.latestRun.artifacts) {
+                $task.latestRun.artifacts = [pscustomobject]@{}
+            }
+            $task.latestRun.artifacts.workerStdout = $workerOutputFile
+            $task.latestRun.artifacts.workerStderr = $workerErrorFile
+            Write-TaskResultFile -Task $task
+            Save-State -StateFile $context.paths.stateFile -State $state
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
 
     [Console]::Error.WriteLine(("[START] {0}" -f ([string](Get-TaskProgress -RepoRoot $context.repoRoot -Task $task).headline)))
 
@@ -3834,7 +3931,7 @@ function Run-Task {
     if (-not $pipelineResult) {
         $pipelineResult = [pscustomobject]@{
             status = "ERROR"
-            finalCategory = "PIPELINE_RESULT_MISSING"
+            finalCategory = "WORKER_EXITED_WITHOUT_RESULT"
             summary = if ($workerResult.output) { $workerResult.output } else { "Pipeline completed without a result file." }
             feedback = [string]$workerResult.output
             noChangeReason = ""
