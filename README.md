@@ -56,7 +56,13 @@ V4 is queue-centric:
 ## Documentation
 
 - Pipeline report: `AUTODEV_PIPE_REPORT.md`
-- Workflow visualization: `ReadMe-Resources/autodevelop_v4.2.5_complete_pipe_workflow.html`
+- Interactive workflow visualization: `ReadMe-Resources/autodevelop_v4.2.5_complete_pipe_workflow.html`
+
+## Workflow Visualization
+
+[![AutoDevelop V4 workflow](ReadMe-Resources/autodevelop_v4.2.5_complete_pipe_workflow.svg)](ReadMe-Resources/autodevelop_v4.2.5_complete_pipe_workflow.html)
+
+Open the HTML version for the full interactive view.
 
 ## Requirements
 
