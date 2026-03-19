@@ -1,6 +1,6 @@
 {
   "name": "T.L-AutoDevelop",
-  "version": "4.2.1",
+  "version": "4.2.2",
   "description": "Interactive queue-aware .NET dev orchestration with scheduler-planned waves, prepare hygiene checks, task-file intake, retries, and normal merge checkpoints.",
   "author": {
     "name": "TLeiott",

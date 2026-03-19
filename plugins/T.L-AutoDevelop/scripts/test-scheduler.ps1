@@ -100,7 +100,9 @@ function Invoke-SchedulerJson {
         [string]$Mode,
         [string]$TasksFile = "",
         [string]$PlanFile = "",
-        [string]$TaskId = ""
+        [string]$TaskId = "",
+        [int]$WaitTimeoutSeconds = 0,
+        [int]$IdlePollSeconds = 0
     )
 
     $arguments = @(
@@ -113,6 +115,8 @@ function Invoke-SchedulerJson {
     if ($TasksFile) { $arguments += @("-TasksFile", $TasksFile) }
     if ($PlanFile) { $arguments += @("-PlanFile", $PlanFile) }
     if ($TaskId) { $arguments += @("-TaskId", $TaskId) }
+    if ($WaitTimeoutSeconds -gt 0) { $arguments += @("-WaitTimeoutSeconds", [string]$WaitTimeoutSeconds) }
+    if ($IdlePollSeconds -gt 0) { $arguments += @("-IdlePollSeconds", [string]$IdlePollSeconds) }
 
     $raw = & powershell.exe @arguments
     return ($raw | Out-String | ConvertFrom-Json)
@@ -3944,6 +3948,256 @@ function Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArt
     }
 }
 
+function Test-WaitQueueWakesOnTaskCompletion {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "wait-complete-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("src\\Feature.cs")
+            branch = "auto/wait-complete"
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "wait-complete"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "complete while waiting"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "wait-complete.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-wait-complete-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "wait-queue" -WaitTimeoutSeconds 1 -IdlePollSeconds 1
+        Assert-True ([string]$result.status -eq "woke") "wait-queue should wake when a running task completes."
+        Assert-True ([string]$result.reason -eq "task_completed") "wait-queue should report task_completed."
+        Assert-True (@($result.completedTaskIds) -contains "wait-complete") "wait-queue should report completed task ids."
+        Assert-True ([string]$result.snapshot.pendingMergeTaskIds[0] -eq "wait-complete") "wait-queue snapshot should include reconciled pending merge task."
+        Assert-True ($null -ne $result.queueProgressSummary) "wait-queue should return queue progress summary."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WaitQueueWakesOnMergeReady {
+    $repo = New-TestRepo
+    try {
+        $merge = New-TestMergeRecord
+        $merge.state = "prepared"
+        $merge.preparedAt = (Get-Date).ToString("o")
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "wait-merge-ready"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "merge ready"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "wait-merge-ready.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $true
+                    mergeState = "prepared"
+                    state = "waiting_user_test"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-wait-merge-ready-a1" -ResultFile (Join-Path $repo.resultsDir "wait-merge-ready.json"))
+                    runs = @()
+                    merge = $merge
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "wait-queue" -WaitTimeoutSeconds 1 -IdlePollSeconds 1
+        Assert-True ([string]$result.status -eq "woke") "wait-queue should wake when merge is ready."
+        Assert-True ([string]$result.reason -eq "merge_ready") "wait-queue should report merge_ready."
+        Assert-True (@($result.waitingUserTestTaskIds) -contains "wait-merge-ready") "wait-queue should report waiting_user_test tasks."
+        Assert-True ($null -ne $result.mergeTaskProgress) "wait-queue should include merge task progress."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WaitQueueWakesOnBreakerOpen {
+    $repo = New-TestRepo
+    try {
+        $completedAt = (Get-Date).ToString("o")
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                1..3 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "wait-breaker-$($_)"
+                        sourceCommand = "develop"
+                        sourceInputType = "inline"
+                        taskText = "breaker candidate $($_)"
+                        solutionPath = $repo.solution
+                        promptFile = $repo.promptFile
+                        planFile = ""
+                        resultFile = (Join-Path $repo.resultsDir ("wait-breaker-" + $_ + ".json"))
+                        allowNuget = $false
+                        submissionOrder = $_
+                        waveNumber = 1
+                        blockedBy = @()
+                        maxAttempts = 3
+                        attemptsUsed = 1
+                        attemptsRemaining = 2
+                        workerLaunchSequence = 1
+                        retryScheduled = $true
+                        waitingUserTest = $false
+                        mergeState = ""
+                        state = "retry_scheduled"
+                        plannerMetadata = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = "develop-wait-breaker-$($_)-a1"
+                            resultFile = (Join-Path $repo.tasksDir ("wait-breaker-" + $_ + "-result.json"))
+                            processId = 0
+                            startedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                            completedAt = $completedAt
+                            finalStatus = "FAILED"
+                            finalCategory = "BUILD_FAILED"
+                            summary = "failed"
+                            feedback = "failed"
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            actualFiles = @()
+                            branchName = ""
+                            artifacts = $null
+                            runDir = ""
+                            schedulerSnapshotPath = ""
+                            timelinePath = ""
+                        }
+                        runs = @()
+                        merge = (New-TestMergeRecord)
+                    }
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "wait-queue" -WaitTimeoutSeconds 1 -IdlePollSeconds 1
+        Assert-True ([string]$result.status -eq "woke") "wait-queue should wake when the circuit breaker is open."
+        Assert-True ([string]$result.reason -eq "breaker_opened") "wait-queue should report breaker_opened."
+        Assert-True ([string]$result.snapshot.circuitBreaker.status -eq "wave_open") "wait-queue snapshot should expose the opened breaker state."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WaitQueueTimesOutWithoutChanges {
+    $repo = New-TestRepo
+    try {
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "wait-queue" -WaitTimeoutSeconds 1 -IdlePollSeconds 1
+        Assert-True ([string]$result.status -eq "timeout") "wait-queue should time out when nothing changes."
+        Assert-True ([string]$result.reason -eq "timeout") "wait-queue should report timeout."
+        Assert-True ($null -ne $result.snapshot) "wait-queue should still return a snapshot on timeout."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-WaitQueueReconcilesWorkerExitWithoutResult {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "wait-missing-result"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "missing result"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "wait-missing-result.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-wait-missing-result-a1" -ResultFile (Join-Path $repo.tasksDir "missing-launch-result.json") -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "wait-queue" -WaitTimeoutSeconds 1 -IdlePollSeconds 1
+        $task = @($result.snapshot.tasks | Where-Object { [string]$_.taskId -eq "wait-missing-result" })[0]
+        Assert-True ([string]$result.status -eq "woke") "wait-queue should wake when a worker exits without a result."
+        Assert-True ([string]$result.reason -eq "task_completed") "worker exit without result should still count as a completed wake."
+        Assert-True ([string]$task.state -eq "environment_retry_scheduled") "missing result should reconcile into environment retry."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKER_EXITED_WITHOUT_RESULT") "missing result should preserve the environment failure category."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-EnvironmentFailureRefundsAttempts
@@ -3998,5 +4252,10 @@ Test-PrepareEnvironmentCleansHistoricalOnlyBranchAndArtifacts
 Test-PrepareEnvironmentPreservesRunningLaunchArtifactsAndBranch
 Test-PrepareEnvironmentCleansRetryScheduledLaunchArtifactsButPreservesNoBranchByDefault
 Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArtifacts
+Test-WaitQueueWakesOnTaskCompletion
+Test-WaitQueueWakesOnMergeReady
+Test-WaitQueueWakesOnBreakerOpen
+Test-WaitQueueTimesOutWithoutChanges
+Test-WaitQueueReconcilesWorkerExitWithoutResult
 
 Write-Host "Scheduler regression checks passed."

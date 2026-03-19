@@ -1,13 +1,18 @@
 # scheduler.ps1 -- Repo-scoped queue scheduler for AutoDevelop v4
 param(
-    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "prepare-merge", "resolve-merge", "admin-edit-task", "admin-clear-breaker", "prepare-environment")][string]$Mode,
+    [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "wait-queue", "prepare-merge", "resolve-merge", "admin-edit-task", "admin-clear-breaker", "prepare-environment")][string]$Mode,
     [string]$SolutionPath = "",
     [string]$TasksFile = "",
     [string]$PlanFile = "",
     [string]$EditFile = "",
     [string]$TaskId = "",
     [string]$Decision = "",
-    [string]$CommitMessage = ""
+    [string]$CommitMessage = "",
+    [int]$WaitTimeoutSeconds = 7200,
+    [int]$IdlePollSeconds = 2,
+    [bool]$WakeOnAnyCompletion = $true,
+    [bool]$WakeOnMergeReady = $true,
+    [bool]$WakeOnBreakerOpen = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -1402,6 +1407,8 @@ function ConvertTo-TaskSnapshot {
     $progress = Get-TaskProgress -RepoRoot $RepoRoot -Task $Task
     $artifactPointers = Get-TaskArtifactPointers -RepoRoot $RepoRoot -Task $Task
     $integrityWarnings = @(Get-TaskIntegrityWarnings -Task $Task)
+    $processId = 0
+    [void][int]::TryParse(([string]$Task.latestRun.processId), [ref]$processId)
 
     return [pscustomobject]@{
         taskId = [string]$Task.taskId
@@ -1434,6 +1441,8 @@ function ConvertTo-TaskSnapshot {
         mergeAttemptsRemaining = [int]$Task.mergeAttemptsRemaining
         waitingUserTest = [bool]$Task.waitingUserTest
         mergeState = [string]$Task.mergeState
+        processId = $processId
+        completedAt = [string]$Task.latestRun.completedAt
         branchName = [string]$Task.latestRun.branchName
         summary = Get-TaskSummaryText -Task $Task
         finalStatus = [string]$Task.latestRun.finalStatus
@@ -3232,6 +3241,145 @@ function Snapshot-Queue {
     }
 }
 
+function Get-WaitQueueSignature {
+    param($Snapshot)
+
+    $tasks = @($Snapshot.tasks | Sort-Object waveNumber, submissionOrder, taskId | ForEach-Object {
+        [pscustomobject]@{
+            taskId = [string]$_.taskId
+            state = [string]$_.state
+            processId = [int]$_.processId
+            completedAt = [string]$_.completedAt
+            finalStatus = [string]$_.finalStatus
+            finalCategory = [string]$_.finalCategory
+            mergeState = [string]$_.mergeState
+            waitingUserTest = [bool]$_.waitingUserTest
+        }
+    })
+
+    $signaturePayload = [pscustomobject]@{
+        tasks = $tasks
+        circuitBreakerStatus = [string]$Snapshot.circuitBreaker.status
+        mergePreparedTaskId = [string]$Snapshot.mergePreparedTaskId
+        nextMergeTaskId = [string]$Snapshot.nextMergeTaskId
+    }
+
+    return ($signaturePayload | ConvertTo-Json -Depth 16 -Compress)
+}
+
+function Get-WaitQueueSnapshotState {
+    param([string]$ResolvedSolutionPath)
+
+    $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
+    $lock = Acquire-Lock -LockFile $context.paths.lockFile
+    try {
+        $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
+        $preReconcileRunningTaskIds = @((Get-Tasks -State $state) | Where-Object { [string]$_.state -eq "running" } | ForEach-Object { [string]$_.taskId })
+        $beforeStateJson = ($state | ConvertTo-Json -Depth 32 -Compress)
+        $reconcileErrors = @(Reconcile-State -State $state -EventsFile $context.paths.eventsFile)
+        $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
+        $afterStateJson = ($state | ConvertTo-Json -Depth 32 -Compress)
+        if ($afterStateJson -ne $beforeStateJson) {
+            Save-State -StateFile $context.paths.stateFile -State $state
+        }
+
+        $snapshot = Get-SnapshotPayload -State $state -EventsFile $context.paths.eventsFile -ReconcileErrors $reconcileErrors
+        return [pscustomobject]@{
+            preReconcileRunningTaskIds = @($preReconcileRunningTaskIds)
+            snapshot = $snapshot
+            signature = Get-WaitQueueSignature -Snapshot $snapshot
+        }
+    } finally {
+        Release-Lock -LockHandle $lock
+    }
+}
+
+function New-WaitQueueResponse {
+    param(
+        [string]$Status,
+        [string]$Reason,
+        [datetime]$WaitStartedAt,
+        [string[]]$CompletedTaskIds,
+        $SnapshotState
+    )
+
+    $waitEndedAt = Get-Date
+    $snapshot = $SnapshotState.snapshot
+    return [pscustomobject]@{
+        status = $Status
+        reason = $Reason
+        waitStartedAt = $WaitStartedAt.ToString("o")
+        waitEndedAt = $waitEndedAt.ToString("o")
+        elapsedSeconds = [int][Math]::Floor(($waitEndedAt - $WaitStartedAt).TotalSeconds)
+        completedTaskIds = @($CompletedTaskIds)
+        mergePreparedTaskId = [string]$snapshot.mergePreparedTaskId
+        waitingUserTestTaskIds = @($snapshot.tasks | Where-Object { [string]$_.state -eq "waiting_user_test" } | ForEach-Object { [string]$_.taskId })
+        runningTaskIds = @($snapshot.runningTaskIds)
+        queueProgressSummary = $snapshot.queueProgressSummary
+        runningTaskProgress = $snapshot.runningTaskProgress
+        queuedTaskProgress = $snapshot.queuedTaskProgress
+        mergeTaskProgress = $snapshot.mergeTaskProgress
+        recentQueueEvents = $snapshot.recentQueueEvents
+        snapshot = $snapshot
+    }
+}
+
+function Wait-Queue {
+    param(
+        [string]$ResolvedSolutionPath,
+        [int]$WaitTimeoutSeconds = 7200,
+        [int]$IdlePollSeconds = 2,
+        [bool]$WakeOnAnyCompletion = $true,
+        [bool]$WakeOnMergeReady = $true,
+        [bool]$WakeOnBreakerOpen = $true
+    )
+
+    $effectiveTimeoutSeconds = [Math]::Max(0, $WaitTimeoutSeconds)
+    $effectivePollSeconds = [Math]::Max(1, $IdlePollSeconds)
+    $waitStartedAt = Get-Date
+    $deadline = $waitStartedAt.AddSeconds($effectiveTimeoutSeconds)
+
+    $baselineState = Get-WaitQueueSnapshotState -ResolvedSolutionPath $ResolvedSolutionPath
+    $baselineSnapshot = $baselineState.snapshot
+    $baselineSignature = [string]$baselineState.signature
+    $baselineRunningTaskIds = @(@($baselineState.preReconcileRunningTaskIds) + @($baselineSnapshot.runningTaskIds) | Where-Object { $_ } | Select-Object -Unique)
+
+    while ($true) {
+        $currentState = if ($baselineState) {
+            $baselineState
+        } else {
+            Get-WaitQueueSnapshotState -ResolvedSolutionPath $ResolvedSolutionPath
+        }
+        $baselineState = $null
+        $currentSnapshot = $currentState.snapshot
+        $currentSignature = [string]$currentState.signature
+        $completedTaskIds = @($baselineRunningTaskIds | Where-Object { $currentSnapshot.runningTaskIds -notcontains $_ })
+
+        if ($WakeOnBreakerOpen -and [string]$currentSnapshot.circuitBreaker.status -notin @("closed", "manual_override")) {
+            return (New-WaitQueueResponse -Status "woke" -Reason "breaker_opened" -WaitStartedAt $waitStartedAt -CompletedTaskIds $completedTaskIds -SnapshotState $currentState)
+        }
+
+        $hasMergeReady = ([string]$currentSnapshot.mergePreparedTaskId) -or @($currentSnapshot.tasks | Where-Object { [string]$_.state -eq "waiting_user_test" }).Count -gt 0
+        if ($WakeOnMergeReady -and $hasMergeReady) {
+            return (New-WaitQueueResponse -Status "woke" -Reason "merge_ready" -WaitStartedAt $waitStartedAt -CompletedTaskIds $completedTaskIds -SnapshotState $currentState)
+        }
+
+        if ($WakeOnAnyCompletion -and $completedTaskIds.Count -gt 0) {
+            return (New-WaitQueueResponse -Status "woke" -Reason "task_completed" -WaitStartedAt $waitStartedAt -CompletedTaskIds $completedTaskIds -SnapshotState $currentState)
+        }
+
+        if ($currentSignature -ne $baselineSignature) {
+            return (New-WaitQueueResponse -Status "woke" -Reason "queue_changed" -WaitStartedAt $waitStartedAt -CompletedTaskIds $completedTaskIds -SnapshotState $currentState)
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            return (New-WaitQueueResponse -Status "timeout" -Reason "timeout" -WaitStartedAt $waitStartedAt -CompletedTaskIds $completedTaskIds -SnapshotState $currentState)
+        }
+
+        Start-Sleep -Seconds $effectivePollSeconds
+    }
+}
+
 function Prepare-Environment {
     param([string]$ResolvedSolutionPath)
 
@@ -4176,6 +4324,10 @@ switch ($Mode) {
     }
     "run-task" {
         Write-JsonOutput -Object (Run-Task -ResolvedSolutionPath $resolvedSolutionPath -TaskId $TaskId)
+        break
+    }
+    "wait-queue" {
+        Write-JsonOutput -Object (Wait-Queue -ResolvedSolutionPath $resolvedSolutionPath -WaitTimeoutSeconds $WaitTimeoutSeconds -IdlePollSeconds $IdlePollSeconds -WakeOnAnyCompletion $WakeOnAnyCompletion -WakeOnMergeReady $WakeOnMergeReady -WakeOnBreakerOpen $WakeOnBreakerOpen)
         break
     }
     "prepare-merge" {

@@ -259,6 +259,21 @@ The scheduler resolves worker PowerShell in this order:
 
 These workers may run in parallel when they are in the same conservative wave.
 
+Immediately after launching the current wave, hand queue waiting back to the scheduler:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode wait-queue -SolutionPath "<solution>"
+```
+
+Interpret the wait result strictly:
+- `status == "woke"` and `reason == "task_completed"`: snapshot the queue again and continue with section 11
+- `status == "woke"` and `reason == "merge_ready"`: snapshot the queue again and continue with section 11
+- `status == "woke"` and `reason == "breaker_opened"`: stop and report the breaker state plus the returned progress snapshot
+- `status == "woke"` and `reason == "queue_changed"`: snapshot the queue again, report the changed progress state, and continue conservatively with section 11
+- `status == "timeout"`: report the returned progress snapshot and stop cleanly without inventing your own shell sleep or re-entry loop
+
+Do not replace scheduler waiting with `sleep`, `timeout`, or ad hoc polling commands.
+
 Tell the user:
 - which tasks were started now
 - which tasks were queued for later waves
@@ -281,9 +296,9 @@ If `circuitBreaker.status == "manual_override"`, report that the breaker is temp
 
 Do not reduce this to only "started" / "queued" lines when richer progress data is available.
 
-## 11. Handle Completions and Merge Turns
+## 11. Handle Scheduler Wake-Ups and Merge Turns
 
-Whenever you are re-entered after one or more tasks completed, always do this in order:
+Whenever `wait-queue` wakes or you are re-entered while tasks may have progressed, always do this in order:
 1. Snapshot the queue.
 2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
    - call the `scheduler-agent` on the latest snapshot
