@@ -4,7 +4,7 @@ A Claude Code plugin marketplace focused on .NET development automation.
 
 ## Included Plugins
 
-### T.L-AutoDevelop (v4.2.2)
+### T.L-AutoDevelop (v4.2.5)
 
 Interactive queue-aware development orchestration for .NET repositories.
 
@@ -21,7 +21,7 @@ Behavior:
 - prepares normal merges with `git merge --no-commit --no-ff`
 - asks the user to test interactive tasks before the final merge commit
 
-### T.L-AutoDevelop-Pro (v4.2.2)
+### T.L-AutoDevelop-Pro (v4.2.3)
 
 Autonomous queue-aware orchestration built on top of T.L-AutoDevelop.
 
@@ -52,6 +52,11 @@ V4 is queue-centric:
 - retries are scheduled work, not immediate reruns
 - merge preparation and merge resolution are explicit scheduler steps
 - batch commands are removed in favor of unified `/develop` and `/TLA-develop`
+
+## Documentation
+
+- Pipeline report: `AUTODEV_PIPE_REPORT.md`
+- Workflow visualization: `ReadMe-Resources/autodevelop_v4.2.5_complete_pipe_workflow.html`
 
 ## Requirements
 
