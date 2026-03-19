@@ -1867,7 +1867,17 @@ function Write-ResultJson {
 
     $resultDir = Split-Path $ResultFile -Parent
     if (-not (Test-Path $resultDir)) { New-Item -ItemType Directory -Path $resultDir -Force | Out-Null }
-    [System.IO.File]::WriteAllText($ResultFile, $result, [System.Text.Encoding]::UTF8)
+    $tempResultFile = Join-Path $resultDir ([System.IO.Path]::GetFileName($ResultFile) + ".tmp")
+    try {
+        [System.IO.File]::WriteAllText($tempResultFile, $result, [System.Text.Encoding]::UTF8)
+        if (Test-Path -LiteralPath $ResultFile) {
+            [System.IO.File]::Replace($tempResultFile, $ResultFile, $null, $true)
+        } else {
+            [System.IO.File]::Move($tempResultFile, $ResultFile)
+        }
+    } finally {
+        Remove-Item -LiteralPath $tempResultFile -ErrorAction SilentlyContinue
+    }
     Save-DebugText -Name "result.json" -Content $result | Out-Null
     Write-DebugManifest
     Write-SchedulerSnapshot

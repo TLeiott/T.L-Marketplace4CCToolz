@@ -659,6 +659,161 @@ function Test-RunTaskMissingResultUsesCanonicalEnvironmentFailure {
     }
 }
 
+function Test-ReconcileAcceptedResultClearsEnvironmentFailureCategory {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "accepted-after-env-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "done"
+            feedback = ""
+            noChangeReason = ""
+            files = @("src/File.cs")
+            branch = "auto/task-accepted"
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-accepted"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "accepted result after env failure"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-accepted.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-accepted-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-accepted" })[0]
+        Assert-True ([string]$task.state -eq "pending_merge") "Accepted latest-run results should recover env-retry tasks into pending_merge."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "") "Accepted recovery should clear stale environment failure metadata."
+        Assert-True ([string]$task.merge.reason -eq "") "Accepted recovery should clear stale merge failure reasons."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-EnvironmentRepairBudgetFallsBackToNormalRetryAtLimit {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-env-limit"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "env failure at repair limit"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-env-limit.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKTREE_INVALID"
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-env-limit-a1" -ResultFile (Join-Path $repo.tasksDir "missing-result.json") -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-env-limit" })[0]
+        Assert-True ([string]$task.state -eq "retry_scheduled") "Environment failures at the repair limit should fall back to normal retry scheduling."
+        Assert-True ([int]$task.environmentRepairAttemptsUsed -eq 2) "The final environment repair budget unit should still be counted."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKER_EXITED_WITHOUT_RESULT") "The terminal environment failure category should still be recorded."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ReadJsonFileBestEffortRetriesMalformedJson {
+    $testPath = Join-Path $env:TEMP ("scheduler-best-effort-" + [guid]::NewGuid().ToString("N") + ".json")
+    $tempScript = Join-Path $env:TEMP ("scheduler-best-effort-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($testPath, '{"status":', [System.Text.Encoding]::UTF8)
+        $functionDefinition = Get-FunctionDefinitionText -ScriptPath $script:SchedulerPath -FunctionName "Read-JsonFileBestEffort"
+        $escapedPath = $testPath.Replace("'", "''")
+        $wrapped = @"
+$functionDefinition
+`$path = '$escapedPath'
+`$repairJob = Start-Job -ScriptBlock {
+    param(`$TargetPath)
+    Start-Sleep -Milliseconds 250
+    [System.IO.File]::WriteAllText(`$TargetPath, (@{
+        status = "ACCEPTED"
+        finalCategory = "IMPLEMENTED"
+    } | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8)
+} -ArgumentList `$path
+try {
+    `$result = Read-JsonFileBestEffort -Path `$path -RetryCount 10 -RetryDelayMilliseconds 100
+    if (`$result) {
+        [string]`$result.status
+    }
+} finally {
+    Wait-Job `$repairJob | Out-Null
+    Remove-Job `$repairJob -Force -ErrorAction SilentlyContinue
+}
+"@
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $status = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript | Out-String).Trim()
+        Assert-True (([string]$status).Trim() -match "ACCEPTED") "Best-effort JSON reads should recover from a transient malformed file."
+    } finally {
+        Remove-Item -LiteralPath $tempScript, $testPath -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-EnvironmentRetryDoesNotBecomeDirectlyStartable {
     $repo = New-TestRepo
     try {
@@ -4337,10 +4492,214 @@ function Test-WaitQueueReconcilesWorkerExitWithoutResult {
     }
 }
 
+function Test-EnvironmentRetryLateResultRecoversToPendingMerge {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "late-arriving-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ACCEPTED"
+            finalCategory = "IMPLEMENTED"
+            summary = "late success"
+            feedback = ""
+            noChangeReason = ""
+            files = @("src/Late.cs")
+            branch = "auto/task-late"
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-late"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "late result"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-late.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-late-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-late" })[0]
+        Assert-True ([string]$task.state -eq "pending_merge") "Env-retry tasks should recover when the latest-run result appears later."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "") "Late accepted results should clear stale environment failure metadata."
+        Assert-True ([string]$task.finalStatus -eq "ACCEPTED") "Recovered late results should populate the task snapshot status."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-EnvironmentRetryLateNoChangeRecoversWithoutFailureResidue {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "late-no-change-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "NO_CHANGE"
+            finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+            summary = "already satisfied"
+            feedback = ""
+            noChangeReason = "NO_CHANGE_ALREADY_SATISFIED"
+            files = @()
+            branch = ""
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-late-no-change"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "late no change"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-late-no-change.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-late-no-change-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-late-no-change" })[0]
+        Assert-True ([string]$task.state -eq "completed_no_change") "Late no-change results should recover env-retry tasks into completed_no_change."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "") "Late no-change recovery should clear stale environment failure metadata."
+        Assert-True ([string]$task.merge.reason -eq "") "Late no-change recovery should clear stale merge failure reasons."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-EnvironmentRetryReconcileDoesNotReplayFailureResult {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "late-failure-result.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "ERROR"
+            finalCategory = "WORKER_EXITED_WITHOUT_RESULT"
+            summary = "missing result"
+            feedback = ""
+            noChangeReason = ""
+            files = @()
+            branch = ""
+            artifacts = $null
+        } | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-late-failure"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "late failure result"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-late-failure.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 1
+                    environmentRepairAttemptsRemaining = 1
+                    lastEnvironmentFailureCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    retryScheduled = $true
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "environment_retry_scheduled"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-task-late-failure-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $firstSnapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $secondSnapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($secondSnapshot.tasks | Where-Object { [string]$_.taskId -eq "task-late-failure" })[0]
+        $firstTask = @($firstSnapshot.tasks | Where-Object { [string]$_.taskId -eq "task-late-failure" })[0]
+        Assert-True ([string]$firstTask.state -eq "environment_retry_scheduled") "Failure artifacts should not recover env-retry tasks."
+        Assert-True ([string]$task.state -eq "environment_retry_scheduled") "Repeated reconciliation should leave failure-result env retries unchanged."
+        Assert-True ([int]$task.environmentRepairAttemptsUsed -eq 1) "Repeated reconciliation should not consume extra environment repair budget."
+        Assert-True ((@($task.runs).Count) -eq 0) "Repeated reconciliation should not append duplicate run records for failure artifacts."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-SolutionPathFallback
 Test-CompletedAtRoundTrip
 Test-EnvironmentFailureRefundsAttempts
 Test-RunTaskMissingResultUsesCanonicalEnvironmentFailure
+Test-ReconcileAcceptedResultClearsEnvironmentFailureCategory
+Test-EnvironmentRepairBudgetFallsBackToNormalRetryAtLimit
+Test-ReadJsonFileBestEffortRetriesMalformedJson
 Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
 Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
 Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames
@@ -4394,6 +4753,9 @@ Test-PrepareEnvironmentPreservesAliveRetryLaunchArtifacts
 Test-PrepareEnvironmentCleansRetryScheduledLaunchArtifactsButPreservesNoBranchByDefault
 Test-PrepareEnvironmentPreservesPendingMergeBranchButCleansOldLaunchArtifacts
 Test-WaitQueueWakesOnTaskCompletion
+Test-EnvironmentRetryLateResultRecoversToPendingMerge
+Test-EnvironmentRetryLateNoChangeRecoversWithoutFailureResidue
+Test-EnvironmentRetryReconcileDoesNotReplayFailureResult
 Test-WaitQueueWakesOnMergeReady
 Test-WaitQueueWakesOnBreakerOpen
 Test-WaitQueueTimesOutWithoutChanges
