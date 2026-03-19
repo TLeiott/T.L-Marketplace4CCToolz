@@ -2483,7 +2483,7 @@ function Get-EnvironmentRetryableResult {
     $Task.merge.branchName = ""
     $Task.manualDebugReason = ""
 
-    if ([int]$Task.environmentRepairAttemptsUsed -le [int]$Task.maxEnvironmentRepairAttempts) {
+    if ([int]$Task.environmentRepairAttemptsUsed -lt [int]$Task.maxEnvironmentRepairAttempts) {
         $Task.state = "environment_retry_scheduled"
         return
     }
@@ -2733,6 +2733,7 @@ function Apply-PipelineResultToTask {
             $Task.state = "pending_merge"
             $Task.retryScheduled = $false
             $Task.waitingUserTest = $false
+            $Task.lastEnvironmentFailureCategory = ""
             $Task.mergeState = "pending"
             $Task.merge.state = "pending"
             $Task.merge.branchName = [string]$PipelineResult.branch
@@ -2744,8 +2745,11 @@ function Apply-PipelineResultToTask {
                 $Task.state = "completed_no_change"
                 $Task.retryScheduled = $false
                 $Task.waitingUserTest = $false
+                $Task.lastEnvironmentFailureCategory = ""
                 $Task.mergeState = "no_change"
                 $Task.merge.state = "no_change"
+                $Task.merge.reason = ""
+                $Task.merge.branchName = ""
                 $Task.manualDebugReason = ""
             } else {
                 Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
@@ -2776,6 +2780,21 @@ function Reconcile-TaskState {
         [string]$RepoRoot = ""
     )
 
+    if ([string]$Task.state -eq "environment_retry_scheduled") {
+        $latePipelineResult = Read-JsonFileBestEffort -Path $Task.latestRun.resultFile
+        $lateStatus = [string]$latePipelineResult.status
+        $lateCategory = [string]$latePipelineResult.finalCategory
+        $canRecoverFromLateResult =
+            $latePipelineResult -and (
+                $lateStatus -eq "ACCEPTED" -or
+                ($lateStatus -eq "NO_CHANGE" -and $lateCategory -eq "NO_CHANGE_ALREADY_SATISFIED")
+            )
+        if ($canRecoverFromLateResult) {
+            Apply-PipelineResultToTask -Task $Task -PipelineResult $latePipelineResult -RepoRoot $RepoRoot
+            return
+        }
+    }
+
     if ($RepoRoot -and $Task.state -in @("pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test")) {
         $branchName = [string]$Task.latestRun.branchName
         if ($branchName -and (Invoke-GitCleanCheck -RepoRoot $RepoRoot) -and (Test-BranchMergedIntoHead -RepoRoot $RepoRoot -BranchName $branchName)) {
@@ -2802,7 +2821,7 @@ function Reconcile-TaskState {
         return
     }
 
-    $pipelineResult = Read-JsonFile -Path $Task.latestRun.resultFile
+    $pipelineResult = Read-JsonFileBestEffort -Path $Task.latestRun.resultFile
     if ($pipelineResult) {
         Apply-PipelineResultToTask -Task $Task -PipelineResult $pipelineResult -RepoRoot $RepoRoot
         return
@@ -3927,7 +3946,7 @@ function Run-Task {
         output = ((@($stdoutText, $stderrText) | Where-Object { $_ }) -join [Environment]::NewLine).Trim()
         exitCode = [int]$process.ExitCode
     }
-    $pipelineResult = Read-JsonFile -Path $pipelineResultPath
+    $pipelineResult = Read-JsonFileBestEffort -Path $pipelineResultPath
     if (-not $pipelineResult) {
         $pipelineResult = [pscustomobject]@{
             status = "ERROR"
