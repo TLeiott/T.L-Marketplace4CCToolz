@@ -14,6 +14,7 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - accepts either a direct task text or a file containing multiple tasks
 - uses the read-only `scheduler-agent` to plan conservative execution waves
 - starts multiple worker pipes asynchronously when their likely edit scopes are disjoint
+- lets `scheduler.ps1` wait for queue changes after launches instead of relying on external sleep-based polling
 - leaves successful worker changes on normal branches for later merge preparation
 - prepares merges with normal merge semantics instead of squash
 - requires explicit user testing and confirmation before committing interactive merges

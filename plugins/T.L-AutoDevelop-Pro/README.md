@@ -12,6 +12,7 @@ Autonomous queue-aware orchestration built on top of [T.L-AutoDevelop](../T.L-Au
 - accepts either a direct task text or a file containing multiple tasks
 - uses the same read-only Scheduler-Agent wave planning model
 - starts autonomous worker pipes in conservative parallel waves
+- lets the shared scheduler wait for queue changes after launches instead of relying on external sleep-based polling
 - prepares merges with normal merge semantics
 - commits prepared merges automatically after validation succeeds
 

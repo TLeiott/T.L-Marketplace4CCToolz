@@ -1036,8 +1036,8 @@ function Ensure-ArtifactDir {
         $logDir = Join-Path $Root ".claude-develop-logs\runs"
         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
         $script:artifactRunDir = Join-Path $logDir $TaskName
-        if (-not (Test-Path $artifactRunDir)) { New-Item -ItemType Directory -Path $artifactRunDir -Force | Out-Null }
     }
+    if ($artifactRunDir -and -not (Test-Path $artifactRunDir)) { New-Item -ItemType Directory -Path $artifactRunDir -Force | Out-Null }
     return $artifactRunDir
 }
 
@@ -1061,7 +1061,7 @@ function Save-Artifact {
         [string]$Subdir = ""
     )
     if (-not $artifactRunDir) { return $null }
-    $targetDir = $artifactRunDir
+    $targetDir = Ensure-ArtifactDir -Root $repoRoot
     if ($Subdir) {
         $targetDir = Join-Path $artifactRunDir $Subdir
         if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }

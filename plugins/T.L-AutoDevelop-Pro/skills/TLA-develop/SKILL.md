@@ -219,6 +219,21 @@ The scheduler resolves worker PowerShell in this order:
 
 These workers may run in parallel when their current wave allows it.
 
+Immediately after launching the current wave, hand queue waiting back to the scheduler:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode wait-queue -SolutionPath "<solution>"
+```
+
+Interpret the wait result strictly:
+- `status == "woke"` and `reason == "task_completed"`: snapshot the queue again and continue with section 9
+- `status == "woke"` and `reason == "merge_ready"`: snapshot the queue again and continue with section 9
+- `status == "woke"` and `reason == "breaker_opened"`: stop and report the breaker state plus the returned progress snapshot
+- `status == "woke"` and `reason == "queue_changed"`: snapshot the queue again, report the changed progress state, and continue conservatively with section 9
+- `status == "timeout"`: report the returned progress snapshot and stop cleanly without inventing your own shell sleep or re-entry loop
+
+Do not replace scheduler waiting with `sleep`, `timeout`, or ad hoc polling commands.
+
 Report to the user:
 - which tasks started
 - which startable tasks were deferred because they did not fit the projected 5h budget
@@ -245,7 +260,7 @@ Do not reduce this to only "started" / "queued" lines when richer progress data 
 
 ## 9. Autonomous Merge Flow
 
-Whenever you re-enter after task completion:
+Whenever `wait-queue` wakes or you re-enter while tasks may have progressed:
 1. Snapshot the queue.
 2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
    - call the `scheduler-agent` on the latest snapshot
