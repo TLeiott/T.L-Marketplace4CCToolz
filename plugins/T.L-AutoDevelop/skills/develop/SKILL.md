@@ -193,9 +193,12 @@ Give it:
 - the new tasks added in this invocation
 - the current running tasks
 - the current pending-merge tasks
+- recent completed task discovery briefs from the latest queue snapshot
 - recent planner feedback from `plannerFeedbackSummary`
 - the nearest relevant `CLAUDE.md`, `AGENTS.md`, and `README.md`
 - up to three additional nearby `*.md` files from relevant module or `docs/` directories
+
+Use `completedTaskBriefs` only as advisory planning context for recently touched files, shared modules, and conflict risk. Do not treat them as hard dependency evidence when they are vague or failure-only.
 
 Ask it for a conservative whole-queue execution plan in JSON with:
 - `summary`

@@ -1338,12 +1338,13 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     $promptFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md'
     $solutionPath = 'D:\Repos\My Repo\My Solution.slnx'
     $resultFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json'
+    $plannerContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json'
     $taskName = 'develop-task-a1'
     $taskId = 'task-spaces'
     $commandType = 'develop'
 
     $encoded = Invoke-SchedulerHelperFunctions -FunctionNames @("ConvertTo-PowerShellSingleQuotedLiteral", "Get-EncodedWorkerLaunchCommand") -ScriptBlock {
-        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
+        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -PlannerContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
     }
 
     $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(([string]$encoded).Trim()))
@@ -1353,7 +1354,83 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     Assert-True ($decoded -match [regex]::Escape($promptFile)) "Encoded worker launch must preserve the full spaced prompt path."
     Assert-True ($decoded -match [regex]::Escape($solutionPath)) "Encoded worker launch must preserve the full spaced solution path."
     Assert-True ($decoded -match [regex]::Escape($resultFile)) "Encoded worker launch must preserve the full spaced result path."
+    Assert-True ($decoded -match [regex]::Escape($plannerContextFile)) "Encoded worker launch must preserve the planner context file path."
     Assert-True ($decoded -notmatch '-File\s+C:\\Users\\Example') "Encoded worker launch must not rely on a raw -File argument that can split at spaces."
+}
+
+function Test-WritePlannerContextFilePersistsEffortClass {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @("Ensure-Directory", "Ensure-ParentDirectory", "Write-PlannerContextFile") -ScriptBlock {
+        $path = Join-Path $env:TEMP ("planner-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        $task = [pscustomobject]@{
+            taskId = "task-planner"
+            waveNumber = 3
+            plannerMetadata = [pscustomobject]@{
+                effortClass = "LOW"
+                likelyFiles = @("src\App.cs")
+            }
+        }
+        Write-PlannerContextFile -Path $path -Task $task
+        try {
+            [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    Assert-True ([string]$parsed.taskId -eq "task-planner") "Planner context file should persist the task id."
+    Assert-True ([int]$parsed.waveNumber -eq 3) "Planner context file should persist the wave number."
+    Assert-True ([string]$parsed.plannerMetadata.effortClass -eq "LOW") "Planner context file should persist plannerMetadata.effortClass."
+}
+
+function Test-PlannerContextLowEffortSelectsSimpleProfile {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Get-NormalizedPlannerEffortClass",
+        "Get-PipelineProfile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("planner-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"plannerMetadata":{"effortClass":"LOW"}}', [System.Text.Encoding]::UTF8)
+        try {
+            $context = Read-JsonFileBestEffort -Path $path
+            [pscustomobject]@{
+                plannerEffortClass = Get-NormalizedPlannerEffortClass -EffortClass ([string]$context.plannerMetadata.effortClass)
+                pipelineProfile = Get-PipelineProfile -PlannerEffortClass ([string]$context.plannerMetadata.effortClass)
+            } | ConvertTo-Json -Depth 6
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.plannerEffortClass -eq "LOW") "LOW planner effort should remain normalized as LOW."
+    Assert-True ([string]$parsed.pipelineProfile -eq "SIMPLE") "LOW planner effort should select the SIMPLE pipeline profile."
+}
+
+function Test-MissingPlannerContextFallsBackToComplexProfile {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Get-NormalizedPlannerEffortClass",
+        "Get-PipelineProfile"
+    ) -ScriptBlock {
+        $missingPath = Join-Path $env:TEMP ("missing-planner-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        $context = Read-JsonFileBestEffort -Path $missingPath
+        $plannerEffortClass = if ($context -and $context.plannerMetadata) {
+            Get-NormalizedPlannerEffortClass -EffortClass ([string]$context.plannerMetadata.effortClass)
+        } else {
+            "UNKNOWN"
+        }
+        [pscustomobject]@{
+            contextLoaded = [bool]$context
+            plannerEffortClass = $plannerEffortClass
+            pipelineProfile = Get-PipelineProfile -PlannerEffortClass $plannerEffortClass
+        } | ConvertTo-Json -Depth 6
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.contextLoaded -eq $false) "Missing planner context should not load successfully."
+    Assert-True ([string]$parsed.plannerEffortClass -eq "UNKNOWN") "Missing planner context should fall back to UNKNOWN effort."
+    Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
 }
 
 function Test-RegistrationRejectsMissingPromptFile {
@@ -1823,6 +1900,378 @@ function Test-UsageProjectionAndPlannerFeedback {
         Assert-True ($snapshot.plannerFeedbackSummary.evaluatedTasks -eq 1) "Snapshot should expose planner feedback summary."
         Assert-True ([double]$snapshot.plannerFeedbackSummary.averageHitRate -gt 0) "Planner feedback summary should include a hit rate."
         Assert-True ([int]$snapshot.usageProjection.fullQueueEstimatedMinutes -ge 0) "Snapshot should expose queue usage projection."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-TaskDiscoveryBriefUsesCompactCompletedTaskData {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief"
+    ) -ScriptBlock {
+        $task = [pscustomobject]@{
+            taskId = "task-brief"
+            waveNumber = 2
+            state = "pending_merge"
+            taskText = "Fix null reference in OrderService.GetById by tightening DTO access and keeping test coverage up to date."
+            plannerMetadata = [pscustomobject]@{
+                likelyAreas = @("Services", "DTO")
+                likelyFiles = @("src\\Services\\OrderService.cs")
+            }
+            plannerFeedback = [pscustomobject]@{
+                classification = "broad"
+            }
+            latestRun = [pscustomobject]@{
+                finalStatus = "ACCEPTED"
+                finalCategory = "ACCEPTED"
+                summary = "Added null-safe navigation in OrderService and extended regression test coverage for the failing DTO branch."
+                investigationConclusion = "OrderService shares CustomerDto with ShippingService and both paths rely on the same null-sensitive shape."
+                feedback = ""
+                actualFiles = @(
+                    "src\\Services\\OrderService.cs",
+                    "tests\\OrderServiceTests.cs",
+                    "src\\Shared\\CustomerDto.cs",
+                    "docs\\note.md",
+                    "extra\\one.cs",
+                    "extra\\two.cs",
+                    "extra\\three.cs"
+                )
+                completedAt = "2026-03-24T10:00:00.0000000Z"
+            }
+        }
+        (Get-TaskDiscoveryBrief -Task $task) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.taskId -eq "task-brief") "Discovery brief should preserve task id."
+    Assert-True ([string]$parsed.status -eq "ACCEPTED") "Discovery brief should use latest final status."
+    Assert-True (@($parsed.filesChanged).Count -eq 6) "Discovery brief should cap changed files."
+    Assert-True (@($parsed.discoveries).Count -le 2) "Discovery brief should cap discoveries."
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$parsed.conflictHints)) "Discovery brief should emit a compact conflict hint when useful."
+}
+
+function Test-CompletedTaskBriefsAreOrderedAndCapped {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs"
+    ) -ScriptBlock {
+        $state = [pscustomobject]@{
+            tasks = @(
+                1..10 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "task-$($_)"
+                        submissionOrder = $_
+                        waveNumber = 1
+                        state = "merged"
+                        taskText = "Task $_"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            finalStatus = "ACCEPTED"
+                            finalCategory = "ACCEPTED"
+                            summary = "Done $_"
+                            feedback = ""
+                            investigationConclusion = ""
+                            actualFiles = @("src\\File$($_).cs")
+                            completedAt = ("2026-03-24T{0:d2}:00:00.0000000Z" -f $_)
+                        }
+                    }
+                }
+            )
+        }
+        (Get-CompletedTaskBriefs -State $state) | ConvertTo-Json -Depth 8
+    }
+
+    [object[]]$parsed = ConvertFrom-Json $output
+    Assert-True ($parsed.Count -eq 8) "Completed task briefs should be capped to the most recent eight entries."
+    Assert-True ([string]$parsed[0].taskId -eq "task-10") "Completed task briefs should order newest completed tasks first."
+    Assert-True ([string]$parsed[-1].taskId -eq "task-3") "Completed task briefs should trim older completed tasks."
+}
+
+function Test-CompletedTaskBriefsPreferHigherConfidenceStatesWhenCapped {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs"
+    ) -ScriptBlock {
+        $state = [pscustomobject]@{
+            tasks = @(
+                1..5 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "merged-$($_)"
+                        submissionOrder = $_
+                        waveNumber = 1
+                        state = "merged"
+                        taskText = "Merged $_"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            finalStatus = "ACCEPTED"
+                            finalCategory = "ACCEPTED"
+                            summary = "Merged $_"
+                            feedback = ""
+                            investigationConclusion = ""
+                            actualFiles = @("src\\Merged$($_).cs")
+                            completedAt = ("2026-03-24T0{0}:00:00.0000000Z" -f $_)
+                        }
+                    }
+                }
+                6..10 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "failed-$($_)"
+                        submissionOrder = $_
+                        waveNumber = 1
+                        state = "completed_failed_terminal"
+                        taskText = "Failed $_"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            finalStatus = "FAILED"
+                            finalCategory = "PREFLIGHT_FAILED"
+                            summary = "Failed $_"
+                            feedback = "Failure $_"
+                            investigationConclusion = ""
+                            actualFiles = @("src\\Failed$($_).cs")
+                            completedAt = ("2026-03-24T1{0}:00:00.0000000Z" -f ($_ - 5))
+                        }
+                    }
+                }
+            )
+        }
+        (Get-CompletedTaskBriefs -State $state) | ConvertTo-Json -Depth 8
+    }
+
+    [object[]]$parsed = ConvertFrom-Json $output
+    Assert-True ($parsed.Count -eq 8) "Completed task briefs should still cap to eight entries after priority sorting."
+    Assert-True (@($parsed | Where-Object { [string]$_.taskId -like 'merged-*' }).Count -eq 5) "Higher-confidence merged briefs should survive capping."
+    Assert-True (@($parsed | Where-Object { [string]$_.taskId -like 'failed-*' }).Count -eq 3) "Lower-confidence failed briefs should only fill remaining brief slots."
+}
+
+function Test-CompletedTaskBriefsUseRecencyWithinSameConfidenceTier {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs"
+    ) -ScriptBlock {
+        $state = [pscustomobject]@{
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "pending-newer"
+                    submissionOrder = 2
+                    waveNumber = 1
+                    state = "pending_merge"
+                    taskText = "Newer pending"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Newer pending"
+                        feedback = ""
+                        investigationConclusion = ""
+                        actualFiles = @("src\\PendingNewer.cs")
+                        completedAt = "2026-03-24T11:00:00.0000000Z"
+                    }
+                },
+                [pscustomobject]@{
+                    taskId = "pending-older"
+                    submissionOrder = 1
+                    waveNumber = 1
+                    state = "pending_merge"
+                    taskText = "Older pending"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Older pending"
+                        feedback = ""
+                        investigationConclusion = ""
+                        actualFiles = @("src\\PendingOlder.cs")
+                        completedAt = "2026-03-24T10:00:00.0000000Z"
+                    }
+                },
+                [pscustomobject]@{
+                    taskId = "failed-newer"
+                    submissionOrder = 4
+                    waveNumber = 1
+                    state = "completed_failed_terminal"
+                    taskText = "Newer failed"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "FAILED"
+                        finalCategory = "PREFLIGHT_FAILED"
+                        summary = "Newer failed"
+                        feedback = "Failure"
+                        investigationConclusion = ""
+                        actualFiles = @("src\\FailedNewer.cs")
+                        completedAt = "2026-03-24T13:00:00.0000000Z"
+                    }
+                },
+                [pscustomobject]@{
+                    taskId = "failed-older"
+                    submissionOrder = 3
+                    waveNumber = 1
+                    state = "completed_failed_terminal"
+                    taskText = "Older failed"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "FAILED"
+                        finalCategory = "PREFLIGHT_FAILED"
+                        summary = "Older failed"
+                        feedback = "Failure"
+                        investigationConclusion = ""
+                        actualFiles = @("src\\FailedOlder.cs")
+                        completedAt = "2026-03-24T12:00:00.0000000Z"
+                    }
+                }
+            )
+        }
+        (Get-CompletedTaskBriefs -State $state) | ConvertTo-Json -Depth 8
+    }
+
+    [object[]]$parsed = ConvertFrom-Json $output
+    Assert-True ([string]$parsed[0].taskId -eq "pending-newer") "Newer tasks should sort first within the same confidence tier."
+    Assert-True ([string]$parsed[1].taskId -eq "pending-older") "Older tasks should follow within the same confidence tier."
+    Assert-True ([string]$parsed[2].taskId -eq "failed-newer") "Lower-confidence tiers should still be ordered by recency internally."
+    Assert-True ([string]$parsed[3].taskId -eq "failed-older") "Older tasks in the same lower-confidence tier should follow newer ones."
+}
+
+function Test-SnapshotIncludesCompletedTaskBriefs {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = [pscustomobject]@{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-complete"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "Tighten the null handling in OrderService."
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-complete.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "merged"
+                    plannerMetadata = [pscustomobject]@{ likelyAreas = @("Services") }
+                    plannerFeedback = [pscustomobject]@{ classification = "acceptable" }
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        launchSequence = 1
+                        taskName = "develop-task-complete-a1"
+                        resultFile = (Join-Path $repo.resultsDir "task-complete.json")
+                        processId = 0
+                        startedAt = (Get-Date).AddMinutes(-20).ToString("o")
+                        completedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Updated OrderService null handling and kept the regression test passing."
+                        feedback = ""
+                        noChangeReason = ""
+                        investigationConclusion = "OrderService and CustomerDto are shared with shipping-related code paths."
+                        reproductionConfirmed = $false
+                        actualFiles = @("src\\Services\\OrderService.cs", "tests\\OrderServiceTests.cs")
+                        branchName = "auto/task-complete"
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "task-running"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "Still running."
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-running.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-running-a1"
+                        resultFile = (Join-Path $repo.resultsDir "task-running.json")
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True (@($snapshot.completedTaskBriefs).Count -eq 1) "Snapshot should expose one completed task brief for the finished task."
+        Assert-True ([string]$snapshot.completedTaskBriefs[0].taskId -eq "task-complete") "Snapshot should include the completed task brief."
+        Assert-True (@($snapshot.completedTaskBriefs | Where-Object { [string]$_.taskId -eq "task-running" }).Count -eq 0) "Snapshot should exclude running tasks from completed task briefs."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -4710,12 +5159,20 @@ Test-ManualDebugTaskResumesToQueuedOnPositiveReplan
 Test-ManualDebugTaskStaysPausedWithoutPositiveWaveReplan
 Test-SnapshotResilience
 Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
+Test-WritePlannerContextFilePersistsEffortClass
+Test-PlannerContextLowEffortSelectsSimpleProfile
+Test-MissingPlannerContextFallsBackToComplexProfile
 Test-RegistrationRejectsMissingPromptFile
 Test-SnapshotSurfacesMissingPromptFileIntegrityError
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
 Test-UsageProjectionAndPlannerFeedback
+Test-TaskDiscoveryBriefUsesCompactCompletedTaskData
+Test-CompletedTaskBriefsAreOrderedAndCapped
+Test-CompletedTaskBriefsPreferHigherConfidenceStatesWhenCapped
+Test-CompletedTaskBriefsUseRecencyWithinSameConfidenceTier
+Test-SnapshotIncludesCompletedTaskBriefs
 Test-PlannerFeedbackMatchesFilenameOnlyPredictions
 Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches
 Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions

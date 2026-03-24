@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][string]$PromptFile,
     [Parameter(Mandatory)][string]$SolutionPath,
     [Parameter(Mandatory)][string]$ResultFile,
+    [string]$PlannerContextFile = "",
     [string]$TaskName = "develop-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
     [string]$SchedulerTaskId = "",
     [string]$CommandType = "",
@@ -81,6 +82,8 @@ $discoverConclusion = ""
 $routeDecision = "UNCERTAIN"
 $testability = "UNKNOWN"
 $testProjects = @()
+$plannerEffortClass = "UNKNOWN"
+$pipelineProfile = "COMPLEX"
 $reproductionAttempted = $false
 $reproductionConfirmed = $false
 $reproductionOutput = ""
@@ -142,6 +145,20 @@ function Get-CanonicalPath {
     }
 }
 
+function Read-JsonFileBestEffort {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        return ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+    } catch {
+        try {
+            return ([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json)
+        } catch {
+            return $null
+        }
+    }
+}
+
 function Normalize-RepoRelativePath {
     param([string]$Path)
     if (-not $Path) { return "" }
@@ -150,6 +167,21 @@ function Normalize-RepoRelativePath {
         $normalized = $normalized.Substring(2)
     }
     return $normalized.TrimStart('\')
+}
+
+function Get-NormalizedPlannerEffortClass {
+    param([string]$EffortClass)
+    $value = ([string]$EffortClass).Trim().ToUpperInvariant()
+    if ($value -in @("LOW", "MEDIUM", "HIGH")) { return $value }
+    return "UNKNOWN"
+}
+
+function Get-PipelineProfile {
+    param([string]$PlannerEffortClass)
+    if ((Get-NormalizedPlannerEffortClass -EffortClass $PlannerEffortClass) -eq "LOW") {
+        return "SIMPLE"
+    }
+    return "COMPLEX"
 }
 
 function Get-NormalizedPathSet {
@@ -1595,8 +1627,10 @@ function Test-ConcreteTestTargets {
 function Get-ModelForPlan {
     param(
         [string]$TaskClass,
-        [string[]]$Targets
+        [string[]]$Targets,
+        [string]$PipelineProfile = "COMPLEX"
     )
+    if ($PipelineProfile -eq "SIMPLE") { return $CONST_MODEL_FAST }
     if ($TaskClass -eq "DIRECT_EDIT") { return $CONST_MODEL_FAST }
     if (Test-ConcreteTargets -Targets $Targets) { return $CONST_MODEL_FAST }
     return $CONST_MODEL_PLAN
@@ -1644,8 +1678,12 @@ function Get-ModelForImplement {
         [bool]$InvestigationRequired,
         [string[]]$Targets,
         [string]$TaskText = "",
-        [string]$PhaseContext = ""
+        [string]$PhaseContext = "",
+        [string]$PipelineProfile = "COMPLEX"
     )
+    if ($PipelineProfile -eq "SIMPLE" -and (Test-ConcreteTargets -Targets $Targets) -and $Targets.Count -le 3) {
+        return $CONST_MODEL_FAST
+    }
     if (Test-LowComplexityImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PhaseContext) {
         return $CONST_MODEL_FAST
     }
@@ -1659,17 +1697,18 @@ function Get-ModelForRepair {
         [bool]$InvestigationRequired,
         [string[]]$Targets,
         [string]$PreviousOutput = "",
-        [string]$TaskText = ""
+        [string]$TaskText = "",
+        [string]$PipelineProfile = "COMPLEX"
     )
     if ($PhaseName -in @("PLAN", "FIX_PLAN")) {
-        return Get-ModelForPlan -TaskClass $TaskClass -Targets $Targets
+        return Get-ModelForPlan -TaskClass $TaskClass -Targets $Targets -PipelineProfile $PipelineProfile
     }
     if ($PhaseName -eq "INVESTIGATE") {
         if (Test-HasActionableSignal -Text $PreviousOutput) { return $CONST_MODEL_FAST }
         return $CONST_MODEL_INVESTIGATE
     }
     if ($PhaseName -eq "IMPLEMENT") {
-        return Get-ModelForImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PreviousOutput
+        return Get-ModelForImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PreviousOutput -PipelineProfile $PipelineProfile
     }
     if ($PhaseName -eq "REVIEW_MINOR") { return $CONST_MODEL_FAST }
     return $CONST_MODEL_IMPLEMENT
@@ -1823,7 +1862,9 @@ function Write-ResultJson {
         [bool]$reproductionAttempted = $false,
         [bool]$reproductionConfirmed = $false,
         $reproductionTests = $null,
-        [bool]$targetedVerificationPassed = $false
+        [bool]$targetedVerificationPassed = $false,
+        [string]$plannerEffortClass = "UNKNOWN",
+        [string]$pipelineProfile = "COMPLEX"
     )
     $metricsSummary = Get-PhaseMetricsSummary
     if ($artifactRunDir) {
@@ -1862,6 +1903,8 @@ function Write-ResultJson {
         targetedVerificationPassed = [bool]$targetedVerificationPassed
         noChangeReason = $noChangeReason
         taskClass = $taskClass
+        plannerEffortClass = $plannerEffortClass
+        pipelineProfile = $pipelineProfile
         metrics = $metricsSummary
     } | ConvertTo-Json -Depth 8
 
@@ -2379,11 +2422,23 @@ try {
 
     $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
     $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch "^\s*$|^##" } | Select-Object -First 1).Trim()
+    $plannerContext = if ($PlannerContextFile) { Read-JsonFileBestEffort -Path $PlannerContextFile } else { $null }
+    if ($plannerContext -and $plannerContext.plannerMetadata) {
+        $plannerEffortClass = Get-NormalizedPlannerEffortClass -EffortClass ([string]$plannerContext.plannerMetadata.effortClass)
+    } else {
+        $plannerEffortClass = "UNKNOWN"
+    }
+    $pipelineProfile = Get-PipelineProfile -PlannerEffortClass $plannerEffortClass
     $taskClass = Get-TaskClass -TaskText $taskPrompt
     $investigationRequired = Test-InvestigationRequired -TaskText $taskPrompt -TaskClass $taskClass
     Save-Artifact -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Save-DebugText -Name "input-task.txt" -Content $taskPrompt | Out-Null
-    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired }
+    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired; plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile; plannerContextLoaded = [bool]$plannerContext }
+    if ($PlannerContextFile -and -not $plannerContext) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context file could not be read. Falling back to default pipeline profile." -Category "PLANNER_CONTEXT_INVALID" -Data @{ plannerContextFile = $PlannerContextFile }
+    } elseif ($plannerContext) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context loaded for worker startup." -Category "PLANNER_CONTEXT_LOADED" -Data @{ plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile }
+    }
     Write-SchedulerSnapshot
 
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
@@ -2423,7 +2478,7 @@ try {
     } -ArgumentList $worktreeSln
 
     Set-Location $worktreePath
-    $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets @()
+    $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets @() -PipelineProfile $pipelineProfile
     $effectiveModelImplement = $CONST_MODEL_IMPLEMENT
     $nugetRule = if ($AllowNuget) { "- New NuGet packages are allowed only when required" } else { "- No new NuGet packages" }
 
@@ -2480,7 +2535,7 @@ RATIONALE:
 <short evidence-based explanation>
 NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
 "@
-        $discoverModel = Get-ModelForPlan -TaskClass $taskClass -Targets @()
+        $discoverModel = Get-ModelForPlan -TaskClass $taskClass -Targets @() -PipelineProfile $pipelineProfile
         $discoverResult = Invoke-ClaudeDiscover -Prompt $discoverPrompt -Model $discoverModel -Attempt $discoverAttempt
         if (-not $discoverResult.success) {
             $discoverCritique = "Discover call failed: $($discoverResult.output)"
@@ -2938,7 +2993,7 @@ For each relevant file or search area:
 investigationRequired: true|false
 Write ONLY the plan.
 "@
-        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets
+        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets -PipelineProfile $pipelineProfile
         $planResult = Invoke-ClaudeFixPlan -Prompt $planPrompt -Model $effectiveModelPlan -Attempt $planAttempt
         if (-not $planResult.success) {
             $replanReason = "Fix-plan call failed: $($planResult.output)"
@@ -3020,7 +3075,7 @@ For each relevant file or search area:
 investigationRequired: true|false
 Write ONLY the plan.
 "@
-            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planContextTargets -PreviousOutput $planOutput -TaskText $taskPrompt
+            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planContextTargets -PreviousOutput $planOutput -TaskText $taskPrompt -PipelineProfile $pipelineProfile
             $repairResult = Invoke-ClaudeRepair -PhaseName "FIX_PLAN" -Prompt $repairPrompt -Model $repairModel -Attempt (190 + $planAttempt * 10 + $repairAttempt)
             if (-not $repairResult.success) { continue }
 
@@ -3142,7 +3197,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_ALREADY_SATISFIED | NO_CHANGE_TARGET_NOT_FOUN
 SUMMARY:
 <Short rationale>
 "@
-        $effectiveModelImplement = Get-ModelForImplement -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -TaskText $taskPrompt -PhaseContext $investigationBlock
+        $effectiveModelImplement = Get-ModelForImplement -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -TaskText $taskPrompt -PhaseContext $investigationBlock -PipelineProfile $pipelineProfile
         $implResult = Invoke-ClaudeImplement -Prompt $implPrompt -Model $effectiveModelImplement -Attempt $implementAttempt
         $lastImplementOutput = $implResult.output
         if (-not $implResult.success) {
@@ -3233,7 +3288,7 @@ IMPORTANT:
 - Do not return another vague explanation.
 - Modify at least one repository file or return a clearly justified RESULT.
 "@
-                $repairModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $implResult.output -TaskText $taskPrompt
+                $repairModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $implResult.output -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                 $repairImplResult = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $repairPrompt -Model $repairModel -Attempt (400 + $implementAttempt) -CanWrite
                 if ($repairImplResult.success) {
                     $implResult = $repairImplResult
@@ -3304,7 +3359,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Short rationale>
 "@
-                    $verifyFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verifyReproResult.output -TaskText $taskPrompt
+                    $verifyFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verifyReproResult.output -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                     $verifyFixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $verifyFixModel -Attempt (90 + $implementAttempt * 10 + $reviewCycle)
                     if (-not $verifyFixResult.success) {
                         Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "VERIFY_REPRO_TOOL_FAILURE" -Feedback $verifyFixResult.output
@@ -3379,7 +3434,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Short rationale>
 "@
-                $preflightFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $blockerText -TaskText $taskPrompt
+                $preflightFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $blockerText -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                 $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $preflightFixModel -Attempt (100 + $implementAttempt * 10 + $reviewCycle)
                 if (-not $fixResult.success) {
                     Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
@@ -3490,7 +3545,7 @@ FIX ONLY THESE MINOR ISSUES IN THE CURRENT WORKTREE.
 FEEDBACK:
 $($verdict.feedback)
 "@
-                    $minorRescueModel = Get-ModelForRepair -PhaseName "REVIEW_MINOR" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt
+                    $minorRescueModel = Get-ModelForRepair -PhaseName "REVIEW_MINOR" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                     $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $minorRescueModel -Attempt (500 + $implementAttempt * 10 + $reviewCycle) -CanWrite
                     if ($minorRescue.success) {
                         $changedFiles = Get-ChangedFiles
@@ -3518,7 +3573,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Short rationale>
 "@
-            $reviewFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt
+            $reviewFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt -PipelineProfile $pipelineProfile
             $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $reviewFixModel -Attempt (200 + $implementAttempt * 10 + $reviewCycle)
             if (-not $fixResult.success) {
                 Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
@@ -3556,12 +3611,12 @@ SUMMARY:
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
     } else {
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force") | Out-Null
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
     }
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
@@ -3577,7 +3632,7 @@ SUMMARY:
             Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
             $worktreePath = $null
         }
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
     } else {
         Write-Host "[ERROR] $errMsg"
         $finalStatus = "ERROR"
@@ -3585,7 +3640,7 @@ SUMMARY:
         $finalSummary = "Unexpected error in phase $currentPhase."
         $finalFeedback = $errMsg
         Write-TimelineArtifact
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
     }
 } finally {
     Set-Location $originalDir -ErrorAction SilentlyContinue

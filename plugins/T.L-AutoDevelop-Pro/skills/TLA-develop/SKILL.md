@@ -167,8 +167,11 @@ The planner input must include:
 - any `manual_debug_needed` tasks
 - all pending-merge tasks
 - the newly added tasks
+- recent completed task discovery briefs from the latest queue snapshot
 - recent planner feedback from the queue snapshot
 - nearby documentation markdown files relevant to the affected modules
+
+Use `completedTaskBriefs` only as advisory planning context for recently touched files, shared modules, and conflict risk. Do not treat them as hard dependency evidence when they are vague or failure-only.
 
 ## 8. Gate And Start Ready Pipes
 

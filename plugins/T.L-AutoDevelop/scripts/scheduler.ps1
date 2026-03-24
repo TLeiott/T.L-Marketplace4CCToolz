@@ -1536,6 +1536,21 @@ function Write-TaskResultFile {
     [System.IO.File]::WriteAllText($Task.resultFile, ((ConvertTo-TaskSnapshot -Task $Task -RepoRoot $script:CurrentSnapshotRepoRoot) | ConvertTo-Json -Depth 24), [System.Text.Encoding]::UTF8)
 }
 
+function Write-PlannerContextFile {
+    param(
+        [string]$Path,
+        $Task
+    )
+
+    Ensure-ParentDirectory -Path $Path
+    $payload = [ordered]@{
+        taskId = [string]$Task.taskId
+        waveNumber = [int]$Task.waveNumber
+        plannerMetadata = if ($Task.plannerMetadata) { $Task.plannerMetadata } else { [pscustomobject]@{} }
+    } | ConvertTo-Json -Depth 16
+    [System.IO.File]::WriteAllText($Path, $payload, [System.Text.Encoding]::UTF8)
+}
+
 function Normalize-RepoRelativePath {
     param(
         [string]$RepoRoot,
@@ -3115,6 +3130,7 @@ function Get-EncodedWorkerLaunchCommand {
         [string]$PromptFile,
         [string]$SolutionPath,
         [string]$ResultFile,
+        [string]$PlannerContextFile,
         [string]$TaskName,
         [string]$SchedulerTaskId,
         [string]$CommandType,
@@ -3125,6 +3141,7 @@ function Get-EncodedWorkerLaunchCommand {
     $promptLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $PromptFile
     $solutionLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SolutionPath
     $resultLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $ResultFile
+    $plannerContextLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $PlannerContextFile
     $taskNameLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $TaskName
     $taskIdLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SchedulerTaskId
     $commandTypeLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $CommandType
@@ -3132,7 +3149,7 @@ function Get-EncodedWorkerLaunchCommand {
 
     $commandText = @"
 `$ErrorActionPreference = 'Stop'
-& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
+& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -PlannerContextFile $plannerContextLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
 exit `$LASTEXITCODE
 "@
 
@@ -3201,6 +3218,130 @@ function Get-PlannerFeedbackSummary {
     }
 }
 
+function Clip-DiscoveryBriefText {
+    param(
+        [string]$Text,
+        [int]$MaxLength = 180
+    )
+
+    if (-not $Text) { return "" }
+    $value = ([string]$Text -replace '\s+', ' ').Trim()
+    if (-not $value) { return "" }
+    if ($value.Length -le $MaxLength) { return $value }
+    return ($value.Substring(0, [Math]::Max(0, $MaxLength - 3)).TrimEnd() + "...")
+}
+
+function Get-DiscoveryBriefConflictHint {
+    param($Task)
+
+    $classification = [string]$Task.plannerFeedback.classification
+    $likelyAreas = @(Normalize-StringArray -Value $Task.plannerMetadata.likelyAreas)
+    $likelyFiles = @(Normalize-StringArray -Value $Task.plannerMetadata.likelyFiles)
+    $actualFiles = @(Normalize-StringArray -Value $Task.latestRun.actualFiles)
+
+    if ($actualFiles.Count -gt 0 -and $likelyAreas.Count -gt 0) {
+        return (Clip-DiscoveryBriefText -Text ("Touches " + ($actualFiles.Count) + " changed file(s) in area(s): " + (($likelyAreas | Select-Object -First 2) -join ", ") + ".") -MaxLength 160)
+    }
+    if ($classification -eq "broad" -and $likelyFiles.Count -gt 0) {
+        return (Clip-DiscoveryBriefText -Text ("Prior scope prediction was broad around: " + (($likelyFiles | Select-Object -First 2) -join ", ") + ".") -MaxLength 160)
+    }
+    if ($classification -eq "missed" -and $actualFiles.Count -gt 0) {
+        return (Clip-DiscoveryBriefText -Text ("Actual files diverged from the original prediction; changed: " + (($actualFiles | Select-Object -First 2) -join ", ") + ".") -MaxLength 160)
+    }
+    return ""
+}
+
+function Get-TaskDiscoveryBrief {
+    param($Task)
+
+    if (-not $Task) { return $null }
+    $state = [string]$Task.state
+    if ($state -notin @("merged", "pending_merge", "completed_no_change", "completed_failed_terminal")) {
+        return $null
+    }
+
+    $taskSummary = Clip-DiscoveryBriefText -Text ([string]$Task.taskText) -MaxLength 180
+    $whatWasBuilt = Clip-DiscoveryBriefText -Text ([string]$Task.latestRun.summary) -MaxLength 220
+    $investigationConclusion = Clip-DiscoveryBriefText -Text ([string]$Task.latestRun.investigationConclusion) -MaxLength 180
+    $failureText = Clip-DiscoveryBriefText -Text ([string]$Task.latestRun.feedback) -MaxLength 180
+    $filesChanged = @((Normalize-StringArray -Value $Task.latestRun.actualFiles) | Select-Object -First 6)
+    $discoveries = [System.Collections.ArrayList]::new()
+
+    if ($investigationConclusion) {
+        [void]$discoveries.Add($investigationConclusion)
+    }
+    if ($whatWasBuilt -and $whatWasBuilt -ne $taskSummary -and $whatWasBuilt -ne $investigationConclusion) {
+        [void]$discoveries.Add((Clip-DiscoveryBriefText -Text $whatWasBuilt -MaxLength 180))
+    }
+    $discoveries = @($discoveries | Select-Object -Unique | Select-Object -First 2)
+
+    $failures = @()
+    if ($state -eq "completed_failed_terminal" -and $failureText) {
+        $failures = @($failureText)
+    }
+
+    $conflictHint = Get-DiscoveryBriefConflictHint -Task $Task
+    $hasSignal = $taskSummary -or $whatWasBuilt -or $discoveries.Count -gt 0 -or $failures.Count -gt 0 -or $filesChanged.Count -gt 0
+    if (-not $hasSignal) { return $null }
+
+    return [pscustomobject]@{
+        taskId = [string]$Task.taskId
+        waveNumber = [int]$Task.waveNumber
+        status = [string]$Task.latestRun.finalStatus
+        finalCategory = [string]$Task.latestRun.finalCategory
+        taskSummary = $taskSummary
+        whatWasBuilt = $whatWasBuilt
+        discoveries = @($discoveries)
+        failures = @($failures)
+        filesChanged = @($filesChanged)
+        conflictHints = $conflictHint
+    }
+}
+
+function Get-DiscoveryBriefPriority {
+    param($Task)
+
+    switch ([string]$Task.state) {
+        "merged" { return 4 }
+        "pending_merge" { return 3 }
+        "completed_no_change" { return 2 }
+        "completed_failed_terminal" { return 1 }
+        default { return 0 }
+    }
+}
+
+function Get-CompletedTaskBriefs {
+    param($State)
+
+    $tasks = @((Get-Tasks -State $State) | Where-Object {
+        $_ -and [string]$_.state -in @("merged", "pending_merge", "completed_no_change", "completed_failed_terminal")
+    })
+
+    $ordered = @($tasks | Sort-Object @{
+        Expression = { Get-DiscoveryBriefPriority -Task $_ }
+        Descending = $true
+    }, @{
+        Expression = {
+            $completedAt = [string]$_.latestRun.completedAt
+            if ($completedAt) {
+                try { return [datetime]$completedAt } catch { }
+            }
+            return [datetime]::MinValue
+        }
+        Descending = $true
+    }, @{
+        Expression = { [int]$_.submissionOrder }
+        Descending = $true
+    })
+
+    return @(
+        $ordered |
+            ForEach-Object { Get-TaskDiscoveryBrief -Task $_ } |
+            Where-Object { $_ } |
+            Select-Object -First 8
+    )
+}
+
 function Get-TaskMergePreview {
     param(
         [string]$RepoRoot,
@@ -3247,6 +3388,7 @@ function Get-SnapshotPayload {
     $breaker = Update-CircuitBreakerState -State $State
     $usageProjection = Get-UsageProjection -State $State
     $plannerFeedbackSummary = Get-PlannerFeedbackSummary -State $State
+    $completedTaskBriefs = Get-CompletedTaskBriefs -State $State
     $recentEvents = Get-RecentQueueEvents -EventsFile $EventsFile
     $tasks = @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)
     $stateIntegrity = Get-StateIntegritySummary -State $State
@@ -3303,6 +3445,7 @@ function Get-SnapshotPayload {
         mergePreparedPreview = if ($mergePreparedTask) { Get-TaskMergePreview -RepoRoot $State.repoRoot -Task $mergePreparedTask } else { $null }
         unknownAutoBranches = @($unknownBranches)
         plannerFeedbackSummary = $plannerFeedbackSummary
+        completedTaskBriefs = @($completedTaskBriefs)
         usageProjection = $usageProjection
         stateIntegrity = $stateIntegrity
         hasIntegrityWarnings = [bool]($stateIntegrity.status -eq "warning")
@@ -3783,6 +3926,7 @@ function Run-Task {
         $attemptNumber = [int]$task.attemptsUsed
         $launchSequence = [int]$task.workerLaunchSequence
         $pipelineResultPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-result.json"
+        $plannerContextPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-planner-context.json"
         $taskName = Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -LaunchSequence $launchSequence
         $runDir = Join-Path (Join-Path $context.repoRoot ".claude-develop-logs\runs") $taskName
         $artifactPointers = [pscustomobject]@{
@@ -3790,6 +3934,7 @@ function Run-Task {
             schedulerSnapshotPath = Join-Path $runDir "scheduler-snapshot.json"
             timelinePath = Join-Path $runDir "timeline.json"
             resultFile = $pipelineResultPath
+            plannerContextFile = $plannerContextPath
         }
         $task.latestRun = New-LatestRunRecord `
             -AttemptNumber $attemptNumber `
@@ -3805,10 +3950,12 @@ function Run-Task {
             runDir = $artifactPointers.runDir
             timeline = $artifactPointers.timelinePath
             schedulerSnapshot = $artifactPointers.schedulerSnapshotPath
+            plannerContext = $artifactPointers.plannerContextFile
             workerLauncher = $workerLauncher.command
             workerStdout = ""
             workerStderr = ""
         }
+        Write-PlannerContextFile -Path $plannerContextPath -Task $task
         Write-TaskResultFile -Task $task
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
@@ -3822,6 +3969,7 @@ function Run-Task {
         -PromptFile ([string]$task.promptFile) `
         -SolutionPath ([string]$task.solutionPath) `
         -ResultFile $pipelineResultPath `
+        -PlannerContextFile $plannerContextPath `
         -TaskName ([string]$task.latestRun.taskName) `
         -SchedulerTaskId ([string]$task.taskId) `
         -CommandType ([string]$task.sourceCommand) `
