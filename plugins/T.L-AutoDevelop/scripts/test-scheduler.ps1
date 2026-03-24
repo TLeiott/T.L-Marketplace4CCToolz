@@ -1433,6 +1433,164 @@ function Test-MissingPlannerContextFallsBackToComplexProfile {
     Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
 }
 
+function Test-ImplementationScopeCheckIsTightForExactMatches {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Feature.cs") -ChangedFiles @("src\\Feature.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.evaluated -eq $true) "Exact file matches should be evaluated."
+    Assert-True ([string]$parsed.classification -eq "tight") "Exact file matches should classify as tight."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 0) "Exact file matches should not report out-of-scope files."
+    Assert-True ($parsed.shouldEscalateReview -eq $false) "Tight matches should not escalate review."
+}
+
+function Test-ImplementationScopeCheckAcceptsUniqueSuffixMatches {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("Feature.cs") -ChangedFiles @("src\\Feature.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "acceptable") "Unique filename-only targets should classify as acceptable."
+    Assert-True ([int]$parsed.matchKindsSummary.suffix -eq 1) "Unique filename-only targets should count as suffix matches."
+    Assert-True ($parsed.shouldEscalateReview -eq $false) "Acceptable suffix matches should not escalate review."
+}
+
+function Test-ImplementationScopeCheckEscalatesDirectoryTargets {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services") -ChangedFiles @("src\\Services\\OrderService.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "broad") "Directory targets should classify as broad."
+    Assert-True ([int]$parsed.matchKindsSummary.directory -eq 1) "Directory targets should count as directory matches."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Broad scope matches should escalate review."
+}
+
+function Test-ImplementationScopeCheckDetectsOutOfScopeFiles {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\OrderService.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Shared\\CustomerDto.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "drifted") "Extra changed files outside the plan should classify as drifted."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 1) "Scope drift should report the unexpected changed file."
+    Assert-True ([string]$parsed.outOfScopeFiles[0] -eq "src\\Shared\\CustomerDto.cs") "Scope drift should preserve the unexpected file path."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Scope drift should escalate review."
+}
+
+function Test-ImplementationScopeCheckTreatsWildcardMatchesAsBroad {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\*.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Services\\CustomerService.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "broad") "Wildcard targets should classify as broad when they match the changed files."
+    Assert-True ([int]$parsed.matchKindsSummary.wildcard -eq 1) "Wildcard targets should count as wildcard matches."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 0) "Wildcard-matched files should not be treated as out-of-scope."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Wildcard matches should escalate review for stricter inspection."
+}
+
+function Test-ImplementationScopeCheckWildcardStillDetectsOutOfScopeFiles {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\*.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Shared\\CustomerDto.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "drifted") "Wildcard targets should still classify as drifted when unrelated files change."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 1) "Wildcard scope drift should report the unrelated changed file."
+    Assert-True ([string]$parsed.outOfScopeFiles[0] -eq "src\\Shared\\CustomerDto.cs") "Wildcard scope drift should preserve the unrelated file path."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Wildcard scope drift should escalate review."
+}
+
+function Test-ImplementationScopeCheckReportsUnmatchedWildcardTargets {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\*.cs") -ChangedFiles @("docs\\note.md")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "drifted") "Unmatched wildcard targets should classify as drifted when all changes fall outside the allowed area."
+    Assert-True (@($parsed.unmatchedTargets).Count -eq 1) "Unmatched wildcard targets should be surfaced explicitly."
+    Assert-True ([string]$parsed.unmatchedTargets[0] -eq "src\\Services\\*.cs") "The unmatched wildcard target should be preserved."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 1 -and [string]$parsed.outOfScopeFiles[0] -eq "docs\\note.md") "All changed files should remain out-of-scope when the wildcard target does not match."
+}
+
+function Test-ImplementationScopeCheckSupportsMixedExactAndWildcardTargets {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\OrderService.cs", "src\\Tests\\*.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Tests\\OrderServiceTests.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "broad") "Mixed exact and wildcard targets should classify as broad when wildcard matching is involved without drift."
+    Assert-True ([int]$parsed.matchKindsSummary.exact -eq 1) "Mixed targets should preserve exact-match accounting."
+    Assert-True ([int]$parsed.matchKindsSummary.wildcard -eq 1) "Mixed targets should preserve wildcard-match accounting."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 0) "Mixed exact and wildcard targets should not produce out-of-scope files when all changes are covered."
+}
+
 function Test-RegistrationRejectsMissingPromptFile {
     $repo = New-TestRepo
     try {
@@ -5162,6 +5320,14 @@ Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-WritePlannerContextFilePersistsEffortClass
 Test-PlannerContextLowEffortSelectsSimpleProfile
 Test-MissingPlannerContextFallsBackToComplexProfile
+Test-ImplementationScopeCheckIsTightForExactMatches
+Test-ImplementationScopeCheckAcceptsUniqueSuffixMatches
+Test-ImplementationScopeCheckEscalatesDirectoryTargets
+Test-ImplementationScopeCheckDetectsOutOfScopeFiles
+Test-ImplementationScopeCheckTreatsWildcardMatchesAsBroad
+Test-ImplementationScopeCheckWildcardStillDetectsOutOfScopeFiles
+Test-ImplementationScopeCheckReportsUnmatchedWildcardTargets
+Test-ImplementationScopeCheckSupportsMixedExactAndWildcardTargets
 Test-RegistrationRejectsMissingPromptFile
 Test-SnapshotSurfacesMissingPromptFileIntegrityError
 Test-BlockedByNormalization

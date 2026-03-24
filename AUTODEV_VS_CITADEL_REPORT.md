@@ -705,41 +705,43 @@ The IMPLEMENT-PREFLIGHT-REVIEW-REMEDIATE feedback loop shares mutable state acro
 
 ### Tier 1 — High Impact, Moderate Effort
 
-| # | Improvement | Source Inspiration | Expected Impact | Effort |
-|---|---|---|---|---|
-| 1 | **Wire `effortClass` from scheduler-agent to worker pipeline** | Citadel's /do router | Free classification signal already computed but wasted. Enables pipeline profile selection. | Low — pass through existing data |
-| 2 | **Discovery briefs (template-extracted) → scheduler-agent** | Citadel's compress-discovery.cjs | Directly improves wave planning accuracy using ground-truth data from completed tasks. | Low-Medium — new function in scheduler post-processing |
-| 3 | **Direction check after FIX_PLAN** | Citadel's Archon alignment check | One Sonnet call (~2-3% cost) saves 70-80% when drift caught. | Medium — new pipeline phase |
-| 4 | **Retry context injection** | Citadel's Decision Log | Workers currently start cold. Passing prior attempt lessons would reduce blind retries 60-80%. | Medium — extend result JSON + add `-RetryContextFile` parameter |
+Status update as of 2026-03-24: recommendations #1 and #2 were implemented by commit `d0b4d22` (`auto: wire planner effort and add discovery briefs`).
+
+| # | Improvement | Status | Source Inspiration | Expected Impact | Effort |
+|---|---|---|---|---|---|
+| 1 | **Wire `effortClass` from scheduler-agent to worker pipeline** | Done 2026-03-24 in `d0b4d22` | Citadel's /do router | Free classification signal already computed but wasted. Enables pipeline profile selection. | Low — pass through existing data |
+| 2 | **Discovery briefs (template-extracted) → scheduler-agent** | Done 2026-03-24 in `d0b4d22` | Citadel's compress-discovery.cjs | Directly improves wave planning accuracy using ground-truth data from completed tasks. | Low-Medium — new function in scheduler post-processing |
+| 3 | **Direction check after FIX_PLAN** | Open | Citadel's Archon alignment check | One Sonnet call (~2-3% cost) saves 70-80% when drift caught. | Medium — new pipeline phase |
+| 4 | **Retry context injection** | Open | Citadel's Decision Log | Workers currently start cold. Passing prior attempt lessons would reduce blind retries 60-80%. | Medium — extend result JSON + add `-RetryContextFile` parameter |
 
 ### Tier 2 — Medium Impact, Lower Effort
 
-| # | Improvement | Expected Impact | Effort |
-|---|---|---|---|
-| 5 | **Baseline regression tracking** | Catches tasks that "pass" but degrade quality. 5+ new warnings = blocker. | Medium — baseline capture + preflight comparison |
-| 6 | **Telemetry report script** | Data-driven pipeline optimization. Surface patterns like "REPRODUCE phase has 60% failure rate." | Low — PowerShell script over existing JSONL |
-| 7 | **Post-edit pattern lint hook** | Catches common preflight failures during implementation. Reduces remediation cycles. | Low-Medium — reuse preflight regex in a hook |
-| 8 | **Deterministic file-scope check after IMPLEMENT** | Zero-cost check comparing `$changedFiles` against `$planTargets`. Flags unexpected scope expansion. | Low — add after line 3272 in auto-develop.ps1 |
+| # | Improvement | Status | Expected Impact | Effort |
+|---|---|---|---|---|
+| 5 | **Baseline regression tracking** | Open | Catches tasks that "pass" but degrade quality. 5+ new warnings = blocker. | Medium — baseline capture + preflight comparison |
+| 6 | **Telemetry report script** | Open | Data-driven pipeline optimization. Surface patterns like "REPRODUCE phase has 60% failure rate." | Low — PowerShell script over existing JSONL |
+| 7 | **Post-edit pattern lint hook** | Open | Catches common preflight failures during implementation. Reduces remediation cycles. | Low-Medium — reuse preflight regex in a hook |
+| 8 | **Deterministic file-scope check after IMPLEMENT** | Done 2026-03-24 in `4.2.9` line | Zero-cost check comparing `$changedFiles` against `$planTargets`. Flags unexpected scope expansion. | Low — add after line 3272 in auto-develop.ps1 |
 
 ### Tier 3 — Lower Priority, Higher Value Over Time
 
-| # | Improvement | Expected Impact | Effort |
-|---|---|---|---|
-| 9 | **Knowledge extraction (co-changes + planner accuracy)** | Persistent learning improves planning over time. | Medium — new function in scheduler + storage |
-| 10 | **Standalone skills: /investigate, /review, /preflight** | User flexibility, debugging, partial reruns. | Medium — extract from monolith, define contracts |
-| 11 | **Pre-compact context preservation hook** | Prevents mid-task disorientation on context compression. | Low — simple save/restore hook |
-| 12 | **FIX_PLAN elimination for TRIVIAL tasks** | Merge DISCOVER+IMPLEMENT for true one-line changes. Saves 1 LLM call. | Medium — conditional pipeline flow |
+| # | Improvement | Status | Expected Impact | Effort |
+|---|---|---|---|---|
+| 9 | **Knowledge extraction (co-changes + planner accuracy)** | Open | Persistent learning improves planning over time. | Medium — new function in scheduler + storage |
+| 10 | **Standalone skills: /investigate, /review, /preflight** | Open | User flexibility, debugging, partial reruns. | Medium — extract from monolith, define contracts |
+| 11 | **Pre-compact context preservation hook** | Open | Prevents mid-task disorientation on context compression. | Low — simple save/restore hook |
+| 12 | **FIX_PLAN elimination for TRIVIAL tasks** | Open | Merge DISCOVER+IMPLEMENT for true one-line changes. Saves 1 LLM call. | Medium — conditional pipeline flow |
 
 ### Implementation Roadmap
 
 ```
 Phase 1 (Quick wins):
-  ├─ Wire effortClass to worker (#1)
+  ├─ [Done 2026-03-24] Wire effortClass to worker (#1)
   ├─ Telemetry report script (#6)
-  └─ Deterministic file-scope check (#8)
+  └─ [Done 2026-03-24] Deterministic file-scope check (#8)
 
 Phase 2 (Core improvements):
-  ├─ Discovery briefs → scheduler-agent (#2)
+  ├─ [Done 2026-03-24] Discovery briefs → scheduler-agent (#2)
   ├─ Direction check after FIX_PLAN (#3)
   └─ Baseline regression tracking (#5)
 

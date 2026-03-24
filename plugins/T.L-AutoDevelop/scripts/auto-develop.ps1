@@ -102,6 +102,7 @@ $targetedVerificationPassed = $false
 $taskPrompt = ""
 $taskLine = ""
 $planTargets = @()
+$implementationScopeCheck = $null
 $discoverVerdict = [ordered]@{
     route = "UNCERTAIN"
     bugConfidence = "LOW"
@@ -192,6 +193,242 @@ function Get-NormalizedPathSet {
             if ($value) { $value }
         } | Where-Object { $_ } | Select-Object -Unique)
     )
+}
+
+function Get-CanonicalComparisonPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    return (([string]$Path).Trim().Replace("/", "\").TrimStart('\')).ToLowerInvariant()
+}
+
+function Get-PathComparisonProfile {
+    param([string]$Path)
+
+    $canonical = Get-CanonicalComparisonPath -Path $Path
+    if (-not $canonical) {
+        return [pscustomobject]@{
+            original = [string]$Path
+            canonical = ""
+            baseName = ""
+            isFileLike = $false
+            hasWildcard = $false
+            segments = @()
+        }
+    }
+
+    $segments = @($canonical -split '[\\/]')
+    $baseName = if ($segments.Count -gt 0) { [string]$segments[-1] } else { "" }
+    $hasWildcard = ($canonical -match '[\*\?]')
+    $isFileLike = (-not $hasWildcard) -and ($baseName -match '\.') -and ($segments.Count -gt 0)
+    return [pscustomobject]@{
+        original = [string]$Path
+        canonical = $canonical
+        baseName = $baseName
+        isFileLike = $isFileLike
+        hasWildcard = $hasWildcard
+        segments = @($segments)
+    }
+}
+
+function Get-TargetPathMatches {
+    param(
+        [string]$TargetPath,
+        [string[]]$ActualPaths
+    )
+
+    $target = Get-PathComparisonProfile -Path $TargetPath
+    $actualProfiles = @($ActualPaths | ForEach-Object { Get-PathComparisonProfile -Path ([string]$_) } | Where-Object { $_.canonical })
+    if (-not $target.canonical -or $actualProfiles.Count -eq 0) {
+        return [pscustomobject]@{ kind = "none"; actuals = @() }
+    }
+
+    if ($target.hasWildcard) {
+        $wildcardMatches = @($actualProfiles | Where-Object { $_.canonical -like $target.canonical } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($wildcardMatches.Count -gt 0) {
+            return [pscustomobject]@{ kind = "wildcard"; actuals = @($wildcardMatches) }
+        }
+        return [pscustomobject]@{ kind = "none"; actuals = @() }
+    }
+
+    $exactMatches = @($actualProfiles | Where-Object { $_.canonical -eq $target.canonical } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+    if ($exactMatches.Count -gt 0) {
+        return [pscustomobject]@{ kind = "exact"; actuals = @($exactMatches) }
+    }
+
+    if ($target.isFileLike) {
+        $suffixCandidates = @($actualProfiles | Where-Object { $_.baseName -eq $target.baseName } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($suffixCandidates.Count -eq 1) {
+            return [pscustomobject]@{ kind = "suffix"; actuals = @($suffixCandidates) }
+        }
+
+        $suffixByEnding = @($actualProfiles | Where-Object { $_.canonical.EndsWith("\" + $target.canonical) } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($suffixByEnding.Count -eq 1) {
+            return [pscustomobject]@{ kind = "suffix"; actuals = @($suffixByEnding) }
+        }
+    }
+
+    if (-not $target.isFileLike -and $target.segments.Count -gt 0) {
+        $directoryPrefix = $target.canonical.TrimEnd('\')
+        $directoryCandidates = @($actualProfiles | Where-Object { $_.canonical.StartsWith($directoryPrefix + "\") -or $_.canonical -eq $directoryPrefix } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($directoryCandidates.Count -gt 0) {
+            return [pscustomobject]@{ kind = "directory"; actuals = @($directoryCandidates) }
+        }
+    }
+
+    return [pscustomobject]@{ kind = "none"; actuals = @() }
+}
+
+function Match-AllowedTargetPaths {
+    param(
+        [string[]]$TargetPaths,
+        [string[]]$ActualPaths
+    )
+
+    $matchedTargets = [System.Collections.ArrayList]::new()
+    $matchedActualFiles = [System.Collections.ArrayList]::new()
+    $usedActuals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $unmatchedTargets = [System.Collections.ArrayList]::new()
+    $matchKinds = [ordered]@{ exact = 0; suffix = 0; directory = 0; wildcard = 0 }
+
+    foreach ($target in @($TargetPaths | Where-Object { $_ } | Select-Object -Unique)) {
+        $match = Get-TargetPathMatches -TargetPath ([string]$target) -ActualPaths $ActualPaths
+        if ($match.kind -eq "none" -or @($match.actuals).Count -eq 0) {
+            [void]$unmatchedTargets.Add([string]$target)
+            continue
+        }
+
+        [void]$matchedTargets.Add([string]$target)
+        foreach ($actual in @($match.actuals | Where-Object { $_ } | Select-Object -Unique)) {
+            [void]$matchedActualFiles.Add([string]$actual)
+            [void]$usedActuals.Add(([string]$actual))
+        }
+        if ($matchKinds.Contains($match.kind)) {
+            $matchKinds[$match.kind] = [int]$matchKinds[$match.kind] + 1
+        }
+    }
+
+    $outOfScopeFiles = @(
+        @($ActualPaths | Where-Object { $_ -and -not $usedActuals.Contains([string]$_) } | Select-Object -Unique)
+    )
+
+    return [pscustomobject]@{
+        matchedTargets = @($matchedTargets | Select-Object -Unique)
+        matchedActualFiles = @($matchedActualFiles | Select-Object -Unique)
+        unmatchedTargets = @($unmatchedTargets | Select-Object -Unique)
+        outOfScopeFiles = @($outOfScopeFiles)
+        matchKinds = [pscustomobject]$matchKinds
+    }
+}
+
+function Get-ImplementationScopeCheck {
+    param(
+        [string[]]$PlanTargets,
+        [string[]]$ChangedFiles
+    )
+
+    $normalizedTargets = @(Get-NormalizedPathSet -Paths $PlanTargets)
+    $normalizedFiles = @(Get-NormalizedPathSet -Paths $ChangedFiles)
+    if ($normalizedFiles.Count -eq 0) {
+        return [pscustomobject]@{
+            evaluated = $false
+            classification = "unknown"
+            planTargets = @($normalizedTargets)
+            changedFiles = @($normalizedFiles)
+            matchedTargets = @()
+            matchedFiles = @()
+            unmatchedTargets = @()
+            outOfScopeFiles = @()
+            matchKindsSummary = [pscustomobject]@{ exact = 0; suffix = 0; directory = 0; wildcard = 0 }
+            notes = "No changed files were available for scope validation."
+            shouldWarn = $false
+            shouldEscalateReview = $false
+        }
+    }
+    if ($normalizedTargets.Count -eq 0) {
+        return [pscustomobject]@{
+            evaluated = $false
+            classification = "unknown"
+            planTargets = @($normalizedTargets)
+            changedFiles = @($normalizedFiles)
+            matchedTargets = @()
+            matchedFiles = @()
+            unmatchedTargets = @()
+            outOfScopeFiles = @()
+            matchKindsSummary = [pscustomobject]@{ exact = 0; suffix = 0; directory = 0; wildcard = 0 }
+            notes = "No validated plan targets were available for scope validation."
+            shouldWarn = $false
+            shouldEscalateReview = $false
+        }
+    }
+
+    $matchResult = Match-AllowedTargetPaths -TargetPaths $normalizedTargets -ActualPaths $normalizedFiles
+    $classification = if ($matchResult.outOfScopeFiles.Count -gt 0) {
+        "drifted"
+    } elseif ($matchResult.matchKinds.directory -gt 0 -or $matchResult.matchKinds.wildcard -gt 0) {
+        "broad"
+    } elseif ($matchResult.matchKinds.suffix -gt 0) {
+        "acceptable"
+    } else {
+        "tight"
+    }
+
+    $notes = "Plan targets $($normalizedTargets.Count), changed files $($normalizedFiles.Count), matched files $(@($matchResult.matchedActualFiles).Count), out-of-scope files $(@($matchResult.outOfScopeFiles).Count)."
+    if (@($matchResult.unmatchedTargets).Count -gt 0) {
+        $notes += " Unmatched targets: " + ((@($matchResult.unmatchedTargets) | Select-Object -First 3) -join ", ") + "."
+    }
+
+    return [pscustomobject]@{
+        evaluated = $true
+        classification = $classification
+        planTargets = @($normalizedTargets)
+        changedFiles = @($normalizedFiles)
+        matchedTargets = @($matchResult.matchedTargets)
+        matchedFiles = @($matchResult.matchedActualFiles)
+        unmatchedTargets = @($matchResult.unmatchedTargets)
+        outOfScopeFiles = @($matchResult.outOfScopeFiles)
+        matchKindsSummary = $matchResult.matchKinds
+        notes = $notes
+        shouldWarn = ($classification -in @("broad", "drifted"))
+        shouldEscalateReview = ($classification -in @("broad", "drifted"))
+    }
+}
+
+function Format-ImplementationScopeWarningText {
+    param($ScopeCheck)
+    if (-not $ScopeCheck -or -not $ScopeCheck.evaluated -or -not $ScopeCheck.shouldWarn) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("IMPLEMENTATION SCOPE: $([string]$ScopeCheck.classification)")
+    if (@($ScopeCheck.outOfScopeFiles).Count -gt 0) {
+        [void]$lines.Add("- Out-of-scope files: " + ((@($ScopeCheck.outOfScopeFiles) | Select-Object -First 5) -join ", "))
+    }
+    if (@($ScopeCheck.unmatchedTargets).Count -gt 0) {
+        [void]$lines.Add("- Unmatched plan targets: " + ((@($ScopeCheck.unmatchedTargets) | Select-Object -First 5) -join ", "))
+    }
+    if ($ScopeCheck.notes) {
+        [void]$lines.Add("- Notes: $([string]$ScopeCheck.notes)")
+    }
+    return ($lines -join "`n")
+}
+
+function Update-ImplementationScopeCheck {
+    param(
+        [string]$ArtifactLabel = "",
+        [string]$Phase = "CHANGE_VALIDATE"
+    )
+
+    $script:implementationScopeCheck = Get-ImplementationScopeCheck -PlanTargets $planTargets -ChangedFiles $changedFiles
+    if ($ArtifactLabel) {
+        Save-JsonArtifact -Name "$ArtifactLabel-scope-check.json" -Object $script:implementationScopeCheck | Out-Null
+    }
+    if ($script:implementationScopeCheck.evaluated) {
+        Add-TimelineEvent -Phase $Phase -Message "Deterministic implementation scope check completed." -Category ("IMPLEMENT_SCOPE_" + ([string]$script:implementationScopeCheck.classification).ToUpperInvariant()) -Data @{
+            classification = [string]$script:implementationScopeCheck.classification
+            matchedFiles = @($script:implementationScopeCheck.matchedFiles)
+            outOfScopeFiles = @($script:implementationScopeCheck.outOfScopeFiles)
+            unmatchedTargets = @($script:implementationScopeCheck.unmatchedTargets)
+        }
+    }
 }
 
 function Test-LikelyRepoRelativePath {
@@ -1209,6 +1446,7 @@ function Write-SchedulerSnapshot {
         investigationTargets = @(Get-NormalizedPathSet -Paths $investigationVerdict.targets)
         planTargets = @(Get-NormalizedPathSet -Paths $planTargets)
         changedFiles = @(Get-NormalizedPathSet -Paths $changedFiles)
+        implementationScopeCheck = $implementationScopeCheck
         finalStatus = $finalStatus
         finalCategory = $finalCategory
         artifacts = [ordered]@{
@@ -3213,6 +3451,7 @@ SUMMARY:
         }
         $changedFiles = @($changedFilesResult.files)
         Save-Artifact -Name "implement-v$implementAttempt-changed-files.txt" -Content (($changedFiles -join "`n").Trim()) | Out-Null
+        Update-ImplementationScopeCheck -ArtifactLabel "implement-v$implementAttempt" -Phase "CHANGE_VALIDATE"
 
         if ($changedFiles.Count -eq 0) {
             if ($implOutcome.category -eq "NO_CHANGE_ALREADY_SATISFIED") {
@@ -3440,6 +3679,7 @@ SUMMARY:
                     Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
                 }
                 $changedFiles = Get-ChangedFiles
+                Update-ImplementationScopeCheck -ArtifactLabel "preflight-remediate-$cycleLabel" -Phase "PREFLIGHT"
                 continue
             }
 
@@ -3451,6 +3691,10 @@ SUMMARY:
                     $entry
                 }) -join "`n"
             } else { "" }
+            $scopeWarningText = Format-ImplementationScopeWarningText -ScopeCheck $implementationScopeCheck
+            if ($scopeWarningText) {
+                $warningText = if ($warningText) { "$warningText`n$scopeWarningText" } else { $scopeWarningText }
+            }
 
             $currentPhase = "REVIEW"
             $diffForReview = (Invoke-NativeCommand git @("diff", "HEAD")).output
@@ -3458,6 +3702,12 @@ SUMMARY:
             Save-Artifact -Name "git-diff-$cycleLabel.patch" -Content $diffForReview | Out-Null
             $historyForReview = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3 -MaxChars $CONST_REVIEW_HISTORY_MAX_CHARS
             $lowRiskReview = Test-LowRiskReview -ChangedFiles $changedFiles -DiffText $diffForReview -WarningText $warningText -ReproductionConfirmed $reproductionConfirmed -TaskClass $taskClass
+            if ($implementationScopeCheck -and $implementationScopeCheck.shouldEscalateReview) {
+                if ($lowRiskReview) {
+                    Add-TimelineEvent -Phase "REVIEW" -Message "Compact review escalated to FULL because implementation scope drift needs stricter review." -Category "REVIEW_SCOPE_ESCALATED" -Data @{ reason = "implementation_scope"; classification = [string]$implementationScopeCheck.classification }
+                }
+                $lowRiskReview = $false
+            }
             $reviewPayloadInfo = Get-CompactReviewPayload -PlanText $planOutput -InvestigationText $investigationBlock -ReproductionText $reproductionBlock -DiffText $diffForReview -DiffStat $diffStatForReview -ChangedFiles $changedFiles -WarningText $warningText -HistoryText $historyForReview -LowRiskReview $lowRiskReview
             if ($lowRiskReview -and $reviewPayloadInfo.omittedProductionHunks) {
                 $lowRiskReview = $false
@@ -3549,6 +3799,7 @@ $($verdict.feedback)
                     $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $minorRescueModel -Attempt (500 + $implementAttempt * 10 + $reviewCycle) -CanWrite
                     if ($minorRescue.success) {
                         $changedFiles = Get-ChangedFiles
+                        Update-ImplementationScopeCheck -ArtifactLabel "review-minor-rescue-$cycleLabel" -Phase "REVIEW"
                         $reviewCycle = 0
                         continue
                     }
@@ -3583,6 +3834,7 @@ SUMMARY:
                 Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
             }
             $changedFiles = @($changedFilesResult.files)
+            Update-ImplementationScopeCheck -ArtifactLabel "review-remediate-$cycleLabel" -Phase "REVIEW"
         }
 
         if ($accepted) { break }
