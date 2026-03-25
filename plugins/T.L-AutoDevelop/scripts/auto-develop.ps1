@@ -18,6 +18,7 @@ $CONST_MODEL_REVIEW = "claude-opus-4-6"
 $CONST_MODEL_FAST = "claude-sonnet-4-6"
 $CONST_MAX_TURNS_DISCOVER = 12
 $CONST_MAX_TURNS_PLAN = 18
+$CONST_MAX_TURNS_DIRECTION_CHECK = 8
 $CONST_MAX_TURNS_INVESTIGATE = 14
 $CONST_MAX_TURNS_IMPL = 24
 $CONST_MAX_TURNS_REVIEW = 12
@@ -59,6 +60,7 @@ $attemptsByPhase = [ordered]@{
     discover = 0
     plan = 0
     fixPlan = 0
+    directionCheck = 0
     investigate = 0
     reproduce = 0
     verifyRepro = 0
@@ -103,6 +105,15 @@ $taskPrompt = ""
 $taskLine = ""
 $planTargets = @()
 $implementationScopeCheck = $null
+$directionCheckVerdict = [ordered]@{
+    valid = $false
+    alignment = ""
+    recommendation = ""
+    driftDescription = ""
+    summary = ""
+    warningOnly = $false
+}
+$directionCheckGuardrail = ""
 $discoverVerdict = [ordered]@{
     route = "UNCERTAIN"
     bugConfidence = "LOW"
@@ -1447,6 +1458,7 @@ function Write-SchedulerSnapshot {
         planTargets = @(Get-NormalizedPathSet -Paths $planTargets)
         changedFiles = @(Get-NormalizedPathSet -Paths $changedFiles)
         implementationScopeCheck = $implementationScopeCheck
+        directionCheck = $directionCheckVerdict
         finalStatus = $finalStatus
         finalCategory = $finalCategory
         artifacts = [ordered]@{
@@ -2102,7 +2114,8 @@ function Write-ResultJson {
         $reproductionTests = $null,
         [bool]$targetedVerificationPassed = $false,
         [string]$plannerEffortClass = "UNKNOWN",
-        [string]$pipelineProfile = "COMPLEX"
+        [string]$pipelineProfile = "COMPLEX",
+        $directionCheck = $null
     )
     $metricsSummary = Get-PhaseMetricsSummary
     if ($artifactRunDir) {
@@ -2143,6 +2156,7 @@ function Write-ResultJson {
         taskClass = $taskClass
         plannerEffortClass = $plannerEffortClass
         pipelineProfile = $pipelineProfile
+        directionCheck = if ($directionCheck) { $directionCheck } else { [ordered]@{} }
         metrics = $metricsSummary
     } | ConvertTo-Json -Depth 8
 
@@ -2332,6 +2346,16 @@ function Invoke-ClaudeFixPlan {
     )
 }
 
+function Invoke-ClaudeDirectionCheck {
+    param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "DIRECTION_CHECK nutzt $Model" -Category "DIRECTION_CHECK_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "direction-check-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
+        "--model", $Model,
+        "--allowedTools", "Read,Glob,Grep",
+        "--max-turns", $CONST_MAX_TURNS_DIRECTION_CHECK.ToString()
+    )
+}
+
 function Invoke-ClaudeInvestigate {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
     Add-TimelineEvent -Phase "MODEL" -Message "INVESTIGATE nutzt $Model" -Category "INVESTIGATE_MODEL"
@@ -2457,6 +2481,280 @@ function Get-PlanValidation {
         issues = @($issues)
         targets = @($targets | Select-Object -Unique)
         investigationRequired = $investigationFlag
+    }
+}
+
+function Get-DirectionCheckVerdict {
+    param([string]$Output)
+
+    $trimmed = if ($Output) { $Output.Trim() } else { "" }
+    $result = [ordered]@{
+        valid = $false
+        alignment = ""
+        recommendation = ""
+        driftDescription = ""
+        summary = $trimmed
+        warningOnly = $false
+        shouldContinue = $false
+        shouldTrim = $false
+        shouldReplan = $false
+    }
+    if (-not $trimmed) { return $result }
+
+    $alignment = ""
+    if ($trimmed -match '(?im)^ALIGNMENT\s*:\s*(ON_TRACK|MINOR_DRIFT|MAJOR_DRIFT)\s*$') {
+        $alignment = $Matches[1].ToUpperInvariant()
+    }
+    $recommendation = ""
+    if ($trimmed -match '(?im)^RECOMMENDATION\s*:\s*(CONTINUE|TRIM_PLAN|ABORT)\s*$') {
+        $recommendation = $Matches[1].ToUpperInvariant()
+    }
+    $driftDescription = ""
+    if ($trimmed -match '(?im)^DRIFT_DESCRIPTION\s*:\s*(.+)$') {
+        $driftDescription = $Matches[1].Trim()
+    }
+
+    if (-not $alignment -or -not $recommendation -or -not $driftDescription) {
+        return $result
+    }
+
+    $validCombination = (
+        ($alignment -eq "ON_TRACK" -and $recommendation -eq "CONTINUE") -or
+        ($alignment -eq "MINOR_DRIFT" -and $recommendation -eq "TRIM_PLAN") -or
+        ($alignment -eq "MAJOR_DRIFT" -and $recommendation -eq "ABORT")
+    )
+    if (-not $validCombination) {
+        return $result
+    }
+
+    $result.valid = $true
+    $result.alignment = $alignment
+    $result.recommendation = $recommendation
+    $result.driftDescription = $driftDescription
+    $result.shouldContinue = ($alignment -eq "ON_TRACK")
+    $result.shouldTrim = ($alignment -eq "MINOR_DRIFT")
+    $result.shouldReplan = ($alignment -eq "MAJOR_DRIFT")
+    return $result
+}
+
+function Get-DirectionCheckGuardrail {
+    param($Verdict)
+    if (-not $Verdict -or -not $Verdict.valid -or -not $Verdict.shouldTrim) { return "" }
+
+    return @"
+DIRECTION CHECK:
+- The validated plan contains minor scope drift.
+- Avoid this drift: $([string]$Verdict.driftDescription)
+- Stay inside the requested task and the validated targets unless a directly required adjacent change is unavoidable.
+"@.Trim()
+}
+
+function Get-AcceptedPlanTargets {
+    param(
+        [string[]]$ExistingTargets = @(),
+        [string[]]$CandidateTargets = @(),
+        [bool]$AcceptCandidate = $false
+    )
+    if ($AcceptCandidate) {
+        return @($CandidateTargets | Where-Object { $_ } | Select-Object -Unique)
+    }
+    return @($ExistingTargets | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-FixPlanFailureOutcome {
+    param([string]$LastPlanFailureReason)
+
+    if ([string]$LastPlanFailureReason -eq "DIRECTION_DRIFT") {
+        return [ordered]@{
+            finalCategory = "FIX_PLAN_DIRECTION_DRIFT"
+            finalSummary = "No aligned fix plan could be produced without major scope drift."
+            terminalFailureCode = "TERMINAL_FIX_PLAN_DIRECTION_DRIFT"
+        }
+    }
+
+    return [ordered]@{
+        finalCategory = "FIX_PLAN_INSUFFICIENT"
+        finalSummary = "No reliable fix plan could be produced after discovery, investigation, and optional reproduction."
+        terminalFailureCode = "TERMINAL_FIX_PLAN_INSUFFICIENT"
+    }
+}
+
+function Invoke-PlanDirectionCheck {
+    param(
+        [int]$PlanAttempt,
+        [string]$PlanOutput,
+        [string[]]$ExistingTargets = @(),
+        [string[]]$CandidateTargets = @(),
+        [string]$TaskPrompt,
+        [string]$TaskClass,
+        [string]$DiscoverConclusion,
+        [string]$RouteDecision,
+        [string]$Testability,
+        [string]$DiscoverBlock,
+        [string]$InvestigationBlock,
+        [string]$ReproductionBlock
+    )
+
+    $currentPhase = "DIRECTION_CHECK"
+    $attemptsByPhase.directionCheck = 0
+    $directionCheckVerdict = [ordered]@{
+        valid = $false
+        alignment = ""
+        recommendation = ""
+        driftDescription = ""
+        summary = ""
+        warningOnly = $false
+    }
+    $directionCheckGuardrail = ""
+    $directionPromptBase = @"
+Check whether the validated fix plan still matches the original task intent.
+This is a classification task only. Do not propose a new plan and do not suggest implementation details.
+Prefer the smallest reasonable change. Treat unrelated refactors, architectural cleanup, or speculative follow-up work as drift unless the task clearly requires them.
+
+TASK:
+$TaskPrompt
+
+TASK_CLASS: $TaskClass
+DISCOVER_CONCLUSION: $DiscoverConclusion
+ROUTE: $RouteDecision
+TESTABILITY: $Testability
+
+DISCOVER:
+$DiscoverBlock
+
+INVESTIGATION:
+$InvestigationBlock
+
+REPRODUCTION:
+$ReproductionBlock
+
+VALIDATED FIX PLAN:
+$PlanOutput
+
+VALIDATED TARGETS:
+$(if ($CandidateTargets.Count -gt 0) { ($CandidateTargets | ForEach-Object { "- $_" }) -join "`n" } else { "- No validated targets" })
+
+RESPOND EXACTLY:
+ALIGNMENT: ON_TRACK | MINOR_DRIFT | MAJOR_DRIFT
+DRIFT_DESCRIPTION: <short explanation>
+RECOMMENDATION: CONTINUE | TRIM_PLAN | ABORT
+"@
+    $directionPrompt = $directionPromptBase
+
+    for ($directionAttempt = 1; $directionAttempt -le 2; $directionAttempt++) {
+        $attemptsByPhase.directionCheck = $directionAttempt
+        $directionResult = Invoke-ClaudeDirectionCheck -Prompt $directionPrompt -Model $CONST_MODEL_FAST -Attempt (100 + ($PlanAttempt * 10) + $directionAttempt)
+        if (-not $directionResult.success) {
+            Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_CALL_FAILED" -Feedback $directionResult.output
+            Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check call failed." -Category "DIRECTION_CHECK_CALL_FAILED"
+            if ($directionAttempt -lt 2) {
+                $directionPrompt = @"
+YOUR PREVIOUS ATTEMPT FAILED OR DID NOT RETURN A PARSEABLE CLASSIFICATION.
+
+RETURN ONLY THIS FORMAT:
+ALIGNMENT: ON_TRACK | MINOR_DRIFT | MAJOR_DRIFT
+DRIFT_DESCRIPTION: <short explanation>
+RECOMMENDATION: CONTINUE | TRIM_PLAN | ABORT
+
+$directionPromptBase
+"@
+                continue
+            }
+
+            $directionCheckVerdict.warningOnly = $true
+            $directionCheckVerdict.summary = $directionResult.output
+            return [ordered]@{
+                accepted = $true
+                requiresReplan = $false
+                lastPlanFailureReason = ""
+                replanReason = ""
+                planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+                directionCheckVerdict = $directionCheckVerdict
+                directionCheckGuardrail = ""
+            }
+        }
+
+        $parsedDirectionCheck = Get-DirectionCheckVerdict -Output $directionResult.output
+        Save-JsonArtifact -Name "direction-check-v$PlanAttempt-$directionAttempt.json" -Object $parsedDirectionCheck | Out-Null
+        if ($parsedDirectionCheck.valid) {
+            $directionCheckVerdict = $parsedDirectionCheck
+            if ($parsedDirectionCheck.shouldTrim) {
+                Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_MINOR_DRIFT" -Feedback $parsedDirectionCheck.driftDescription
+                Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check detected minor scope drift." -Category "DIRECTION_CHECK_MINOR_DRIFT" -Data @{ alignment = $parsedDirectionCheck.alignment; recommendation = $parsedDirectionCheck.recommendation }
+                return [ordered]@{
+                    accepted = $true
+                    requiresReplan = $false
+                    lastPlanFailureReason = ""
+                    replanReason = ""
+                    planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+                    directionCheckVerdict = $directionCheckVerdict
+                    directionCheckGuardrail = (Get-DirectionCheckGuardrail -Verdict $parsedDirectionCheck)
+                }
+            }
+            if ($parsedDirectionCheck.shouldReplan) {
+                Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_MAJOR_DRIFT" -Feedback $parsedDirectionCheck.driftDescription
+                Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check rejected the plan due to major drift." -Category "DIRECTION_CHECK_MAJOR_DRIFT" -Data @{ alignment = $parsedDirectionCheck.alignment; recommendation = $parsedDirectionCheck.recommendation }
+                Write-SchedulerSnapshot
+                return [ordered]@{
+                    accepted = $false
+                    requiresReplan = $true
+                    lastPlanFailureReason = "DIRECTION_DRIFT"
+                    replanReason = "Direction check rejected the plan: $($parsedDirectionCheck.driftDescription)"
+                    planTargets = @($ExistingTargets | Where-Object { $_ } | Select-Object -Unique)
+                    directionCheckVerdict = $directionCheckVerdict
+                    directionCheckGuardrail = ""
+                }
+            }
+
+            Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check confirmed the plan is on track." -Category "DIRECTION_CHECK_ON_TRACK" -Data @{ alignment = $parsedDirectionCheck.alignment; recommendation = $parsedDirectionCheck.recommendation }
+            return [ordered]@{
+                accepted = $true
+                requiresReplan = $false
+                lastPlanFailureReason = ""
+                replanReason = ""
+                planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+                directionCheckVerdict = $directionCheckVerdict
+                directionCheckGuardrail = ""
+            }
+        }
+
+        Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_INVALID" -Feedback $directionResult.output
+        Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check output could not be parsed." -Category "DIRECTION_CHECK_INVALID"
+        if ($directionAttempt -lt 2) {
+            $directionPrompt = @"
+YOUR PREVIOUS ATTEMPT DID NOT FOLLOW THE REQUIRED FORMAT.
+
+RETURN ONLY THIS FORMAT:
+ALIGNMENT: ON_TRACK | MINOR_DRIFT | MAJOR_DRIFT
+DRIFT_DESCRIPTION: <short explanation>
+RECOMMENDATION: CONTINUE | TRIM_PLAN | ABORT
+
+$directionPromptBase
+"@
+            continue
+        }
+
+        $directionCheckVerdict.warningOnly = $true
+        $directionCheckVerdict.summary = $directionResult.output
+        return [ordered]@{
+            accepted = $true
+            requiresReplan = $false
+            lastPlanFailureReason = ""
+            replanReason = ""
+            planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+            directionCheckVerdict = $directionCheckVerdict
+            directionCheckGuardrail = ""
+        }
+    }
+
+    return [ordered]@{
+        accepted = $false
+        requiresReplan = $true
+        lastPlanFailureReason = "DIRECTION_DRIFT"
+        replanReason = "Direction check could not determine whether the plan stayed on track."
+        planTargets = @($ExistingTargets | Where-Object { $_ } | Select-Object -Unique)
+        directionCheckVerdict = $directionCheckVerdict
+        directionCheckGuardrail = ""
     }
 }
 
@@ -3140,6 +3438,8 @@ RATIONALE:
         }
     }
 
+    $planReadyForImplementation = $false
+    $lastPlanFailureReason = ""
     for ($planAttempt = 1; $planAttempt -le $CONST_PLAN_ATTEMPTS; $planAttempt++) {
         $currentPhase = "FIX_PLAN"
         $attemptsByPhase.plan = $planAttempt
@@ -3245,13 +3545,27 @@ Write ONLY the plan.
         $planValidation = Get-PlanValidation -Plan $planOutput
         Save-JsonArtifact -Name "fix-plan-v$planAttempt-validation.json" -Object $planValidation | Out-Null
         if ($planValidation.valid) {
-            $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
-            Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan akzeptiert." -Category "FIX_PLAN_VALID" -Data @{ targets = $planTargets }
-            Write-SchedulerSnapshot
-            break
+            $candidatePlanTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
+            Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan akzeptiert." -Category "FIX_PLAN_VALID" -Data @{ targets = $candidatePlanTargets }
+            $directionCheckResult = Invoke-PlanDirectionCheck -PlanAttempt $planAttempt -PlanOutput $planOutput -ExistingTargets $planTargets -CandidateTargets $candidatePlanTargets -TaskPrompt $taskPrompt -TaskClass $taskClass -DiscoverConclusion $discoverConclusion -RouteDecision $routeDecision -Testability $testability -DiscoverBlock $discoverBlock -InvestigationBlock $investigationBlock -ReproductionBlock $reproductionBlock
+            $directionCheckVerdict = $directionCheckResult.directionCheckVerdict
+            $directionCheckGuardrail = [string]$directionCheckResult.directionCheckGuardrail
+            $lastPlanFailureReason = [string]$directionCheckResult.lastPlanFailureReason
+            if ($directionCheckResult.requiresReplan) {
+                $replanReason = [string]$directionCheckResult.replanReason
+                continue
+            }
+
+            if ($directionCheckResult.accepted) {
+                $planTargets = @($directionCheckResult.planTargets)
+                $planReadyForImplementation = $true
+                Write-SchedulerSnapshot
+                break
+            }
         }
 
         $replanReason = ($planValidation.issues -join "`n")
+        $lastPlanFailureReason = "PLAN_INVALID"
         Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN" -Category "FIX_PLAN_INSUFFICIENT" -Feedback $replanReason
         Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan wurde verworfen." -Category "FIX_PLAN_INSUFFICIENT" -Data @{ issues = $planValidation.issues }
         for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
@@ -3322,13 +3636,27 @@ Write ONLY the plan.
             $planValidation = Get-PlanValidation -Plan $planOutput
             Save-JsonArtifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt-validation.json" -Object $planValidation | Out-Null
             if ($planValidation.valid) {
-                $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
-                Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan nach Repair akzeptiert." -Category "FIX_PLAN_REPAIRED" -Data @{ targets = $planTargets }
-                Write-SchedulerSnapshot
-                break
+                $candidateRepairedTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
+                Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan nach Repair akzeptiert." -Category "FIX_PLAN_REPAIRED" -Data @{ targets = $candidateRepairedTargets }
+                $directionCheckResult = Invoke-PlanDirectionCheck -PlanAttempt $planAttempt -PlanOutput $planOutput -ExistingTargets $planTargets -CandidateTargets $candidateRepairedTargets -TaskPrompt $taskPrompt -TaskClass $taskClass -DiscoverConclusion $discoverConclusion -RouteDecision $routeDecision -Testability $testability -DiscoverBlock $discoverBlock -InvestigationBlock $investigationBlock -ReproductionBlock $reproductionBlock
+                $directionCheckVerdict = $directionCheckResult.directionCheckVerdict
+                $directionCheckGuardrail = [string]$directionCheckResult.directionCheckGuardrail
+                $lastPlanFailureReason = [string]$directionCheckResult.lastPlanFailureReason
+                if ($directionCheckResult.requiresReplan) {
+                    $replanReason = [string]$directionCheckResult.replanReason
+                    continue
+                }
+
+                if ($directionCheckResult.accepted) {
+                    $planTargets = @($directionCheckResult.planTargets)
+                    $planReadyForImplementation = $true
+                    Write-SchedulerSnapshot
+                    break
+                }
             }
 
             $replanReason = ($planValidation.issues -join "`n")
+            $lastPlanFailureReason = "PLAN_INVALID"
             Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN_REPAIR" -Category "FIX_PLAN_REPAIR_INSUFFICIENT" -Feedback $replanReason
         }
         if ($planValidation.valid) {
@@ -3338,18 +3666,23 @@ Write ONLY the plan.
         if ($salvagedPlanTargets.Count -gt 0) {
             $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
             $planValidation.valid = $true
+            $lastPlanFailureReason = ""
             Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan via Salvage fortgesetzt." -Category "FIX_PLAN_SALVAGED" -Data @{ targets = $planTargets }
+            $planReadyForImplementation = $true
             Write-SchedulerSnapshot
             break
         }
+        $lastPlanFailureReason = "PLAN_INVALID"
     }
 
-    if ((-not $planValidation -or -not $planValidation.valid) -and $planTargets.Count -eq 0) {
+    if (-not $planReadyForImplementation) {
         $finalStatus = "FAILED"
-        $finalCategory = "FIX_PLAN_INSUFFICIENT"
-        $finalSummary = "No reliable fix plan could be produced after discovery, investigation, and optional reproduction."
+        $fixPlanFailureOutcome = Get-FixPlanFailureOutcome -LastPlanFailureReason $lastPlanFailureReason
+        $finalCategory = [string]$fixPlanFailureOutcome.finalCategory
+        $finalSummary = [string]$fixPlanFailureOutcome.finalSummary
         $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory -MaxChars 1200 }
-        throw [System.Exception]::new("TERMINAL_FIX_PLAN_INSUFFICIENT")
+        $terminalFailureCode = [string]$fixPlanFailureOutcome.terminalFailureCode
+        throw [System.Exception]::new($terminalFailureCode)
     }
 
     $implementationHistoryHashes = [System.Collections.ArrayList]::new()
@@ -3420,6 +3753,8 @@ $targetText
 
 PRIOR FEEDBACK:
 $historyText
+
+$(if ($directionCheckGuardrail) { "$directionCheckGuardrail`n" } else { "" })
 
 RULES:
 - Modify at least one repository file OR return a machine-readable NO_CHANGE result.
@@ -3695,6 +4030,13 @@ SUMMARY:
             if ($scopeWarningText) {
                 $warningText = if ($warningText) { "$warningText`n$scopeWarningText" } else { $scopeWarningText }
             }
+            if ($directionCheckVerdict -and $directionCheckVerdict.valid -and $directionCheckVerdict.shouldTrim) {
+                $directionWarningText = "DIRECTION CHECK: minor drift detected. " + [string]$directionCheckVerdict.driftDescription
+                $warningText = if ($warningText) { "$warningText`n$directionWarningText" } else { $directionWarningText }
+            } elseif ($directionCheckVerdict -and $directionCheckVerdict.warningOnly -and $directionCheckVerdict.summary) {
+                $directionWarningText = "DIRECTION CHECK WARNING: output was not reliable, so the pipeline continued."
+                $warningText = if ($warningText) { "$warningText`n$directionWarningText" } else { $directionWarningText }
+            }
 
             $currentPhase = "REVIEW"
             $diffForReview = (Invoke-NativeCommand git @("diff", "HEAD")).output
@@ -3863,12 +4205,12 @@ SUMMARY:
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     } else {
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force") | Out-Null
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     }
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
@@ -3884,7 +4226,7 @@ SUMMARY:
             Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
             $worktreePath = $null
         }
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     } else {
         Write-Host "[ERROR] $errMsg"
         $finalStatus = "ERROR"
@@ -3892,7 +4234,7 @@ SUMMARY:
         $finalSummary = "Unexpected error in phase $currentPhase."
         $finalFeedback = $errMsg
         Write-TimelineArtifact
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     }
 } finally {
     Set-Location $originalDir -ErrorAction SilentlyContinue

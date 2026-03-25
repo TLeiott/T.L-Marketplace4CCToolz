@@ -1433,6 +1433,204 @@ function Test-MissingPlannerContextFallsBackToComplexProfile {
     Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
 }
 
+function Test-DirectionCheckVerdictParsesOnTrackCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "ALIGNMENT: ON_TRACK`nDRIFT_DESCRIPTION: Plan is correctly scoped.`nRECOMMENDATION: CONTINUE") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "A valid ON_TRACK direction-check response should parse successfully."
+    Assert-True ([string]$parsed.alignment -eq "ON_TRACK") "ON_TRACK alignment should be preserved."
+    Assert-True ($parsed.shouldContinue -eq $true) "ON_TRACK should continue implementation."
+}
+
+function Test-DirectionCheckVerdictParsesMinorDriftCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail"
+    ) -ScriptBlock {
+        $verdict = Get-DirectionCheckVerdict -Output "ALIGNMENT: MINOR_DRIFT`nDRIFT_DESCRIPTION: The plan proposes an adjacent cleanup that is not required.`nRECOMMENDATION: TRIM_PLAN"
+        [pscustomobject]@{
+            verdict = $verdict
+            guardrail = (Get-DirectionCheckGuardrail -Verdict $verdict)
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.verdict.valid -eq $true) "A valid MINOR_DRIFT direction-check response should parse successfully."
+    Assert-True ([string]$parsed.verdict.alignment -eq "MINOR_DRIFT") "MINOR_DRIFT alignment should be preserved."
+    Assert-True ($parsed.verdict.shouldTrim -eq $true) "MINOR_DRIFT should request plan trimming."
+    Assert-True ([string]$parsed.guardrail -match "adjacent cleanup") "Minor drift should produce an implementation guardrail that includes the drift description."
+}
+
+function Test-DirectionCheckVerdictParsesMajorDriftCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "ALIGNMENT: MAJOR_DRIFT`nDRIFT_DESCRIPTION: The plan broadens into a refactor beyond the requested fix.`nRECOMMENDATION: ABORT") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "A valid MAJOR_DRIFT direction-check response should parse successfully."
+    Assert-True ([string]$parsed.recommendation -eq "ABORT") "Major drift should preserve the ABORT recommendation."
+    Assert-True ($parsed.shouldReplan -eq $true) "MAJOR_DRIFT should force replanning."
+}
+
+function Test-DirectionCheckVerdictRejectsMissingMarkers {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "The plan looks broadly correct but may touch too much code.") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Direction-check output without required markers must be rejected."
+}
+
+function Test-DirectionCheckVerdictRejectsMixedCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "ALIGNMENT: ON_TRACK`nDRIFT_DESCRIPTION: Looks good.`nRECOMMENDATION: ABORT") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Direction-check output with an incompatible alignment/recommendation pair must be rejected."
+}
+
+function Test-AcceptedPlanTargetsKeepExistingTargetsWhenCandidateRejected {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-AcceptedPlanTargets"
+    ) -ScriptBlock {
+        (Get-AcceptedPlanTargets -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Overreach\\Rejected.cs") -AcceptCandidate $false) | ConvertTo-Json -Depth 8
+    }
+
+    Assert-True ($output -like '*Existing.cs*') "Rejected candidate targets must preserve the previously accepted target."
+    Assert-True ($output -notlike '*Rejected.cs*') "Rejected candidate targets must not leak into the accepted target set."
+}
+
+function Test-AcceptedPlanTargetsReplaceExistingTargetsWhenAccepted {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-AcceptedPlanTargets"
+    ) -ScriptBlock {
+        (Get-AcceptedPlanTargets -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -AcceptCandidate $true) | ConvertTo-Json -Depth 8
+    }
+
+    Assert-True ($output -like '*Existing.cs*') "Accepted candidate targets should preserve previously accepted targets that remain in the candidate set."
+    Assert-True ($output -like '*Accepted.cs*') "Accepted candidate targets should include the new accepted target."
+}
+
+function Test-FixPlanFailureOutcomeUsesInsufficientForNonFinalDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-FixPlanFailureOutcome"
+    ) -ScriptBlock {
+        (Get-FixPlanFailureOutcome -LastPlanFailureReason "PLAN_INVALID") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.finalCategory -eq "FIX_PLAN_INSUFFICIENT") "Non-drift final failures must report FIX_PLAN_INSUFFICIENT."
+    Assert-True ([string]$parsed.terminalFailureCode -eq "TERMINAL_FIX_PLAN_INSUFFICIENT") "Non-drift final failures must use the insufficient terminal code."
+}
+
+function Test-FixPlanFailureOutcomeUsesDirectionDriftWhenFinalReasonIsDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-FixPlanFailureOutcome"
+    ) -ScriptBlock {
+        (Get-FixPlanFailureOutcome -LastPlanFailureReason "DIRECTION_DRIFT") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.finalCategory -eq "FIX_PLAN_DIRECTION_DRIFT") "Final drift failures must report FIX_PLAN_DIRECTION_DRIFT."
+    Assert-True ([string]$parsed.terminalFailureCode -eq "TERMINAL_FIX_PLAN_DIRECTION_DRIFT") "Final drift failures must use the drift terminal code."
+}
+
+function Test-PlanDirectionCheckRejectsRepairedPlanWithMajorDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail",
+        "Get-AcceptedPlanTargets",
+        "Invoke-PlanDirectionCheck"
+    ) -ScriptBlock {
+        $script:attemptsByPhase = [ordered]@{ directionCheck = 0 }
+        $script:CONST_MODEL_FAST = "test-fast"
+
+        function Save-JsonArtifact { param([string]$Name, $Object) return $null }
+        function Add-FeedbackEntry { param([int]$Attempt, [string]$Source, [string]$Category, [string]$Feedback) }
+        function Add-TimelineEvent { param([string]$Phase, [string]$Message, [string]$Category, $Data) }
+        function Write-SchedulerSnapshot { }
+        function Invoke-ClaudeDirectionCheck {
+            param([string]$Prompt, [string]$Model, [int]$Attempt)
+            return @{ success = $true; output = "ALIGNMENT: MAJOR_DRIFT`nDRIFT_DESCRIPTION: The repaired plan widens into a refactor.`nRECOMMENDATION: ABORT" }
+        }
+
+        (Invoke-PlanDirectionCheck -PlanAttempt 1 -PlanOutput "repaired plan" -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -TaskPrompt "Fix the bug only." -TaskClass "BUG" -DiscoverConclusion "Known defect." -RouteDecision "DIRECT" -Testability "HIGH" -DiscoverBlock "discover" -InvestigationBlock "investigate" -ReproductionBlock "reproduce") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.accepted -eq $false) "Major drift must not accept a repaired plan."
+    Assert-True ($parsed.requiresReplan -eq $true) "Major drift must force replanning for repaired plans."
+    Assert-True ([string]$parsed.lastPlanFailureReason -eq "DIRECTION_DRIFT") "Major drift must report the direction-drift failure reason."
+    Assert-True (($parsed.planTargets | ConvertTo-Json -Compress) -notlike '*Accepted.cs*') "Rejected repaired-plan targets must not replace the accepted target set."
+}
+
+function Test-PlanDirectionCheckAcceptsRepairedPlanWhenOnTrack {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail",
+        "Get-AcceptedPlanTargets",
+        "Invoke-PlanDirectionCheck"
+    ) -ScriptBlock {
+        $script:attemptsByPhase = [ordered]@{ directionCheck = 0 }
+        $script:CONST_MODEL_FAST = "test-fast"
+
+        function Save-JsonArtifact { param([string]$Name, $Object) return $null }
+        function Add-FeedbackEntry { param([int]$Attempt, [string]$Source, [string]$Category, [string]$Feedback) }
+        function Add-TimelineEvent { param([string]$Phase, [string]$Message, [string]$Category, $Data) }
+        function Write-SchedulerSnapshot { }
+        function Invoke-ClaudeDirectionCheck {
+            param([string]$Prompt, [string]$Model, [int]$Attempt)
+            return @{ success = $true; output = "ALIGNMENT: ON_TRACK`nDRIFT_DESCRIPTION: The repaired plan is tightly scoped.`nRECOMMENDATION: CONTINUE" }
+        }
+
+        (Invoke-PlanDirectionCheck -PlanAttempt 1 -PlanOutput "repaired plan" -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -TaskPrompt "Fix the bug only." -TaskClass "BUG" -DiscoverConclusion "Known defect." -RouteDecision "DIRECT" -Testability "HIGH" -DiscoverBlock "discover" -InvestigationBlock "investigate" -ReproductionBlock "reproduce") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.accepted -eq $true) "An on-track repaired plan should be accepted."
+    Assert-True ($parsed.requiresReplan -eq $false) "An on-track repaired plan should not replan."
+    Assert-True (($parsed.planTargets | ConvertTo-Json -Compress) -like '*Accepted.cs*') "Accepted repaired-plan targets should include the repaired target."
+}
+
+function Test-PlanDirectionCheckAddsGuardrailForRepairedMinorDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail",
+        "Get-AcceptedPlanTargets",
+        "Invoke-PlanDirectionCheck"
+    ) -ScriptBlock {
+        $script:attemptsByPhase = [ordered]@{ directionCheck = 0 }
+        $script:CONST_MODEL_FAST = "test-fast"
+
+        function Save-JsonArtifact { param([string]$Name, $Object) return $null }
+        function Add-FeedbackEntry { param([int]$Attempt, [string]$Source, [string]$Category, [string]$Feedback) }
+        function Add-TimelineEvent { param([string]$Phase, [string]$Message, [string]$Category, $Data) }
+        function Write-SchedulerSnapshot { }
+        function Invoke-ClaudeDirectionCheck {
+            param([string]$Prompt, [string]$Model, [int]$Attempt)
+            return @{ success = $true; output = "ALIGNMENT: MINOR_DRIFT`nDRIFT_DESCRIPTION: The repaired plan includes adjacent cleanup.`nRECOMMENDATION: TRIM_PLAN" }
+        }
+
+        (Invoke-PlanDirectionCheck -PlanAttempt 1 -PlanOutput "repaired plan" -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -TaskPrompt "Fix the bug only." -TaskClass "BUG" -DiscoverConclusion "Known defect." -RouteDecision "DIRECT" -Testability "HIGH" -DiscoverBlock "discover" -InvestigationBlock "investigate" -ReproductionBlock "reproduce") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.accepted -eq $true) "Minor drift should still accept the repaired plan with a guardrail."
+    Assert-True ([string]$parsed.directionCheckVerdict.alignment -eq "MINOR_DRIFT") "Minor drift should preserve the parsed direction-check verdict."
+    Assert-True ([string]$parsed.directionCheckGuardrail -match "adjacent cleanup") "Minor drift should populate the repaired-plan guardrail."
+}
+
 function Test-ImplementationScopeCheckIsTightForExactMatches {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
@@ -5320,6 +5518,18 @@ Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-WritePlannerContextFilePersistsEffortClass
 Test-PlannerContextLowEffortSelectsSimpleProfile
 Test-MissingPlannerContextFallsBackToComplexProfile
+Test-DirectionCheckVerdictParsesOnTrackCombination
+Test-DirectionCheckVerdictParsesMinorDriftCombination
+Test-DirectionCheckVerdictParsesMajorDriftCombination
+Test-DirectionCheckVerdictRejectsMissingMarkers
+Test-DirectionCheckVerdictRejectsMixedCombination
+Test-AcceptedPlanTargetsKeepExistingTargetsWhenCandidateRejected
+Test-AcceptedPlanTargetsReplaceExistingTargetsWhenAccepted
+Test-FixPlanFailureOutcomeUsesInsufficientForNonFinalDrift
+Test-FixPlanFailureOutcomeUsesDirectionDriftWhenFinalReasonIsDrift
+Test-PlanDirectionCheckRejectsRepairedPlanWithMajorDrift
+Test-PlanDirectionCheckAcceptsRepairedPlanWhenOnTrack
+Test-PlanDirectionCheckAddsGuardrailForRepairedMinorDrift
 Test-ImplementationScopeCheckIsTightForExactMatches
 Test-ImplementationScopeCheckAcceptsUniqueSuffixMatches
 Test-ImplementationScopeCheckEscalatesDirectoryTargets

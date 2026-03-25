@@ -295,7 +295,7 @@ AutoDevelop's quality checking is **heavily end-loaded**: the reviewer is the on
 - **Reviewer** (post-implementation): checks "Is this the smallest reasonable change?", "Were unnecessary deviations introduced?", "Does the code solve the stated task?" Can return `DENIED_RETHINK` for "fundamentally wrong approach." But this fires only after IMPLEMENT + PREFLIGHT have already consumed the majority of the pipeline budget.
 - **Plan validation** (`Get-PlanValidation`): structural quality only (has Goal/Files/Order sections, not too short). Does NOT check whether the plan aligns with the original task intent.
 - **Implementation outcome detection**: only checks whether files were actually changed, not whether changes match the task.
-- **No mid-pipeline direction check exists.**
+- **A direction check now runs after FIX_PLAN.**
 
 ### Types of Scope Drift in AutoDevelop
 
@@ -705,13 +705,13 @@ The IMPLEMENT-PREFLIGHT-REVIEW-REMEDIATE feedback loop shares mutable state acro
 
 ### Tier 1 — High Impact, Moderate Effort
 
-Status update as of 2026-03-24: recommendations #1 and #2 were implemented by commit `d0b4d22` (`auto: wire planner effort and add discovery briefs`).
+Status update as of 2026-03-25: recommendations #1 and #2 were implemented by commit `d0b4d22` (`auto: wire planner effort and add discovery briefs`). Recommendation #3 is now implemented in the pending 4.2.11 changes.
 
 | # | Improvement | Status | Source Inspiration | Expected Impact | Effort |
 |---|---|---|---|---|---|
 | 1 | **Wire `effortClass` from scheduler-agent to worker pipeline** | Done 2026-03-24 in `d0b4d22` | Citadel's /do router | Free classification signal already computed but wasted. Enables pipeline profile selection. | Low — pass through existing data |
 | 2 | **Discovery briefs (template-extracted) → scheduler-agent** | Done 2026-03-24 in `d0b4d22` | Citadel's compress-discovery.cjs | Directly improves wave planning accuracy using ground-truth data from completed tasks. | Low-Medium — new function in scheduler post-processing |
-| 3 | **Direction check after FIX_PLAN** | Open | Citadel's Archon alignment check | One Sonnet call (~2-3% cost) saves 70-80% when drift caught. | Medium — new pipeline phase |
+| 3 | **Direction check after FIX_PLAN** | Done 2026-03-25 in pending 4.2.11 changes | Citadel's Archon alignment check | One Sonnet call (~2-3% cost) saves 70-80% when drift caught. | Medium — new pipeline phase |
 | 4 | **Retry context injection** | Open | Citadel's Decision Log | Workers currently start cold. Passing prior attempt lessons would reduce blind retries 60-80%. | Medium — extend result JSON + add `-RetryContextFile` parameter |
 
 ### Tier 2 — Medium Impact, Lower Effort
