@@ -3,6 +3,9 @@ param(
     [Parameter(Mandatory)][string]$PromptFile,
     [Parameter(Mandatory)][string]$SolutionPath,
     [Parameter(Mandatory)][string]$ResultFile,
+    [string]$PlannerContextFile = "",
+    [string]$RetryContextFile = "",
+    [string]$BriefsFile = "",
     [string]$TaskName = "develop-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
     [string]$SchedulerTaskId = "",
     [string]$CommandType = "",
@@ -17,6 +20,7 @@ $CONST_MODEL_REVIEW = "claude-opus-4-6"
 $CONST_MODEL_FAST = "claude-sonnet-4-6"
 $CONST_MAX_TURNS_DISCOVER = 12
 $CONST_MAX_TURNS_PLAN = 18
+$CONST_MAX_TURNS_DIRECTION_CHECK = 8
 $CONST_MAX_TURNS_INVESTIGATE = 14
 $CONST_MAX_TURNS_IMPL = 24
 $CONST_MAX_TURNS_REVIEW = 12
@@ -40,6 +44,12 @@ $CONST_REVIEW_HISTORY_MAX_CHARS = 1400
 $CONST_REVIEW_FAST_MAX_FILES = 3
 $CONST_REVIEW_FAST_MAX_DIFF_CHARS = 7000
 $CONST_TARGET_HINTS_MAX = 5
+$CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS = 900
+$CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS = 1200
+$CONST_RETRY_CONTEXT_IMPLEMENT_MAX_CHARS = 1600
+$CONST_RETRY_CONTEXT_REMEDIATE_MAX_CHARS = 1400
+$CONST_WORKER_BRIEFS_DISCOVER_MAX_CHARS = 1100
+$CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS = 1400
 
 $ErrorActionPreference = "Stop"
 $originalDir = Get-Location
@@ -58,6 +68,7 @@ $attemptsByPhase = [ordered]@{
     discover = 0
     plan = 0
     fixPlan = 0
+    directionCheck = 0
     investigate = 0
     reproduce = 0
     verifyRepro = 0
@@ -81,6 +92,10 @@ $discoverConclusion = ""
 $routeDecision = "UNCERTAIN"
 $testability = "UNKNOWN"
 $testProjects = @()
+$plannerEffortClass = "UNKNOWN"
+$pipelineProfile = "COMPLEX"
+$currentRunAttemptNumber = 0
+$currentLaunchSequence = 0
 $reproductionAttempted = $false
 $reproductionConfirmed = $false
 $reproductionOutput = ""
@@ -99,6 +114,43 @@ $targetedVerificationPassed = $false
 $taskPrompt = ""
 $taskLine = ""
 $planTargets = @()
+$implementationScopeCheck = $null
+$directionCheckVerdict = [ordered]@{
+    valid = $false
+    alignment = ""
+    recommendation = ""
+    driftDescription = ""
+    summary = ""
+    warningOnly = $false
+}
+$directionCheckGuardrail = ""
+$priorArtRequirement = [ordered]@{
+    required = $false
+    reasons = @()
+    triggerKind = ""
+}
+$retryContextState = [ordered]@{
+    loaded = $false
+    path = ""
+    taskId = ""
+    attemptNumber = 0
+    latestFailure = [ordered]@{
+        finalStatus = ""
+        finalCategory = ""
+        summary = ""
+        feedback = ""
+        investigationConclusion = ""
+    }
+    priorChangedFiles = @()
+    retryLessons = @()
+}
+$workerBriefsState = [ordered]@{
+    loaded = $false
+    path = ""
+    taskId = ""
+    briefCount = 0
+    briefs = @()
+}
 $discoverVerdict = [ordered]@{
     route = "UNCERTAIN"
     bugConfidence = "LOW"
@@ -114,6 +166,10 @@ $investigationVerdict = [ordered]@{
     testability = "UNKNOWN"
     nextPhase = "FIX_PLAN"
     summary = ""
+    priorArtRequired = $false
+    referenceFiles = @()
+    referenceFindings = ""
+    reuseStrategy = ""
 }
 
 Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
@@ -142,6 +198,340 @@ function Get-CanonicalPath {
     }
 }
 
+function Read-JsonFileBestEffort {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        return ([System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+    } catch {
+        try {
+            return ([System.IO.File]::ReadAllText($Path) | ConvertFrom-Json)
+        } catch {
+            return $null
+        }
+    }
+}
+
+function Get-RetryLessonComparisonText {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+    $value = ([string]$Text).ToLowerInvariant()
+    $value = [regex]::Replace($value, '(?m)^\s*[-*]\s+', '')
+    $value = [regex]::Replace($value, '[\p{P}\p{S}]+', ' ')
+    $value = [regex]::Replace($value, '\s+', ' ')
+    return $value.Trim()
+}
+
+function Get-RetryLessonsFromFeedbackHistory {
+    param(
+        [System.Collections.ArrayList]$History,
+        [int]$RunAttemptNumber = 0,
+        [int]$MaxLessons = 8,
+        [int]$MaxFeedbackChars = 260
+    )
+
+    if (-not $History -or $History.Count -eq 0) { return @() }
+
+    $lessons = [System.Collections.ArrayList]::new()
+    $seenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    for ($index = ($History.Count - 1); $index -ge 0; $index--) {
+        if ($lessons.Count -ge $MaxLessons) { break }
+        $entry = $History[$index]
+        if (-not $entry) { continue }
+
+        $feedbackText = [string]$entry.feedback
+        $firstLine = @($feedbackText -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1)[0]
+        if (-not $firstLine) {
+            $firstLine = [string]$entry.category
+        }
+
+        $dedupeKey = @(
+            ([string]$entry.source).Trim().ToUpperInvariant(),
+            ([string]$entry.category).Trim().ToUpperInvariant(),
+            (Get-RetryLessonComparisonText -Text $firstLine)
+        ) -join "|"
+        if (-not $dedupeKey.Trim('|')) { continue }
+        if (-not $seenKeys.Add($dedupeKey)) { continue }
+
+        [void]$lessons.Add([pscustomobject]@{
+            runAttemptNumber = $RunAttemptNumber
+            phaseAttempt = if ($null -ne $entry.attempt) { [int]$entry.attempt } else { 0 }
+            source = [string]$entry.source
+            category = [string]$entry.category
+            feedbackExcerpt = Clip-Text -Text $feedbackText -MaxChars $MaxFeedbackChars -Marker "Feedback trimmed"
+        })
+    }
+
+    return @($lessons)
+}
+
+function Get-RetryContextState {
+    param(
+        [string]$RetryContextFile,
+        [string]$ExpectedTaskId = ""
+    )
+
+    $emptyState = [ordered]@{
+        loaded = $false
+        path = [string]$RetryContextFile
+        taskId = ""
+        attemptNumber = 0
+        latestFailure = [ordered]@{
+            finalStatus = ""
+            finalCategory = ""
+            summary = ""
+            feedback = ""
+            investigationConclusion = ""
+        }
+        priorChangedFiles = @()
+        retryLessons = @()
+    }
+
+    if (-not $RetryContextFile) {
+        return [pscustomobject]$emptyState
+    }
+
+    $context = Read-JsonFileBestEffort -Path $RetryContextFile
+    if (-not $context) {
+        return [pscustomobject]$emptyState
+    }
+    if ($null -ne $context.version -and [int]$context.version -ne 1) {
+        return [pscustomobject]$emptyState
+    }
+    if ($ExpectedTaskId -and [string]$context.taskId -ne [string]$ExpectedTaskId) {
+        return [pscustomobject]$emptyState
+    }
+
+    $latestFailure = [ordered]@{
+        finalStatus = if ($context.latestFailure) { [string]$context.latestFailure.finalStatus } else { "" }
+        finalCategory = if ($context.latestFailure) { [string]$context.latestFailure.finalCategory } else { "" }
+        summary = if ($context.latestFailure) { [string]$context.latestFailure.summary } else { "" }
+        feedback = if ($context.latestFailure) { [string]$context.latestFailure.feedback } else { "" }
+        investigationConclusion = if ($context.latestFailure) { [string]$context.latestFailure.investigationConclusion } else { "" }
+    }
+
+    $retryLessons = @()
+    foreach ($lesson in @($context.retryLessons)) {
+        if (-not $lesson) { continue }
+        $retryLessons += [pscustomobject]@{
+            runAttemptNumber = if ($null -ne $lesson.runAttemptNumber) { [int]$lesson.runAttemptNumber } else { 0 }
+            phaseAttempt = if ($null -ne $lesson.phaseAttempt) { [int]$lesson.phaseAttempt } elseif ($null -ne $lesson.attempt) { [int]$lesson.attempt } else { 0 }
+            source = [string]$lesson.source
+            category = [string]$lesson.category
+            feedbackExcerpt = if ($null -ne $lesson.feedbackExcerpt) { [string]$lesson.feedbackExcerpt } else { "" }
+        }
+    }
+
+    $priorChangedFiles = @(Get-NormalizedPathSet -Paths $context.priorChangedFiles)
+    $hasSignal =
+        $latestFailure.finalStatus -or
+        $latestFailure.finalCategory -or
+        $latestFailure.summary -or
+        $latestFailure.feedback -or
+        $latestFailure.investigationConclusion -or
+        $priorChangedFiles.Count -gt 0 -or
+        $retryLessons.Count -gt 0
+    if (-not $hasSignal) {
+        return [pscustomobject]$emptyState
+    }
+
+    return [pscustomobject]@{
+        loaded = $true
+        path = [string]$RetryContextFile
+        taskId = [string]$context.taskId
+        attemptNumber = if ($null -ne $context.attemptNumber) { [int]$context.attemptNumber } else { 0 }
+        latestFailure = $latestFailure
+        priorChangedFiles = @($priorChangedFiles)
+        retryLessons = @($retryLessons)
+    }
+}
+
+function Format-RetryContextPromptBlock {
+    param(
+        $RetryContext,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    )
+
+    if (-not $RetryContext -or -not $RetryContext.loaded) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    if ([int]$RetryContext.attemptNumber -gt 0) {
+        [void]$lines.Add("RETRY ATTEMPT: $([int]$RetryContext.attemptNumber)")
+    }
+    if ($RetryContext.latestFailure.finalCategory) {
+        [void]$lines.Add("LATEST FAILURE CATEGORY: $([string]$RetryContext.latestFailure.finalCategory)")
+    }
+    if ($RetryContext.latestFailure.summary) {
+        [void]$lines.Add("LATEST FAILURE SUMMARY: $([string]$RetryContext.latestFailure.summary)")
+    }
+    if ($RetryContext.latestFailure.feedback) {
+        [void]$lines.Add("LATEST FAILURE FEEDBACK: $([string]$RetryContext.latestFailure.feedback)")
+    }
+    if ($RetryContext.latestFailure.investigationConclusion) {
+        [void]$lines.Add("LATEST INVESTIGATION CONCLUSION: $([string]$RetryContext.latestFailure.investigationConclusion)")
+    }
+    if (@($RetryContext.priorChangedFiles).Count -gt 0) {
+        [void]$lines.Add("PRIOR CHANGED FILES:`n$(Format-BulletList -Items @($RetryContext.priorChangedFiles) -MaxItems 8 -EmptyText '- None')")
+    }
+    if (@($RetryContext.retryLessons).Count -gt 0) {
+        $lessonLines = @($RetryContext.retryLessons | ForEach-Object {
+            $runLabel = if ($null -ne $_.runAttemptNumber -and [int]$_.runAttemptNumber -gt 0) { "Run $([int]$_.runAttemptNumber) " } else { "" }
+            "- ${runLabel}[$([string]$_.source)/$([string]$_.category)]: $([string]$_.feedbackExcerpt)"
+        })
+        [void]$lines.Add("PRIOR LESSONS:`n$($lessonLines -join "`n")")
+    }
+
+    $modeRule = switch ($Mode.ToUpperInvariant()) {
+        "DISCOVER" { "Treat these blockers as disconfirming evidence. Do not route through the same failed assumption without new evidence." }
+        "INVESTIGATE" { "Re-check the failed assumption and identify what the earlier attempt missed." }
+        "FIX_PLAN" { "Plan around these blockers explicitly. Do not propose a path that repeats them." }
+        "IMPLEMENT" { "Resolve these blockers directly. Do not repeat a denied or broken approach." }
+        "REMEDIATE" { "Fix the current blockers without reintroducing the earlier denied or failed path." }
+        default { "Use this as must-fix retry memory for the current attempt." }
+    }
+    [void]$lines.Add("RETRY RULE: $modeRule")
+
+    return Clip-Text -Text (($lines | Where-Object { $_ }) -join "`n") -MaxChars $MaxChars -Marker "Retry context trimmed"
+}
+
+function Get-RetryContextPromptSection {
+    param(
+        $RetryContext,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    )
+
+    $block = Format-RetryContextPromptBlock -RetryContext $RetryContext -Mode $Mode -MaxChars $MaxChars
+    if (-not $block) { return "" }
+    return "RETRY CONTEXT:`n$block`n"
+}
+
+function Get-WorkerBriefsState {
+    param(
+        [string]$BriefsFile,
+        [string]$ExpectedTaskId = ""
+    )
+
+    $emptyState = [ordered]@{
+        loaded = $false
+        path = [string]$BriefsFile
+        taskId = ""
+        briefCount = 0
+        briefs = @()
+    }
+
+    if (-not $BriefsFile) {
+        return [pscustomobject]$emptyState
+    }
+
+    $payload = Read-JsonFileBestEffort -Path $BriefsFile
+    if (-not $payload) {
+        return [pscustomobject]$emptyState
+    }
+    if ($null -ne $payload.version -and [int]$payload.version -ne 1) {
+        return [pscustomobject]$emptyState
+    }
+    if ($ExpectedTaskId -and [string]$payload.taskId -ne [string]$ExpectedTaskId) {
+        return [pscustomobject]$emptyState
+    }
+
+    $briefs = @()
+    foreach ($brief in @($payload.briefs)) {
+        if (-not $brief) { continue }
+        $discoveries = @($brief.discoveries | Where-Object { $_ } | Select-Object -Unique -First 2)
+        $filesChanged = @(Get-NormalizedPathSet -Paths $brief.filesChanged | Select-Object -First 6)
+        $hasSignal =
+            [string]$brief.taskSummary -or
+            [string]$brief.whatWasBuilt -or
+            $discoveries.Count -gt 0 -or
+            $filesChanged.Count -gt 0 -or
+            [string]$brief.conflictHints
+        if (-not $hasSignal) { continue }
+
+        $briefs += [pscustomobject]@{
+            taskId = [string]$brief.taskId
+            waveNumber = if ($null -ne $brief.waveNumber) { [int]$brief.waveNumber } else { 0 }
+            status = [string]$brief.status
+            finalCategory = [string]$brief.finalCategory
+            taskSummary = [string]$brief.taskSummary
+            whatWasBuilt = [string]$brief.whatWasBuilt
+            discoveries = @($discoveries)
+            filesChanged = @($filesChanged)
+            conflictHints = [string]$brief.conflictHints
+        }
+    }
+
+    if (@($briefs).Count -eq 0) {
+        return [pscustomobject]$emptyState
+    }
+
+    return [pscustomobject]@{
+        loaded = $true
+        path = [string]$BriefsFile
+        taskId = [string]$payload.taskId
+        briefCount = if ($null -ne $payload.briefCount) { [int]$payload.briefCount } else { @($briefs).Count }
+        briefs = @($briefs)
+    }
+}
+
+function Format-WorkerBriefsPromptBlock {
+    param(
+        $WorkerBriefs,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS
+    )
+
+    if (-not $WorkerBriefs -or -not $WorkerBriefs.loaded) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("COMPLETED TASK BRIEFS: $(@($WorkerBriefs.briefs).Count)")
+    foreach ($brief in @($WorkerBriefs.briefs | Select-Object -First 4)) {
+        $segments = [System.Collections.ArrayList]::new()
+        $label = if ($brief.taskId) { ("[{0}]" -f [string]$brief.taskId) } else { "[brief]" }
+        if ($brief.taskSummary) {
+            [void]$segments.Add("$label Task: $(Clip-Text -Text ([string]$brief.taskSummary) -MaxChars 130 -Marker 'Task trimmed')")
+        }
+        if ($brief.whatWasBuilt) {
+            [void]$segments.Add("Built: $(Clip-Text -Text ([string]$brief.whatWasBuilt) -MaxChars 140 -Marker 'Built trimmed')")
+        }
+        if (@($brief.discoveries).Count -gt 0) {
+            [void]$segments.Add("Discoveries: $(Clip-Text -Text ((@($brief.discoveries) -join '; ')) -MaxChars 140 -Marker 'Discoveries trimmed')")
+        }
+        if (@($brief.filesChanged).Count -gt 0) {
+            [void]$segments.Add("Files: $((@($brief.filesChanged) | Select-Object -First 3) -join ', ')")
+        }
+        if ($brief.conflictHints) {
+            [void]$segments.Add("Conflict hint: $(Clip-Text -Text ([string]$brief.conflictHints) -MaxChars 120 -Marker 'Conflict trimmed')")
+        }
+        if ($segments.Count -gt 0) {
+            [void]$lines.Add("- " + (($segments | Where-Object { $_ }) -join " | "))
+        }
+    }
+
+    $modeRule = switch ($Mode.ToUpperInvariant()) {
+        "DISCOVER" { "Use these as hints for existing nearby implementations before routing the task." }
+        "INVESTIGATE" { "If this task looks reuse-heavy or cross-file, identify concrete matching reference paths before proposing a change path." }
+        default { "Use these as examples of existing proven paths in the codebase." }
+    }
+    [void]$lines.Add("BRIEF RULE: $modeRule")
+
+    return Clip-Text -Text (($lines | Where-Object { $_ }) -join "`n") -MaxChars $MaxChars -Marker "Worker briefs trimmed"
+}
+
+function Get-WorkerBriefsPromptSection {
+    param(
+        $WorkerBriefs,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS
+    )
+
+    $block = Format-WorkerBriefsPromptBlock -WorkerBriefs $WorkerBriefs -Mode $Mode -MaxChars $MaxChars
+    if (-not $block) { return "" }
+    return "WORKER BRIEFS:`n$block`n"
+}
+
 function Normalize-RepoRelativePath {
     param([string]$Path)
     if (-not $Path) { return "" }
@@ -152,6 +542,21 @@ function Normalize-RepoRelativePath {
     return $normalized.TrimStart('\')
 }
 
+function Get-NormalizedPlannerEffortClass {
+    param([string]$EffortClass)
+    $value = ([string]$EffortClass).Trim().ToUpperInvariant()
+    if ($value -in @("LOW", "MEDIUM", "HIGH")) { return $value }
+    return "UNKNOWN"
+}
+
+function Get-PipelineProfile {
+    param([string]$PlannerEffortClass)
+    if ((Get-NormalizedPlannerEffortClass -EffortClass $PlannerEffortClass) -eq "LOW") {
+        return "SIMPLE"
+    }
+    return "COMPLEX"
+}
+
 function Get-NormalizedPathSet {
     param([string[]]$Paths)
     return @(
@@ -160,6 +565,242 @@ function Get-NormalizedPathSet {
             if ($value) { $value }
         } | Where-Object { $_ } | Select-Object -Unique)
     )
+}
+
+function Get-CanonicalComparisonPath {
+    param([string]$Path)
+    if (-not $Path) { return "" }
+    return (([string]$Path).Trim().Replace("/", "\").TrimStart('\')).ToLowerInvariant()
+}
+
+function Get-PathComparisonProfile {
+    param([string]$Path)
+
+    $canonical = Get-CanonicalComparisonPath -Path $Path
+    if (-not $canonical) {
+        return [pscustomobject]@{
+            original = [string]$Path
+            canonical = ""
+            baseName = ""
+            isFileLike = $false
+            hasWildcard = $false
+            segments = @()
+        }
+    }
+
+    $segments = @($canonical -split '[\\/]')
+    $baseName = if ($segments.Count -gt 0) { [string]$segments[-1] } else { "" }
+    $hasWildcard = ($canonical -match '[\*\?]')
+    $isFileLike = (-not $hasWildcard) -and ($baseName -match '\.') -and ($segments.Count -gt 0)
+    return [pscustomobject]@{
+        original = [string]$Path
+        canonical = $canonical
+        baseName = $baseName
+        isFileLike = $isFileLike
+        hasWildcard = $hasWildcard
+        segments = @($segments)
+    }
+}
+
+function Get-TargetPathMatches {
+    param(
+        [string]$TargetPath,
+        [string[]]$ActualPaths
+    )
+
+    $target = Get-PathComparisonProfile -Path $TargetPath
+    $actualProfiles = @($ActualPaths | ForEach-Object { Get-PathComparisonProfile -Path ([string]$_) } | Where-Object { $_.canonical })
+    if (-not $target.canonical -or $actualProfiles.Count -eq 0) {
+        return [pscustomobject]@{ kind = "none"; actuals = @() }
+    }
+
+    if ($target.hasWildcard) {
+        $wildcardMatches = @($actualProfiles | Where-Object { $_.canonical -like $target.canonical } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($wildcardMatches.Count -gt 0) {
+            return [pscustomobject]@{ kind = "wildcard"; actuals = @($wildcardMatches) }
+        }
+        return [pscustomobject]@{ kind = "none"; actuals = @() }
+    }
+
+    $exactMatches = @($actualProfiles | Where-Object { $_.canonical -eq $target.canonical } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+    if ($exactMatches.Count -gt 0) {
+        return [pscustomobject]@{ kind = "exact"; actuals = @($exactMatches) }
+    }
+
+    if ($target.isFileLike) {
+        $suffixCandidates = @($actualProfiles | Where-Object { $_.baseName -eq $target.baseName } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($suffixCandidates.Count -eq 1) {
+            return [pscustomobject]@{ kind = "suffix"; actuals = @($suffixCandidates) }
+        }
+
+        $suffixByEnding = @($actualProfiles | Where-Object { $_.canonical.EndsWith("\" + $target.canonical) } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($suffixByEnding.Count -eq 1) {
+            return [pscustomobject]@{ kind = "suffix"; actuals = @($suffixByEnding) }
+        }
+    }
+
+    if (-not $target.isFileLike -and $target.segments.Count -gt 0) {
+        $directoryPrefix = $target.canonical.TrimEnd('\')
+        $directoryCandidates = @($actualProfiles | Where-Object { $_.canonical.StartsWith($directoryPrefix + "\") -or $_.canonical -eq $directoryPrefix } | ForEach-Object { [string]$_.original } | Select-Object -Unique)
+        if ($directoryCandidates.Count -gt 0) {
+            return [pscustomobject]@{ kind = "directory"; actuals = @($directoryCandidates) }
+        }
+    }
+
+    return [pscustomobject]@{ kind = "none"; actuals = @() }
+}
+
+function Match-AllowedTargetPaths {
+    param(
+        [string[]]$TargetPaths,
+        [string[]]$ActualPaths
+    )
+
+    $matchedTargets = [System.Collections.ArrayList]::new()
+    $matchedActualFiles = [System.Collections.ArrayList]::new()
+    $usedActuals = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $unmatchedTargets = [System.Collections.ArrayList]::new()
+    $matchKinds = [ordered]@{ exact = 0; suffix = 0; directory = 0; wildcard = 0 }
+
+    foreach ($target in @($TargetPaths | Where-Object { $_ } | Select-Object -Unique)) {
+        $match = Get-TargetPathMatches -TargetPath ([string]$target) -ActualPaths $ActualPaths
+        if ($match.kind -eq "none" -or @($match.actuals).Count -eq 0) {
+            [void]$unmatchedTargets.Add([string]$target)
+            continue
+        }
+
+        [void]$matchedTargets.Add([string]$target)
+        foreach ($actual in @($match.actuals | Where-Object { $_ } | Select-Object -Unique)) {
+            [void]$matchedActualFiles.Add([string]$actual)
+            [void]$usedActuals.Add(([string]$actual))
+        }
+        if ($matchKinds.Contains($match.kind)) {
+            $matchKinds[$match.kind] = [int]$matchKinds[$match.kind] + 1
+        }
+    }
+
+    $outOfScopeFiles = @(
+        @($ActualPaths | Where-Object { $_ -and -not $usedActuals.Contains([string]$_) } | Select-Object -Unique)
+    )
+
+    return [pscustomobject]@{
+        matchedTargets = @($matchedTargets | Select-Object -Unique)
+        matchedActualFiles = @($matchedActualFiles | Select-Object -Unique)
+        unmatchedTargets = @($unmatchedTargets | Select-Object -Unique)
+        outOfScopeFiles = @($outOfScopeFiles)
+        matchKinds = [pscustomobject]$matchKinds
+    }
+}
+
+function Get-ImplementationScopeCheck {
+    param(
+        [string[]]$PlanTargets,
+        [string[]]$ChangedFiles
+    )
+
+    $normalizedTargets = @(Get-NormalizedPathSet -Paths $PlanTargets)
+    $normalizedFiles = @(Get-NormalizedPathSet -Paths $ChangedFiles)
+    if ($normalizedFiles.Count -eq 0) {
+        return [pscustomobject]@{
+            evaluated = $false
+            classification = "unknown"
+            planTargets = @($normalizedTargets)
+            changedFiles = @($normalizedFiles)
+            matchedTargets = @()
+            matchedFiles = @()
+            unmatchedTargets = @()
+            outOfScopeFiles = @()
+            matchKindsSummary = [pscustomobject]@{ exact = 0; suffix = 0; directory = 0; wildcard = 0 }
+            notes = "No changed files were available for scope validation."
+            shouldWarn = $false
+            shouldEscalateReview = $false
+        }
+    }
+    if ($normalizedTargets.Count -eq 0) {
+        return [pscustomobject]@{
+            evaluated = $false
+            classification = "unknown"
+            planTargets = @($normalizedTargets)
+            changedFiles = @($normalizedFiles)
+            matchedTargets = @()
+            matchedFiles = @()
+            unmatchedTargets = @()
+            outOfScopeFiles = @()
+            matchKindsSummary = [pscustomobject]@{ exact = 0; suffix = 0; directory = 0; wildcard = 0 }
+            notes = "No validated plan targets were available for scope validation."
+            shouldWarn = $false
+            shouldEscalateReview = $false
+        }
+    }
+
+    $matchResult = Match-AllowedTargetPaths -TargetPaths $normalizedTargets -ActualPaths $normalizedFiles
+    $classification = if ($matchResult.outOfScopeFiles.Count -gt 0) {
+        "drifted"
+    } elseif ($matchResult.matchKinds.directory -gt 0 -or $matchResult.matchKinds.wildcard -gt 0) {
+        "broad"
+    } elseif ($matchResult.matchKinds.suffix -gt 0) {
+        "acceptable"
+    } else {
+        "tight"
+    }
+
+    $notes = "Plan targets $($normalizedTargets.Count), changed files $($normalizedFiles.Count), matched files $(@($matchResult.matchedActualFiles).Count), out-of-scope files $(@($matchResult.outOfScopeFiles).Count)."
+    if (@($matchResult.unmatchedTargets).Count -gt 0) {
+        $notes += " Unmatched targets: " + ((@($matchResult.unmatchedTargets) | Select-Object -First 3) -join ", ") + "."
+    }
+
+    return [pscustomobject]@{
+        evaluated = $true
+        classification = $classification
+        planTargets = @($normalizedTargets)
+        changedFiles = @($normalizedFiles)
+        matchedTargets = @($matchResult.matchedTargets)
+        matchedFiles = @($matchResult.matchedActualFiles)
+        unmatchedTargets = @($matchResult.unmatchedTargets)
+        outOfScopeFiles = @($matchResult.outOfScopeFiles)
+        matchKindsSummary = $matchResult.matchKinds
+        notes = $notes
+        shouldWarn = ($classification -in @("broad", "drifted"))
+        shouldEscalateReview = ($classification -in @("broad", "drifted"))
+    }
+}
+
+function Format-ImplementationScopeWarningText {
+    param($ScopeCheck)
+    if (-not $ScopeCheck -or -not $ScopeCheck.evaluated -or -not $ScopeCheck.shouldWarn) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("IMPLEMENTATION SCOPE: $([string]$ScopeCheck.classification)")
+    if (@($ScopeCheck.outOfScopeFiles).Count -gt 0) {
+        [void]$lines.Add("- Out-of-scope files: " + ((@($ScopeCheck.outOfScopeFiles) | Select-Object -First 5) -join ", "))
+    }
+    if (@($ScopeCheck.unmatchedTargets).Count -gt 0) {
+        [void]$lines.Add("- Unmatched plan targets: " + ((@($ScopeCheck.unmatchedTargets) | Select-Object -First 5) -join ", "))
+    }
+    if ($ScopeCheck.notes) {
+        [void]$lines.Add("- Notes: $([string]$ScopeCheck.notes)")
+    }
+    return ($lines -join "`n")
+}
+
+function Update-ImplementationScopeCheck {
+    param(
+        [string]$ArtifactLabel = "",
+        [string]$Phase = "CHANGE_VALIDATE"
+    )
+
+    $script:implementationScopeCheck = Get-ImplementationScopeCheck -PlanTargets $planTargets -ChangedFiles $changedFiles
+    if ($ArtifactLabel) {
+        Save-JsonArtifact -Name "$ArtifactLabel-scope-check.json" -Object $script:implementationScopeCheck | Out-Null
+    }
+    if ($script:implementationScopeCheck.evaluated) {
+        Add-TimelineEvent -Phase $Phase -Message "Deterministic implementation scope check completed." -Category ("IMPLEMENT_SCOPE_" + ([string]$script:implementationScopeCheck.classification).ToUpperInvariant()) -Data @{
+            classification = [string]$script:implementationScopeCheck.classification
+            matchedFiles = @($script:implementationScopeCheck.matchedFiles)
+            outOfScopeFiles = @($script:implementationScopeCheck.outOfScopeFiles)
+            unmatchedTargets = @($script:implementationScopeCheck.unmatchedTargets)
+        }
+    }
 }
 
 function Test-LikelyRepoRelativePath {
@@ -663,6 +1304,261 @@ function Format-ScopedContext {
     return ($parts -join "`n`n").Trim()
 }
 
+function Get-TaskCodeReferenceHints {
+    param([string]$TaskText)
+
+    $references = [System.Collections.ArrayList]::new()
+    if (-not $TaskText) { return @($references) }
+
+    foreach ($match in [regex]::Matches($TaskText, '\b[A-Z][A-Za-z0-9_]+\.[A-Za-z0-9_]+\b')) {
+        [void]$references.Add($match.Value.Trim())
+    }
+    foreach ($match in [regex]::Matches($TaskText, '`([^`]+)`')) {
+        $value = $match.Groups[1].Value.Trim()
+        if ($value -match '[A-Z]' -or $value -match '\.') {
+            [void]$references.Add($value)
+        }
+    }
+
+    return @($references | Where-Object { $_ } | Select-Object -Unique -First 6)
+}
+
+function Test-PriorArtReuseText {
+    param([string]$Text)
+
+    if (-not $Text) { return $false }
+    $value = [string]$Text
+    $patterns = @(
+        '\b(re-?use|already implemented|same as|follow existing|use current|align with|mirror|wire into existing|hook into existing|extend(?: the)? existing)\b',
+        '\b(existing|current)\s+(implementation|functionality|path|flow|logic|behavior|service|handler|callback|converter|call chain)\b',
+        '\bnamed\s+(method|member|service|handler|converter|callback)\b',
+        '\bparallel path\b'
+    )
+
+    foreach ($pattern in $patterns) {
+        if ($value -match ("(?i)" + $pattern)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-PriorArtRequirement {
+    param(
+        [string]$TaskText,
+        [string]$TaskClass = "",
+        [string[]]$Targets = @(),
+        $RetryContext = $null
+    )
+
+    $reasons = [System.Collections.ArrayList]::new()
+    $triggerKind = ""
+    $taskTextValue = [string]$TaskText
+
+    if (Test-PriorArtReuseText -Text $taskTextValue) {
+        [void]$reasons.Add("Task text explicitly asks for reuse or an existing implementation path.")
+        $triggerKind = "reuse_text"
+    }
+
+    $namedReferences = @(Get-TaskCodeReferenceHints -TaskText $taskTextValue)
+    if ($namedReferences.Count -gt 0) {
+        [void]$reasons.Add("Task text names an existing code reference: $($namedReferences[0]).")
+        if (-not $triggerKind) { $triggerKind = "named_reference" }
+    }
+
+    $concreteTargets = @($Targets | Where-Object { $_ -and $_ -match '\.(razor|cs|js|ts|xaml)\b' } | Select-Object -Unique)
+    $targetExtensions = @($concreteTargets | ForEach-Object {
+        if ($_ -match '\.(razor|cs|js|ts|xaml)\b') { $Matches[1].ToLowerInvariant() }
+    } | Select-Object -Unique)
+    $hasCrossLayerTargets =
+        (($targetExtensions -contains 'cs') -and (@($targetExtensions | Where-Object { $_ -in @('razor', 'js', 'ts', 'xaml') }).Count -gt 0)) -or
+        (($targetExtensions -contains 'razor') -and (@($targetExtensions | Where-Object { $_ -in @('js', 'ts') }).Count -gt 0))
+    if ($hasCrossLayerTargets) {
+        [void]$reasons.Add("Targets span multiple code layers or file types.")
+        if (-not $triggerKind) { $triggerKind = "cross_layer" }
+    } elseif ($TaskClass -ne "DIRECT_EDIT" -and $concreteTargets.Count -gt 1) {
+        [void]$reasons.Add("Multiple concrete implementation targets suggest cross-file work.")
+        if (-not $triggerKind) { $triggerKind = "cross_file" }
+    }
+
+    $retryText = ""
+    if ($RetryContext -and $RetryContext.loaded) {
+        $retryParts = [System.Collections.ArrayList]::new()
+        if ($RetryContext.latestFailure.feedback) { [void]$retryParts.Add([string]$RetryContext.latestFailure.feedback) }
+        foreach ($lesson in @($RetryContext.retryLessons | Select-Object -First 3)) {
+            if ($lesson.feedbackExcerpt) { [void]$retryParts.Add([string]$lesson.feedbackExcerpt) }
+        }
+        $retryText = ($retryParts -join " ")
+    }
+    if (Test-PriorArtReuseText -Text $retryText) {
+        [void]$reasons.Add("Retry memory already points to an existing path that should be reused.")
+        if (-not $triggerKind) { $triggerKind = "retry_memory" }
+    }
+
+    return [ordered]@{
+        required = ($reasons.Count -gt 0)
+        reasons = @($reasons | Select-Object -Unique | Select-Object -First 4)
+        triggerKind = $triggerKind
+        namedReferences = @($namedReferences)
+    }
+}
+
+function Get-PriorArtRequirementPromptSection {
+    param(
+        $Requirement,
+        [string]$Mode = "INVESTIGATE"
+    )
+
+    if (-not $Requirement -or -not $Requirement.required) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("PRIOR-ART REQUIREMENT:")
+    [void]$lines.Add("- Required: YES")
+    if ($Requirement.triggerKind) {
+        [void]$lines.Add("- Trigger: $([string]$Requirement.triggerKind)")
+    }
+    foreach ($reason in @($Requirement.reasons)) {
+        [void]$lines.Add("- Reason: $reason")
+    }
+
+    switch ($Mode.ToUpperInvariant()) {
+        "DISCOVER" {
+            [void]$lines.Add("- Route this through investigation if you need to confirm an existing implementation path first.")
+        }
+        "FIX_PLAN" {
+            [void]$lines.Add("- The plan must cite the concrete reference files that will be reused or mirrored.")
+        }
+        "IMPLEMENT" {
+            [void]$lines.Add("- Do not invent a parallel implementation when the validated reference path already exists.")
+        }
+        default {
+            [void]$lines.Add("- Find the closest existing implementation, handler, service, converter, or call chain before proposing the change path.")
+            [void]$lines.Add("- If nothing matches, say so explicitly and provide the concrete file paths or file-qualified search hits you checked.")
+        }
+    }
+
+    return ($lines -join "`n").Trim()
+}
+
+function Get-InvestigationPriorArtOutputBlock {
+    param([bool]$Required = $false)
+
+    if (-not $Required) { return "" }
+
+    return @"
+PRIOR_ART_REQUIRED: YES | NO
+REFERENCE_FILES:
+- <concrete relative path OR file-qualified search hit>
+REFERENCE_FINDINGS:
+<short summary of the matching existing implementation or file-qualified search evidence>
+REUSE_STRATEGY:
+<how the existing path should be reused or extended>
+"@
+}
+
+function Get-PlanPriorArtOutputBlock {
+    param([bool]$Required = $false)
+
+    if (-not $Required) { return "" }
+
+    return @"
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- <concrete relative path>
+Reuse Path:
+One sentence describing which existing path is being reused or extended.
+
+"@
+}
+
+function Get-PriorArtReferenceFiles {
+    param(
+        [string[]]$Entries = @(),
+        [string]$Mode = "INVESTIGATE"
+    )
+
+    $validated = [System.Collections.ArrayList]::new()
+    foreach ($entry in @($Entries | Where-Object { $_ })) {
+        $value = ([string]$entry).Trim()
+        if (-not $value -or $value -match '^<') { continue }
+        if ($value -match '^(?i)\s*(rg|ripgrep|git grep|select-string)\b') { continue }
+
+        $match = [regex]::Match($value, '^(?<path>[\w\-.\\/]+\.(razor|cs|css|js|ts|xaml|csproj))(?:[:#].*)?$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $match.Success) { continue }
+
+        $path = Normalize-RepoRelativePath -Path $match.Groups['path'].Value
+        if ($path) {
+            [void]$validated.Add($path)
+        }
+    }
+
+    return @($validated | Select-Object -Unique)
+}
+
+function Get-InvestigationPriorArtValidation {
+    param(
+        $InvestigationVerdict,
+        [bool]$PriorArtRequired = $false
+    )
+
+    $issues = [System.Collections.ArrayList]::new()
+    $referenceFiles = @()
+    $referenceFindings = ""
+    $reuseStrategy = ""
+
+    if ($InvestigationVerdict) {
+        $referenceFiles = @(Get-PriorArtReferenceFiles -Entries $InvestigationVerdict.referenceFiles -Mode "INVESTIGATE")
+        $referenceFindings = [string]$InvestigationVerdict.referenceFindings
+        $reuseStrategy = [string]$InvestigationVerdict.reuseStrategy
+    }
+
+    if ($PriorArtRequired) {
+        if (-not $InvestigationVerdict -or -not $InvestigationVerdict.priorArtRequired) {
+            [void]$issues.Add("Investigation must declare PRIOR_ART_REQUIRED: YES.")
+        }
+        if (@($referenceFiles).Count -eq 0) {
+            [void]$issues.Add("Investigation must cite at least one concrete reference file or file-qualified search hit.")
+        }
+        if ([string]::IsNullOrWhiteSpace($referenceFindings)) {
+            [void]$issues.Add("Investigation must summarize the matching reference findings.")
+        }
+        if ([string]::IsNullOrWhiteSpace($reuseStrategy)) {
+            [void]$issues.Add("Investigation must describe the reuse strategy.")
+        }
+    }
+
+    return [ordered]@{
+        valid = ($issues.Count -eq 0)
+        issues = @($issues)
+        referenceFiles = @($referenceFiles)
+        referenceFindings = $referenceFindings
+        reuseStrategy = $reuseStrategy
+    }
+}
+
+function Get-ValidatedPriorArtPromptSection {
+    param($InvestigationVerdict)
+
+    if (-not $InvestigationVerdict -or -not $InvestigationVerdict.priorArtRequired) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("VALIDATED PRIOR-ART:")
+    [void]$lines.Add("- Required: YES")
+    if (@($InvestigationVerdict.referenceFiles).Count -gt 0) {
+        [void]$lines.Add("REFERENCE FILES:`n$(Format-BulletList -Items @($InvestigationVerdict.referenceFiles) -MaxItems 6 -EmptyText '- None')")
+    }
+    if ($InvestigationVerdict.referenceFindings) {
+        [void]$lines.Add("REFERENCE FINDINGS:`n$([string]$InvestigationVerdict.referenceFindings)")
+    }
+    if ($InvestigationVerdict.reuseStrategy) {
+        [void]$lines.Add("REUSE STRATEGY:`n$([string]$InvestigationVerdict.reuseStrategy)")
+    }
+
+    return Clip-Text -Text (($lines | Where-Object { $_ }) -join "`n") -MaxChars 900 -Marker "Prior-art trimmed"
+}
+
 function Get-NoChangeAssessment {
     param(
         [string]$Output,
@@ -1133,6 +2029,9 @@ function Write-DebugManifest {
         promptFile = $PromptFile
         solutionPath = $SolutionPath
         resultFile = $ResultFile
+        plannerContextFile = $PlannerContextFile
+        retryContextFile = $RetryContextFile
+        briefsFile = $BriefsFile
         repoRoot = $repoRoot
         artifactRunDir = $artifactRunDir
         debugDir = $debugRunDir
@@ -1147,6 +2046,11 @@ function Write-DebugManifest {
         routeDecision = $routeDecision
         testability = $testability
         reproductionConfirmed = [bool]$reproductionConfirmed
+        retryContextLoaded = [bool]$retryContextState.loaded
+        retryLessonCount = @($retryContextState.retryLessons).Count
+        retryLatestFailureCategory = [string]$retryContextState.latestFailure.finalCategory
+        workerBriefsLoaded = [bool]$workerBriefsState.loaded
+        workerBriefCount = @($workerBriefsState.briefs).Count
     }
     Save-DebugJson -Name "manifest.json" -Object $manifest | Out-Null
 }
@@ -1177,6 +2081,15 @@ function Write-SchedulerSnapshot {
         investigationTargets = @(Get-NormalizedPathSet -Paths $investigationVerdict.targets)
         planTargets = @(Get-NormalizedPathSet -Paths $planTargets)
         changedFiles = @(Get-NormalizedPathSet -Paths $changedFiles)
+        implementationScopeCheck = $implementationScopeCheck
+        directionCheck = $directionCheckVerdict
+        retryContextLoaded = [bool]$retryContextState.loaded
+        retryLessonCount = @($retryContextState.retryLessons).Count
+        retryLatestFailureCategory = [string]$retryContextState.latestFailure.finalCategory
+        workerBriefsLoaded = [bool]$workerBriefsState.loaded
+        workerBriefCount = @($workerBriefsState.briefs).Count
+        priorArtRequired = [bool]$priorArtRequirement.required
+        priorArtTriggerKind = [string]$priorArtRequirement.triggerKind
         finalStatus = $finalStatus
         finalCategory = $finalCategory
         artifacts = [ordered]@{
@@ -1595,8 +2508,10 @@ function Test-ConcreteTestTargets {
 function Get-ModelForPlan {
     param(
         [string]$TaskClass,
-        [string[]]$Targets
+        [string[]]$Targets,
+        [string]$PipelineProfile = "COMPLEX"
     )
+    if ($PipelineProfile -eq "SIMPLE") { return $CONST_MODEL_FAST }
     if ($TaskClass -eq "DIRECT_EDIT") { return $CONST_MODEL_FAST }
     if (Test-ConcreteTargets -Targets $Targets) { return $CONST_MODEL_FAST }
     return $CONST_MODEL_PLAN
@@ -1644,8 +2559,12 @@ function Get-ModelForImplement {
         [bool]$InvestigationRequired,
         [string[]]$Targets,
         [string]$TaskText = "",
-        [string]$PhaseContext = ""
+        [string]$PhaseContext = "",
+        [string]$PipelineProfile = "COMPLEX"
     )
+    if ($PipelineProfile -eq "SIMPLE" -and (Test-ConcreteTargets -Targets $Targets) -and $Targets.Count -le 3) {
+        return $CONST_MODEL_FAST
+    }
     if (Test-LowComplexityImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PhaseContext) {
         return $CONST_MODEL_FAST
     }
@@ -1659,17 +2578,18 @@ function Get-ModelForRepair {
         [bool]$InvestigationRequired,
         [string[]]$Targets,
         [string]$PreviousOutput = "",
-        [string]$TaskText = ""
+        [string]$TaskText = "",
+        [string]$PipelineProfile = "COMPLEX"
     )
     if ($PhaseName -in @("PLAN", "FIX_PLAN")) {
-        return Get-ModelForPlan -TaskClass $TaskClass -Targets $Targets
+        return Get-ModelForPlan -TaskClass $TaskClass -Targets $Targets -PipelineProfile $PipelineProfile
     }
     if ($PhaseName -eq "INVESTIGATE") {
         if (Test-HasActionableSignal -Text $PreviousOutput) { return $CONST_MODEL_FAST }
         return $CONST_MODEL_INVESTIGATE
     }
     if ($PhaseName -eq "IMPLEMENT") {
-        return Get-ModelForImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PreviousOutput
+        return Get-ModelForImplement -TaskClass $TaskClass -InvestigationRequired $InvestigationRequired -Targets $Targets -TaskText $TaskText -PhaseContext $PreviousOutput -PipelineProfile $PipelineProfile
     }
     if ($PhaseName -eq "REVIEW_MINOR") { return $CONST_MODEL_FAST }
     return $CONST_MODEL_IMPLEMENT
@@ -1823,9 +2743,13 @@ function Write-ResultJson {
         [bool]$reproductionAttempted = $false,
         [bool]$reproductionConfirmed = $false,
         $reproductionTests = $null,
-        [bool]$targetedVerificationPassed = $false
+        [bool]$targetedVerificationPassed = $false,
+        [string]$plannerEffortClass = "UNKNOWN",
+        [string]$pipelineProfile = "COMPLEX",
+        $directionCheck = $null
     )
     $metricsSummary = Get-PhaseMetricsSummary
+    $retryLessons = @(Get-RetryLessonsFromFeedbackHistory -History $feedbackHistory -RunAttemptNumber $currentRunAttemptNumber)
     if ($artifactRunDir) {
         Save-JsonArtifact -Name "phase-metrics.json" -Object @($phaseMetrics) | Out-Null
         Save-JsonArtifact -Name "metrics-summary.json" -Object $metricsSummary | Out-Null
@@ -1848,6 +2772,9 @@ function Write-ResultJson {
             runDir = $artifactRunDir
             timeline = if ($artifactRunDir) { Join-Path $artifactRunDir "timeline.json" } else { "" }
             debugDir = $debugRunDir
+            plannerContext = $PlannerContextFile
+            retryContext = $RetryContextFile
+            briefs = $BriefsFile
         }
         planVersion = $planVersion
         investigationRequired = $investigationRequired
@@ -1862,6 +2789,15 @@ function Write-ResultJson {
         targetedVerificationPassed = [bool]$targetedVerificationPassed
         noChangeReason = $noChangeReason
         taskClass = $taskClass
+        plannerEffortClass = $plannerEffortClass
+        pipelineProfile = $pipelineProfile
+        directionCheck = if ($directionCheck) { $directionCheck } else { [ordered]@{} }
+        retryLessons = @($retryLessons)
+        workerBriefsLoaded = [bool]$workerBriefsState.loaded
+        workerBriefCount = @($workerBriefsState.briefs).Count
+        priorArtRequired = [bool]$priorArtRequirement.required
+        priorArtTriggerKind = [string]$priorArtRequirement.triggerKind
+        priorArtReferenceFiles = @($investigationVerdict.referenceFiles)
         metrics = $metricsSummary
     } | ConvertTo-Json -Depth 8
 
@@ -2051,6 +2987,16 @@ function Invoke-ClaudeFixPlan {
     )
 }
 
+function Invoke-ClaudeDirectionCheck {
+    param([string]$Prompt, [string]$Model, [int]$Attempt)
+    Add-TimelineEvent -Phase "MODEL" -Message "DIRECTION_CHECK nutzt $Model" -Category "DIRECTION_CHECK_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "direction-check-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
+        "--model", $Model,
+        "--allowedTools", "Read,Glob,Grep",
+        "--max-turns", $CONST_MAX_TURNS_DIRECTION_CHECK.ToString()
+    )
+}
+
 function Invoke-ClaudeInvestigate {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
     Add-TimelineEvent -Phase "MODEL" -Message "INVESTIGATE nutzt $Model" -Category "INVESTIGATE_MODEL"
@@ -2138,10 +3084,16 @@ function Test-InvestigationRequired {
 }
 
 function Get-PlanValidation {
-    param([string]$Plan)
+    param(
+        [string]$Plan,
+        [bool]$PriorArtRequired = $false
+    )
+
     $issues = [System.Collections.ArrayList]::new()
     $targets = [System.Collections.ArrayList]::new()
     $investigationFlag = $false
+    $referenceFiles = [System.Collections.ArrayList]::new()
+    $reusePath = ""
 
     if ($Plan -match "Freigabe bereit|approval pending|plan ready for approval") {
         [void]$issues.Add("Plan contains UI or approval text.")
@@ -2171,11 +3123,318 @@ function Get-PlanValidation {
         $investigationFlag = $true
     }
 
+    if ($PriorArtRequired) {
+        if ($Plan -notmatch '(?im)^##\s*Reuse\s*/\s*Reference Pattern\s*$') {
+            [void]$issues.Add("Section ## Reuse / Reference Pattern is missing.")
+        } else {
+            $reuseSectionMatch = [regex]::Match($Plan, '(?ims)^\s*##\s*Reuse\s*/\s*Reference Pattern\s*$\s*(?<body>.*?)(?=^\s*##\s+|\z)')
+            $reuseSection = if ($reuseSectionMatch.Success) { [string]$reuseSectionMatch.Groups['body'].Value } else { "" }
+            if ($reuseSection -notmatch '(?im)^\s*Required\s*:\s*YES\s*$') {
+                [void]$issues.Add("Reuse/reference section must declare Required: YES.")
+            }
+
+            $referenceBlockMatch = [regex]::Match($reuseSection, '(?ims)^\s*Reference Files\s*:\s*(?<value>.*?)(?=^\s*Reuse Path\s*:|\z)')
+            $referenceBlock = if ($referenceBlockMatch.Success) { [string]$referenceBlockMatch.Groups['value'].Value } else { "" }
+            $parsedReferenceEntries = @()
+            foreach ($match in [regex]::Matches($referenceBlock, '(?im)^\s*-\s+(.+?)\s*$')) {
+                $parsedReferenceEntries += $match.Groups[1].Value.Trim()
+            }
+            foreach ($value in @(Get-PriorArtReferenceFiles -Entries $parsedReferenceEntries -Mode "FIX_PLAN")) {
+                [void]$referenceFiles.Add($value)
+            }
+            if ($referenceFiles.Count -eq 0) {
+                [void]$issues.Add("Reuse/reference section must name concrete reference file paths.")
+            }
+
+            $reusePathMatch = [regex]::Match($reuseSection, '(?ims)^\s*Reuse Path\s*:\s*(?<value>.*?)(?=^\s*[A-Za-z][A-Za-z /]+\s*:|\z)')
+            $reusePath = if ($reusePathMatch.Success) { [string]$reusePathMatch.Groups['value'].Value.Trim() } else { "" }
+            if (-not $reusePath) {
+                [void]$issues.Add("Reuse/reference section must describe the reuse path.")
+            }
+        }
+    }
+
     return [ordered]@{
         valid = ($issues.Count -eq 0)
         issues = @($issues)
         targets = @($targets | Select-Object -Unique)
         investigationRequired = $investigationFlag
+        referenceFiles = @($referenceFiles | Select-Object -Unique)
+        reusePath = $reusePath
+    }
+}
+
+function Get-DirectionCheckVerdict {
+    param([string]$Output)
+
+    $trimmed = if ($Output) { $Output.Trim() } else { "" }
+    $result = [ordered]@{
+        valid = $false
+        alignment = ""
+        recommendation = ""
+        driftDescription = ""
+        summary = $trimmed
+        warningOnly = $false
+        shouldContinue = $false
+        shouldTrim = $false
+        shouldReplan = $false
+    }
+    if (-not $trimmed) { return $result }
+
+    $alignment = ""
+    if ($trimmed -match '(?im)^ALIGNMENT\s*:\s*(ON_TRACK|MINOR_DRIFT|MAJOR_DRIFT)\s*$') {
+        $alignment = $Matches[1].ToUpperInvariant()
+    }
+    $recommendation = ""
+    if ($trimmed -match '(?im)^RECOMMENDATION\s*:\s*(CONTINUE|TRIM_PLAN|ABORT)\s*$') {
+        $recommendation = $Matches[1].ToUpperInvariant()
+    }
+    $driftDescription = ""
+    if ($trimmed -match '(?im)^DRIFT_DESCRIPTION\s*:\s*(.+)$') {
+        $driftDescription = $Matches[1].Trim()
+    }
+
+    if (-not $alignment -or -not $recommendation -or -not $driftDescription) {
+        return $result
+    }
+
+    $validCombination = (
+        ($alignment -eq "ON_TRACK" -and $recommendation -eq "CONTINUE") -or
+        ($alignment -eq "MINOR_DRIFT" -and $recommendation -eq "TRIM_PLAN") -or
+        ($alignment -eq "MAJOR_DRIFT" -and $recommendation -eq "ABORT")
+    )
+    if (-not $validCombination) {
+        return $result
+    }
+
+    $result.valid = $true
+    $result.alignment = $alignment
+    $result.recommendation = $recommendation
+    $result.driftDescription = $driftDescription
+    $result.shouldContinue = ($alignment -eq "ON_TRACK")
+    $result.shouldTrim = ($alignment -eq "MINOR_DRIFT")
+    $result.shouldReplan = ($alignment -eq "MAJOR_DRIFT")
+    return $result
+}
+
+function Get-DirectionCheckGuardrail {
+    param($Verdict)
+    if (-not $Verdict -or -not $Verdict.valid -or -not $Verdict.shouldTrim) { return "" }
+
+    return @"
+DIRECTION CHECK:
+- The validated plan contains minor scope drift.
+- Avoid this drift: $([string]$Verdict.driftDescription)
+- Stay inside the requested task and the validated targets unless a directly required adjacent change is unavoidable.
+"@.Trim()
+}
+
+function Get-AcceptedPlanTargets {
+    param(
+        [string[]]$ExistingTargets = @(),
+        [string[]]$CandidateTargets = @(),
+        [bool]$AcceptCandidate = $false
+    )
+    if ($AcceptCandidate) {
+        return @($CandidateTargets | Where-Object { $_ } | Select-Object -Unique)
+    }
+    return @($ExistingTargets | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-FixPlanFailureOutcome {
+    param([string]$LastPlanFailureReason)
+
+    if ([string]$LastPlanFailureReason -eq "DIRECTION_DRIFT") {
+        return [ordered]@{
+            finalCategory = "FIX_PLAN_DIRECTION_DRIFT"
+            finalSummary = "No aligned fix plan could be produced without major scope drift."
+            terminalFailureCode = "TERMINAL_FIX_PLAN_DIRECTION_DRIFT"
+        }
+    }
+
+    return [ordered]@{
+        finalCategory = "FIX_PLAN_INSUFFICIENT"
+        finalSummary = "No reliable fix plan could be produced after discovery, investigation, and optional reproduction."
+        terminalFailureCode = "TERMINAL_FIX_PLAN_INSUFFICIENT"
+    }
+}
+
+function Invoke-PlanDirectionCheck {
+    param(
+        [int]$PlanAttempt,
+        [string]$PlanOutput,
+        [string[]]$ExistingTargets = @(),
+        [string[]]$CandidateTargets = @(),
+        [string]$TaskPrompt,
+        [string]$TaskClass,
+        [string]$DiscoverConclusion,
+        [string]$RouteDecision,
+        [string]$Testability,
+        [string]$DiscoverBlock,
+        [string]$InvestigationBlock,
+        [string]$ReproductionBlock
+    )
+
+    $currentPhase = "DIRECTION_CHECK"
+    $attemptsByPhase.directionCheck = 0
+    $directionCheckVerdict = [ordered]@{
+        valid = $false
+        alignment = ""
+        recommendation = ""
+        driftDescription = ""
+        summary = ""
+        warningOnly = $false
+    }
+    $directionCheckGuardrail = ""
+    $directionPromptBase = @"
+Check whether the validated fix plan still matches the original task intent.
+This is a classification task only. Do not propose a new plan and do not suggest implementation details.
+Prefer the smallest reasonable change. Treat unrelated refactors, architectural cleanup, or speculative follow-up work as drift unless the task clearly requires them.
+
+TASK:
+$TaskPrompt
+
+TASK_CLASS: $TaskClass
+DISCOVER_CONCLUSION: $DiscoverConclusion
+ROUTE: $RouteDecision
+TESTABILITY: $Testability
+
+DISCOVER:
+$DiscoverBlock
+
+INVESTIGATION:
+$InvestigationBlock
+
+REPRODUCTION:
+$ReproductionBlock
+
+VALIDATED FIX PLAN:
+$PlanOutput
+
+VALIDATED TARGETS:
+$(if ($CandidateTargets.Count -gt 0) { ($CandidateTargets | ForEach-Object { "- $_" }) -join "`n" } else { "- No validated targets" })
+
+RESPOND EXACTLY:
+ALIGNMENT: ON_TRACK | MINOR_DRIFT | MAJOR_DRIFT
+DRIFT_DESCRIPTION: <short explanation>
+RECOMMENDATION: CONTINUE | TRIM_PLAN | ABORT
+"@
+    $directionPrompt = $directionPromptBase
+
+    for ($directionAttempt = 1; $directionAttempt -le 2; $directionAttempt++) {
+        $attemptsByPhase.directionCheck = $directionAttempt
+        $directionResult = Invoke-ClaudeDirectionCheck -Prompt $directionPrompt -Model $CONST_MODEL_FAST -Attempt (100 + ($PlanAttempt * 10) + $directionAttempt)
+        if (-not $directionResult.success) {
+            Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_CALL_FAILED" -Feedback $directionResult.output
+            Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check call failed." -Category "DIRECTION_CHECK_CALL_FAILED"
+            if ($directionAttempt -lt 2) {
+                $directionPrompt = @"
+YOUR PREVIOUS ATTEMPT FAILED OR DID NOT RETURN A PARSEABLE CLASSIFICATION.
+
+RETURN ONLY THIS FORMAT:
+ALIGNMENT: ON_TRACK | MINOR_DRIFT | MAJOR_DRIFT
+DRIFT_DESCRIPTION: <short explanation>
+RECOMMENDATION: CONTINUE | TRIM_PLAN | ABORT
+
+$directionPromptBase
+"@
+                continue
+            }
+
+            $directionCheckVerdict.warningOnly = $true
+            $directionCheckVerdict.summary = $directionResult.output
+            return [ordered]@{
+                accepted = $true
+                requiresReplan = $false
+                lastPlanFailureReason = ""
+                replanReason = ""
+                planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+                directionCheckVerdict = $directionCheckVerdict
+                directionCheckGuardrail = ""
+            }
+        }
+
+        $parsedDirectionCheck = Get-DirectionCheckVerdict -Output $directionResult.output
+        Save-JsonArtifact -Name "direction-check-v$PlanAttempt-$directionAttempt.json" -Object $parsedDirectionCheck | Out-Null
+        if ($parsedDirectionCheck.valid) {
+            $directionCheckVerdict = $parsedDirectionCheck
+            if ($parsedDirectionCheck.shouldTrim) {
+                Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_MINOR_DRIFT" -Feedback $parsedDirectionCheck.driftDescription
+                Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check detected minor scope drift." -Category "DIRECTION_CHECK_MINOR_DRIFT" -Data @{ alignment = $parsedDirectionCheck.alignment; recommendation = $parsedDirectionCheck.recommendation }
+                return [ordered]@{
+                    accepted = $true
+                    requiresReplan = $false
+                    lastPlanFailureReason = ""
+                    replanReason = ""
+                    planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+                    directionCheckVerdict = $directionCheckVerdict
+                    directionCheckGuardrail = (Get-DirectionCheckGuardrail -Verdict $parsedDirectionCheck)
+                }
+            }
+            if ($parsedDirectionCheck.shouldReplan) {
+                Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_MAJOR_DRIFT" -Feedback $parsedDirectionCheck.driftDescription
+                Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check rejected the plan due to major drift." -Category "DIRECTION_CHECK_MAJOR_DRIFT" -Data @{ alignment = $parsedDirectionCheck.alignment; recommendation = $parsedDirectionCheck.recommendation }
+                Write-SchedulerSnapshot
+                return [ordered]@{
+                    accepted = $false
+                    requiresReplan = $true
+                    lastPlanFailureReason = "DIRECTION_DRIFT"
+                    replanReason = "Direction check rejected the plan: $($parsedDirectionCheck.driftDescription)"
+                    planTargets = @($ExistingTargets | Where-Object { $_ } | Select-Object -Unique)
+                    directionCheckVerdict = $directionCheckVerdict
+                    directionCheckGuardrail = ""
+                }
+            }
+
+            Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check confirmed the plan is on track." -Category "DIRECTION_CHECK_ON_TRACK" -Data @{ alignment = $parsedDirectionCheck.alignment; recommendation = $parsedDirectionCheck.recommendation }
+            return [ordered]@{
+                accepted = $true
+                requiresReplan = $false
+                lastPlanFailureReason = ""
+                replanReason = ""
+                planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+                directionCheckVerdict = $directionCheckVerdict
+                directionCheckGuardrail = ""
+            }
+        }
+
+        Add-FeedbackEntry -Attempt $PlanAttempt -Source "DIRECTION_CHECK" -Category "DIRECTION_CHECK_INVALID" -Feedback $directionResult.output
+        Add-TimelineEvent -Phase "DIRECTION_CHECK" -Message "Direction check output could not be parsed." -Category "DIRECTION_CHECK_INVALID"
+        if ($directionAttempt -lt 2) {
+            $directionPrompt = @"
+YOUR PREVIOUS ATTEMPT DID NOT FOLLOW THE REQUIRED FORMAT.
+
+RETURN ONLY THIS FORMAT:
+ALIGNMENT: ON_TRACK | MINOR_DRIFT | MAJOR_DRIFT
+DRIFT_DESCRIPTION: <short explanation>
+RECOMMENDATION: CONTINUE | TRIM_PLAN | ABORT
+
+$directionPromptBase
+"@
+            continue
+        }
+
+        $directionCheckVerdict.warningOnly = $true
+        $directionCheckVerdict.summary = $directionResult.output
+        return [ordered]@{
+            accepted = $true
+            requiresReplan = $false
+            lastPlanFailureReason = ""
+            replanReason = ""
+            planTargets = @(Get-AcceptedPlanTargets -ExistingTargets $ExistingTargets -CandidateTargets $CandidateTargets -AcceptCandidate $true)
+            directionCheckVerdict = $directionCheckVerdict
+            directionCheckGuardrail = ""
+        }
+    }
+
+    return [ordered]@{
+        accepted = $false
+        requiresReplan = $true
+        lastPlanFailureReason = "DIRECTION_DRIFT"
+        replanReason = "Direction check could not determine whether the plan stayed on track."
+        planTargets = @($ExistingTargets | Where-Object { $_ } | Select-Object -Unique)
+        directionCheckVerdict = $directionCheckVerdict
+        directionCheckGuardrail = ""
     }
 }
 
@@ -2208,6 +3467,10 @@ function Get-InvestigationVerdict {
             "FIX_PLAN"
         }
         summary = $Output.Trim()
+        priorArtRequired = ($Output -match '(?im)^PRIOR_ART_REQUIRED\s*:\s*YES\s*$')
+        referenceFiles = @(Get-BulletSectionValues -Text $Output -Header "REFERENCE_FILES")
+        referenceFindings = Get-ScalarSectionText -Text $Output -Header "REFERENCE_FINDINGS"
+        reuseStrategy = Get-ScalarSectionText -Text $Output -Header "REUSE_STRATEGY"
     }
 }
 
@@ -2379,11 +3642,45 @@ try {
 
     $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
     $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch "^\s*$|^##" } | Select-Object -First 1).Trim()
+    $plannerContext = if ($PlannerContextFile) { Read-JsonFileBestEffort -Path $PlannerContextFile } else { $null }
+    $currentRunAttemptNumber = if ($plannerContext -and $null -ne $plannerContext.attemptNumber) { [int]$plannerContext.attemptNumber } else { 0 }
+    $currentLaunchSequence = if ($plannerContext -and $null -ne $plannerContext.launchSequence) { [int]$plannerContext.launchSequence } else { 0 }
+    $retryContextState = Get-RetryContextState -RetryContextFile $RetryContextFile -ExpectedTaskId $SchedulerTaskId
+    $workerBriefsState = Get-WorkerBriefsState -BriefsFile $BriefsFile -ExpectedTaskId $SchedulerTaskId
+    if ($plannerContext -and $plannerContext.plannerMetadata) {
+        $plannerEffortClass = Get-NormalizedPlannerEffortClass -EffortClass ([string]$plannerContext.plannerMetadata.effortClass)
+    } else {
+        $plannerEffortClass = "UNKNOWN"
+    }
+    $pipelineProfile = Get-PipelineProfile -PlannerEffortClass $plannerEffortClass
     $taskClass = Get-TaskClass -TaskText $taskPrompt
     $investigationRequired = Test-InvestigationRequired -TaskText $taskPrompt -TaskClass $taskClass
+    $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -RetryContext $retryContextState
     Save-Artifact -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Save-DebugText -Name "input-task.txt" -Content $taskPrompt | Out-Null
-    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired }
+    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired; plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile; plannerContextLoaded = [bool]$plannerContext; retryContextLoaded = [bool]$retryContextState.loaded; retryLessonCount = @($retryContextState.retryLessons).Count; workerBriefsLoaded = [bool]$workerBriefsState.loaded; workerBriefCount = @($workerBriefsState.briefs).Count; priorArtRequired = [bool]$priorArtRequirement.required }
+    if ($PlannerContextFile -and -not $plannerContext) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context file could not be read. Falling back to default pipeline profile." -Category "PLANNER_CONTEXT_INVALID" -Data @{ plannerContextFile = $PlannerContextFile }
+    } elseif ($plannerContext) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context loaded for worker startup." -Category "PLANNER_CONTEXT_LOADED" -Data @{ plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile }
+    }
+    if ($RetryContextFile -and -not $retryContextState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Retry context file could not be read. Continuing without retry memory." -Category "RETRY_CONTEXT_INVALID" -Data @{ retryContextFile = $RetryContextFile }
+    } elseif ($retryContextState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Retry context loaded for worker startup." -Category "RETRY_CONTEXT_LOADED" -Data @{ retryLessonCount = @($retryContextState.retryLessons).Count; latestFailureCategory = [string]$retryContextState.latestFailure.finalCategory }
+    }
+    if ($BriefsFile -and -not $workerBriefsState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Worker briefs file could not be read. Continuing without completed-task grounding." -Category "WORKER_BRIEFS_INVALID" -Data @{ briefsFile = $BriefsFile }
+    } elseif ($workerBriefsState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Worker briefs loaded for worker startup." -Category "WORKER_BRIEFS_LOADED" -Data @{ briefCount = @($workerBriefsState.briefs).Count }
+    }
+    $retryContextDiscoverBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "DISCOVER" -MaxChars $CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS
+    $retryContextInvestigateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "INVESTIGATE" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    $retryContextPlanBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "FIX_PLAN" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    $retryContextImplementBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "IMPLEMENT" -MaxChars $CONST_RETRY_CONTEXT_IMPLEMENT_MAX_CHARS
+    $retryContextRemediateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "REMEDIATE" -MaxChars $CONST_RETRY_CONTEXT_REMEDIATE_MAX_CHARS
+    $workerBriefsDiscoverBlock = Get-WorkerBriefsPromptSection -WorkerBriefs $workerBriefsState -Mode "DISCOVER" -MaxChars $CONST_WORKER_BRIEFS_DISCOVER_MAX_CHARS
+    $workerBriefsInvestigateBlock = Get-WorkerBriefsPromptSection -WorkerBriefs $workerBriefsState -Mode "INVESTIGATE" -MaxChars $CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS
     Write-SchedulerSnapshot
 
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
@@ -2423,7 +3720,7 @@ try {
     } -ArgumentList $worktreeSln
 
     Set-Location $worktreePath
-    $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets @()
+    $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets @() -PipelineProfile $pipelineProfile
     $effectiveModelImplement = $CONST_MODEL_IMPLEMENT
     $nugetRule = if ($AllowNuget) { "- New NuGet packages are allowed only when required" } else { "- No new NuGet packages" }
 
@@ -2454,6 +3751,7 @@ try {
         $discoverCritiqueBlock = if ($discoverCritique) { "`nCRITIQUE OF THE PREVIOUS DISCOVER RESULT:`n$discoverCritique`n" } else { "" }
         $discoverContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $planTargets
         $discoverTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $planTargets
+        $discoverPriorArtBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "DISCOVER"
         $discoverPrompt = @"
 Analyze the task read-only and decide the next pipeline step. Do NOT produce an implementation plan.
 Be concise. Maximum 10 lines. TARGET_HINTS may contain at most 3 entries. RATIONALE must be exactly 1-2 sentences.
@@ -2469,6 +3767,9 @@ $discoverTestProjectText
 
 CONTEXT:
 $discoverContext
+$workerBriefsDiscoverBlock
+$discoverPriorArtBlock
+$retryContextDiscoverBlock
 $discoverCritiqueBlock
 OUTPUT FORMAT:
 ROUTE: DIRECT_EDIT | BUGFIX_TESTABLE | BUGFIX_NONTESTABLE | UNCERTAIN
@@ -2480,7 +3781,7 @@ RATIONALE:
 <short evidence-based explanation>
 NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
 "@
-        $discoverModel = Get-ModelForPlan -TaskClass $taskClass -Targets @()
+        $discoverModel = Get-ModelForPlan -TaskClass $taskClass -Targets @() -PipelineProfile $pipelineProfile
         $discoverResult = Invoke-ClaudeDiscover -Prompt $discoverPrompt -Model $discoverModel -Attempt $discoverAttempt
         if (-not $discoverResult.success) {
             $discoverCritique = "Discover call failed: $($discoverResult.output)"
@@ -2497,6 +3798,7 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
         if ($discoverVerdict.targetHints.Count -gt 0) {
             $planTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
         }
+        $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($planTargets + $discoverVerdict.targetHints) -RetryContext $retryContextState
         Add-TimelineEvent -Phase "DISCOVER" -Message "Discover routing determined." -Category $routeDecision -Data @{ testability = $testability; nextPhase = $discoverVerdict.nextPhase }
         Write-SchedulerSnapshot
         break
@@ -2511,9 +3813,13 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
     $investigationOutput = ""
     $investigationVerdict = [ordered]@{ result = "CHANGE_NEEDED"; targets = @(); testability = "UNKNOWN"; nextPhase = "FIX_PLAN"; summary = "" }
     $investigationHashes = [System.Collections.ArrayList]::new()
-    $needsInvestigation = ($discoverVerdict.nextPhase -ne "FIX_PLAN")
+    $priorArtValidation = $null
+    $needsInvestigation = ($discoverVerdict.nextPhase -ne "FIX_PLAN") -or $priorArtRequirement.required
     $investigationRequired = $needsInvestigation
     if ($needsInvestigation) {
+        if ($priorArtRequirement.required -and $discoverVerdict.nextPhase -eq "FIX_PLAN") {
+            Add-TimelineEvent -Phase "DISCOVER" -Message "Prior-art requirement forces investigation before planning." -Category "PRIOR_ART_REQUIRED" -Data @{ triggerKind = [string]$priorArtRequirement.triggerKind; reasons = @($priorArtRequirement.reasons) }
+        }
         for ($investigateAttempt = 1; $investigateAttempt -le $CONST_INVESTIGATION_ATTEMPTS; $investigateAttempt++) {
             $currentPhase = "INVESTIGATE"
             $attemptsByPhase.investigate = $investigateAttempt
@@ -2523,6 +3829,8 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
             $investigationTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
             $investigationContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $investigationTargets
             $investigationTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $investigationTargets
+            $investigationPriorArtBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "INVESTIGATE"
+            $investigationPriorArtOutputBlock = Get-InvestigationPriorArtOutputBlock -Required ([bool]$priorArtRequirement.required)
             $investigatePrompt = @"
 Investigate the task read-only and decide whether a code change is required. Also assess whether an automated bug reproduction through tests is worthwhile.
 Be concise. TARGET_FILES may contain at most 5 entries. ROOT_CAUSE and NEXT_ACTION may each use at most 2 sentences.
@@ -2541,9 +3849,13 @@ $investigationTestProjectText
 
 CONTEXT:
 $investigationContext
+$workerBriefsInvestigateBlock
+$investigationPriorArtBlock
 
 PRIOR FEEDBACK:
 $historyText
+
+$retryContextInvestigateBlock
 
 OUTPUT FORMAT:
 RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
@@ -2555,6 +3867,7 @@ TESTABILITY_REASSESSMENT: YES | NO | UNKNOWN
 RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <concrete next change or rationale>
+$investigationPriorArtOutputBlock
 "@
             $investigateModel = Get-ModelForInvestigate -TaskClass $taskClass -Targets @($planTargets + $discoverVerdict.targetHints) -Attempt $investigateAttempt -PreviousOutput $investigationOutput
             $investigateResult = Invoke-ClaudeInvestigate -Prompt $investigatePrompt -Model $investigateModel -Attempt $investigateAttempt
@@ -2566,11 +3879,19 @@ NEXT_ACTION:
             $investigationOutput = $investigateResult.output.Trim()
             Save-Artifact -Name "investigation-v$investigateAttempt.txt" -Content $investigationOutput | Out-Null
             $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
+            $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($investigationTargets + $investigationVerdict.targets) -RetryContext $retryContextState
             $investigationConclusion = $investigationVerdict.result
             [void]$investigationHashes.Add((Get-TextHash -Text $investigationOutput))
             if ($investigationVerdict.testability -ne "UNKNOWN") {
                 $testability = $investigationVerdict.testability
             }
+            if ($priorArtRequirement.required) {
+                $investigationVerdict.priorArtRequired = $true
+            }
+            $priorArtValidation = Get-InvestigationPriorArtValidation -InvestigationVerdict $investigationVerdict -PriorArtRequired ([bool]$priorArtRequirement.required)
+            $investigationVerdict.referenceFiles = @($priorArtValidation.referenceFiles)
+            $investigationVerdict.referenceFindings = [string]$priorArtValidation.referenceFindings
+            $investigationVerdict.reuseStrategy = [string]$priorArtValidation.reuseStrategy
             Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation result: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets; nextPhase = $investigationVerdict.nextPhase }
             Write-SchedulerSnapshot
 
@@ -2580,6 +3901,14 @@ NEXT_ACTION:
                 $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
                 Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation was salvaged from actionable evidence." -Category "CHANGE_NEEDED_SALVAGED" -Data @{ targets = $investigationVerdict.targets }
                 Write-SchedulerSnapshot
+            }
+
+            if ($priorArtRequirement.required -and $investigationVerdict.result -eq "CHANGE_NEEDED" -and -not $priorArtValidation.valid) {
+                $priorArtIssuesText = ($priorArtValidation.issues -join " ")
+                Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "PRIOR_ART_INSUFFICIENT" -Feedback $priorArtIssuesText
+                Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation lacked the required prior-art grounding." -Category "PRIOR_ART_INSUFFICIENT" -Data @{ triggerKind = [string]$priorArtRequirement.triggerKind; issues = @($priorArtValidation.issues) }
+                $investigationVerdict.result = "INCONCLUSIVE"
+                $investigationConclusion = "PRIOR_ART_INSUFFICIENT"
             }
 
             if ($investigationVerdict.result -eq "NO_CHANGE") {
@@ -2626,10 +3955,16 @@ REASON:
 
             Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_INCONCLUSIVE" -Feedback $investigationOutput
             for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
-                $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons @("Your output was not specific enough for the pipeline to continue automatically.") -PreviousOutput $investigationOutput
+                $repairReasons = @("Your output was not specific enough for the pipeline to continue automatically.")
+                if ($priorArtRequirement.required -and $priorArtValidation -and @($priorArtValidation.issues).Count -gt 0) {
+                    $repairReasons += @($priorArtValidation.issues)
+                }
+                $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons $repairReasons -PreviousOutput $investigationOutput
                 $repairTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
                 $repairContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $repairTargets
                 $repairTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $repairTargets
+                $repairPriorArtBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "INVESTIGATE"
+                $repairPriorArtOutputBlock = Get-InvestigationPriorArtOutputBlock -Required ([bool]$priorArtRequirement.required)
                 $repairPrompt = @"
 $repairBlock
 
@@ -2646,6 +3981,8 @@ $repairTestProjectText
 
 CONTEXT:
 $repairContext
+$workerBriefsInvestigateBlock
+$repairPriorArtBlock
 
 OUTPUT FORMAT:
 RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
@@ -2657,6 +3994,7 @@ TESTABILITY_REASSESSMENT: YES | NO | UNKNOWN
 RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <concrete next change or rationale>
+$repairPriorArtOutputBlock
 "@
                 $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $needsInvestigation -Targets $repairTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
                 $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $repairModel -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
@@ -2664,13 +4002,26 @@ NEXT_ACTION:
                 $investigationOutput = $repairResult.output.Trim()
                 Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $investigationOutput | Out-Null
                 $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
+                $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($repairTargets + $investigationVerdict.targets) -RetryContext $retryContextState
                 if ($investigationVerdict.testability -ne "UNKNOWN") {
                     $testability = $investigationVerdict.testability
                 }
+                if ($priorArtRequirement.required) {
+                    $investigationVerdict.priorArtRequired = $true
+                }
+                $priorArtValidation = Get-InvestigationPriorArtValidation -InvestigationVerdict $investigationVerdict -PriorArtRequired ([bool]$priorArtRequirement.required)
+                $investigationVerdict.referenceFiles = @($priorArtValidation.referenceFiles)
+                $investigationVerdict.referenceFindings = [string]$priorArtValidation.referenceFindings
+                $investigationVerdict.reuseStrategy = [string]$priorArtValidation.reuseStrategy
                 if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                     $investigationVerdict.result = "CHANGE_NEEDED"
                     $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
                     $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
+                }
+                if ($priorArtRequirement.required -and $investigationVerdict.result -eq "CHANGE_NEEDED" -and -not $priorArtValidation.valid) {
+                    Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "PRIOR_ART_INSUFFICIENT" -Feedback ($priorArtValidation.issues -join " ")
+                    $investigationVerdict.result = "INCONCLUSIVE"
+                    $investigationConclusion = "PRIOR_ART_INSUFFICIENT"
                 }
                 if ($investigationVerdict.result -eq "CHANGE_NEEDED") {
                     if ($investigationVerdict.targets.Count -gt 0) {
@@ -2847,6 +4198,8 @@ RATIONALE:
         }
     }
 
+    $planReadyForImplementation = $false
+    $lastPlanFailureReason = ""
     for ($planAttempt = 1; $planAttempt -le $CONST_PLAN_ATTEMPTS; $planAttempt++) {
         $currentPhase = "FIX_PLAN"
         $attemptsByPhase.plan = $planAttempt
@@ -2877,6 +4230,9 @@ $($reproductionTests.rationale)
         } else {
             "No verified test reproduction is available."
         }
+        $validatedPriorArtBlock = Get-ValidatedPriorArtPromptSection -InvestigationVerdict $investigationVerdict
+        $priorArtPlanRequirementBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "FIX_PLAN"
+        $priorArtPlanOutputBlock = Get-PlanPriorArtOutputBlock -Required ([bool]$investigationVerdict.priorArtRequired)
         $planPrompt = @"
 Create the concrete fix plan now based on the evidence already collected. Do not plan speculatively anymore.
 Stay compact: at most 5 files or search areas and at most 4 ordered steps.
@@ -2904,6 +4260,9 @@ $reproductionBlock
 
 CONTEXT:
 $planContext
+$validatedPriorArtBlock
+$priorArtPlanRequirementBlock
+$retryContextPlanBlock
 $replanBlock
 RULES:
 - No TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) comments
@@ -2932,13 +4291,14 @@ For each relevant file or search area:
 ## Constraints
 - <concrete risk>
 
+$priorArtPlanOutputBlock
 ## Reproduction Tests
 - <only when present: project/file/test/expectation>
 
 investigationRequired: true|false
 Write ONLY the plan.
 "@
-        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets
+        $effectiveModelPlan = Get-ModelForPlan -TaskClass $taskClass -Targets $planTargets -PipelineProfile $pipelineProfile
         $planResult = Invoke-ClaudeFixPlan -Prompt $planPrompt -Model $effectiveModelPlan -Attempt $planAttempt
         if (-not $planResult.success) {
             $replanReason = "Fix-plan call failed: $($planResult.output)"
@@ -2949,16 +4309,30 @@ Write ONLY the plan.
 
         $planOutput = $planResult.output.Trim()
         Save-Artifact -Name "fix-plan-v$planAttempt.txt" -Content $planOutput | Out-Null
-        $planValidation = Get-PlanValidation -Plan $planOutput
+        $planValidation = Get-PlanValidation -Plan $planOutput -PriorArtRequired ([bool]$investigationVerdict.priorArtRequired)
         Save-JsonArtifact -Name "fix-plan-v$planAttempt-validation.json" -Object $planValidation | Out-Null
         if ($planValidation.valid) {
-            $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
-            Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan akzeptiert." -Category "FIX_PLAN_VALID" -Data @{ targets = $planTargets }
-            Write-SchedulerSnapshot
-            break
+            $candidatePlanTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
+            Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan akzeptiert." -Category "FIX_PLAN_VALID" -Data @{ targets = $candidatePlanTargets }
+            $directionCheckResult = Invoke-PlanDirectionCheck -PlanAttempt $planAttempt -PlanOutput $planOutput -ExistingTargets $planTargets -CandidateTargets $candidatePlanTargets -TaskPrompt $taskPrompt -TaskClass $taskClass -DiscoverConclusion $discoverConclusion -RouteDecision $routeDecision -Testability $testability -DiscoverBlock $discoverBlock -InvestigationBlock $investigationBlock -ReproductionBlock $reproductionBlock
+            $directionCheckVerdict = $directionCheckResult.directionCheckVerdict
+            $directionCheckGuardrail = [string]$directionCheckResult.directionCheckGuardrail
+            $lastPlanFailureReason = [string]$directionCheckResult.lastPlanFailureReason
+            if ($directionCheckResult.requiresReplan) {
+                $replanReason = [string]$directionCheckResult.replanReason
+                continue
+            }
+
+            if ($directionCheckResult.accepted) {
+                $planTargets = @($directionCheckResult.planTargets)
+                $planReadyForImplementation = $true
+                Write-SchedulerSnapshot
+                break
+            }
         }
 
         $replanReason = ($planValidation.issues -join "`n")
+        $lastPlanFailureReason = "PLAN_INVALID"
         Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN" -Category "FIX_PLAN_INSUFFICIENT" -Feedback $replanReason
         Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan wurde verworfen." -Category "FIX_PLAN_INSUFFICIENT" -Data @{ issues = $planValidation.issues }
         for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
@@ -2996,6 +4370,9 @@ $reproductionBlock
 
 CONTEXT:
 $planContext
+$validatedPriorArtBlock
+$priorArtPlanRequirementBlock
+$retryContextPlanBlock
 
 OUTPUT FORMAT:
 ## Goal
@@ -3014,49 +4391,69 @@ For each relevant file or search area:
 ## Constraints
 - <concrete risk>
 
+$priorArtPlanOutputBlock
 ## Reproduction Tests
 - <only when present: project/file/test/expectation>
 
 investigationRequired: true|false
 Write ONLY the plan.
 "@
-            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planContextTargets -PreviousOutput $planOutput -TaskText $taskPrompt
+            $repairModel = Get-ModelForRepair -PhaseName "FIX_PLAN" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planContextTargets -PreviousOutput $planOutput -TaskText $taskPrompt -PipelineProfile $pipelineProfile
             $repairResult = Invoke-ClaudeRepair -PhaseName "FIX_PLAN" -Prompt $repairPrompt -Model $repairModel -Attempt (190 + $planAttempt * 10 + $repairAttempt)
             if (-not $repairResult.success) { continue }
 
             $planOutput = $repairResult.output.Trim()
             Save-Artifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt.txt" -Content $planOutput | Out-Null
-            $planValidation = Get-PlanValidation -Plan $planOutput
+            $planValidation = Get-PlanValidation -Plan $planOutput -PriorArtRequired ([bool]$investigationVerdict.priorArtRequired)
             Save-JsonArtifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt-validation.json" -Object $planValidation | Out-Null
             if ($planValidation.valid) {
-                $planTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
-                Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan nach Repair akzeptiert." -Category "FIX_PLAN_REPAIRED" -Data @{ targets = $planTargets }
-                Write-SchedulerSnapshot
-                break
+                $candidateRepairedTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
+                Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan nach Repair akzeptiert." -Category "FIX_PLAN_REPAIRED" -Data @{ targets = $candidateRepairedTargets }
+                $directionCheckResult = Invoke-PlanDirectionCheck -PlanAttempt $planAttempt -PlanOutput $planOutput -ExistingTargets $planTargets -CandidateTargets $candidateRepairedTargets -TaskPrompt $taskPrompt -TaskClass $taskClass -DiscoverConclusion $discoverConclusion -RouteDecision $routeDecision -Testability $testability -DiscoverBlock $discoverBlock -InvestigationBlock $investigationBlock -ReproductionBlock $reproductionBlock
+                $directionCheckVerdict = $directionCheckResult.directionCheckVerdict
+                $directionCheckGuardrail = [string]$directionCheckResult.directionCheckGuardrail
+                $lastPlanFailureReason = [string]$directionCheckResult.lastPlanFailureReason
+                if ($directionCheckResult.requiresReplan) {
+                    $replanReason = [string]$directionCheckResult.replanReason
+                    continue
+                }
+
+                if ($directionCheckResult.accepted) {
+                    $planTargets = @($directionCheckResult.planTargets)
+                    $planReadyForImplementation = $true
+                    Write-SchedulerSnapshot
+                    break
+                }
             }
 
             $replanReason = ($planValidation.issues -join "`n")
+            $lastPlanFailureReason = "PLAN_INVALID"
             Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN_REPAIR" -Category "FIX_PLAN_REPAIR_INSUFFICIENT" -Feedback $replanReason
         }
         if ($planValidation.valid) {
             break
         }
         $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
-        if ($salvagedPlanTargets.Count -gt 0) {
+        if ($salvagedPlanTargets.Count -gt 0 -and -not $investigationVerdict.priorArtRequired) {
             $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
             $planValidation.valid = $true
+            $lastPlanFailureReason = ""
             Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan via Salvage fortgesetzt." -Category "FIX_PLAN_SALVAGED" -Data @{ targets = $planTargets }
+            $planReadyForImplementation = $true
             Write-SchedulerSnapshot
             break
         }
+        $lastPlanFailureReason = "PLAN_INVALID"
     }
 
-    if ((-not $planValidation -or -not $planValidation.valid) -and $planTargets.Count -eq 0) {
+    if (-not $planReadyForImplementation) {
         $finalStatus = "FAILED"
-        $finalCategory = "FIX_PLAN_INSUFFICIENT"
-        $finalSummary = "No reliable fix plan could be produced after discovery, investigation, and optional reproduction."
+        $fixPlanFailureOutcome = Get-FixPlanFailureOutcome -LastPlanFailureReason $lastPlanFailureReason
+        $finalCategory = [string]$fixPlanFailureOutcome.finalCategory
+        $finalSummary = [string]$fixPlanFailureOutcome.finalSummary
         $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory -MaxChars 1200 }
-        throw [System.Exception]::new("TERMINAL_FIX_PLAN_INSUFFICIENT")
+        $terminalFailureCode = [string]$fixPlanFailureOutcome.terminalFailureCode
+        throw [System.Exception]::new($terminalFailureCode)
     }
 
     $implementationHistoryHashes = [System.Collections.ArrayList]::new()
@@ -3101,6 +4498,8 @@ $($reproductionTests.bugBehavior)
         }
         $implementPlan = Clip-Text -Text $planOutput -MaxChars 2600 -Marker "Fix plan trimmed"
         $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $reproductionConfirmed
+        $validatedImplementPriorArtBlock = Get-ValidatedPriorArtPromptSection -InvestigationVerdict $investigationVerdict
+        $implementPriorArtRequirementBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "IMPLEMENT"
         $implPrompt = @"
 Implement the change. Do not guess.
 Work in a focused way. Open only files relevant to the target. At the end, output only the required short result format.
@@ -3119,6 +4518,9 @@ $implementPlan
 INVESTIGATION:
 $investigationBlock
 
+$validatedImplementPriorArtBlock
+$implementPriorArtRequirementBlock
+
 REPRODUCTION:
 $reproductionBlock
 
@@ -3127,6 +4529,10 @@ $targetText
 
 PRIOR FEEDBACK:
 $historyText
+
+$retryContextImplementBlock
+
+$(if ($directionCheckGuardrail) { "$directionCheckGuardrail`n" } else { "" })
 
 RULES:
 - Modify at least one repository file OR return a machine-readable NO_CHANGE result.
@@ -3142,7 +4548,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_ALREADY_SATISFIED | NO_CHANGE_TARGET_NOT_FOUN
 SUMMARY:
 <Short rationale>
 "@
-        $effectiveModelImplement = Get-ModelForImplement -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -TaskText $taskPrompt -PhaseContext $investigationBlock
+        $effectiveModelImplement = Get-ModelForImplement -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -TaskText $taskPrompt -PhaseContext $investigationBlock -PipelineProfile $pipelineProfile
         $implResult = Invoke-ClaudeImplement -Prompt $implPrompt -Model $effectiveModelImplement -Attempt $implementAttempt
         $lastImplementOutput = $implResult.output
         if (-not $implResult.success) {
@@ -3158,6 +4564,7 @@ SUMMARY:
         }
         $changedFiles = @($changedFilesResult.files)
         Save-Artifact -Name "implement-v$implementAttempt-changed-files.txt" -Content (($changedFiles -join "`n").Trim()) | Out-Null
+        Update-ImplementationScopeCheck -ArtifactLabel "implement-v$implementAttempt" -Phase "CHANGE_VALIDATE"
 
         if ($changedFiles.Count -eq 0) {
             if ($implOutcome.category -eq "NO_CHANGE_ALREADY_SATISFIED") {
@@ -3233,7 +4640,7 @@ IMPORTANT:
 - Do not return another vague explanation.
 - Modify at least one repository file or return a clearly justified RESULT.
 "@
-                $repairModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $implResult.output -TaskText $taskPrompt
+                $repairModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $implResult.output -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                 $repairImplResult = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $repairPrompt -Model $repairModel -Attempt (400 + $implementAttempt) -CanWrite
                 if ($repairImplResult.success) {
                     $implResult = $repairImplResult
@@ -3304,7 +4711,7 @@ RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Short rationale>
 "@
-                    $verifyFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verifyReproResult.output -TaskText $taskPrompt
+                    $verifyFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verifyReproResult.output -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                     $verifyFixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $verifyFixModel -Attempt (90 + $implementAttempt * 10 + $reviewCycle)
                     if (-not $verifyFixResult.success) {
                         Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "VERIFY_REPRO_TOOL_FAILURE" -Feedback $verifyFixResult.output
@@ -3374,17 +4781,20 @@ Fix only the following deterministic blockers in the current worktree.
 BLOCKERS:
 $blockerText
 
+$retryContextRemediateBlock
+
 OUTPUT FORMAT AT THE END:
 RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Short rationale>
 "@
-                $preflightFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $blockerText -TaskText $taskPrompt
+                $preflightFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $blockerText -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                 $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $preflightFixModel -Attempt (100 + $implementAttempt * 10 + $reviewCycle)
                 if (-not $fixResult.success) {
                     Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
                 }
                 $changedFiles = Get-ChangedFiles
+                Update-ImplementationScopeCheck -ArtifactLabel "preflight-remediate-$cycleLabel" -Phase "PREFLIGHT"
                 continue
             }
 
@@ -3396,6 +4806,17 @@ SUMMARY:
                     $entry
                 }) -join "`n"
             } else { "" }
+            $scopeWarningText = Format-ImplementationScopeWarningText -ScopeCheck $implementationScopeCheck
+            if ($scopeWarningText) {
+                $warningText = if ($warningText) { "$warningText`n$scopeWarningText" } else { $scopeWarningText }
+            }
+            if ($directionCheckVerdict -and $directionCheckVerdict.valid -and $directionCheckVerdict.shouldTrim) {
+                $directionWarningText = "DIRECTION CHECK: minor drift detected. " + [string]$directionCheckVerdict.driftDescription
+                $warningText = if ($warningText) { "$warningText`n$directionWarningText" } else { $directionWarningText }
+            } elseif ($directionCheckVerdict -and $directionCheckVerdict.warningOnly -and $directionCheckVerdict.summary) {
+                $directionWarningText = "DIRECTION CHECK WARNING: output was not reliable, so the pipeline continued."
+                $warningText = if ($warningText) { "$warningText`n$directionWarningText" } else { $directionWarningText }
+            }
 
             $currentPhase = "REVIEW"
             $diffForReview = (Invoke-NativeCommand git @("diff", "HEAD")).output
@@ -3403,6 +4824,12 @@ SUMMARY:
             Save-Artifact -Name "git-diff-$cycleLabel.patch" -Content $diffForReview | Out-Null
             $historyForReview = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 3 -MaxChars $CONST_REVIEW_HISTORY_MAX_CHARS
             $lowRiskReview = Test-LowRiskReview -ChangedFiles $changedFiles -DiffText $diffForReview -WarningText $warningText -ReproductionConfirmed $reproductionConfirmed -TaskClass $taskClass
+            if ($implementationScopeCheck -and $implementationScopeCheck.shouldEscalateReview) {
+                if ($lowRiskReview) {
+                    Add-TimelineEvent -Phase "REVIEW" -Message "Compact review escalated to FULL because implementation scope drift needs stricter review." -Category "REVIEW_SCOPE_ESCALATED" -Data @{ reason = "implementation_scope"; classification = [string]$implementationScopeCheck.classification }
+                }
+                $lowRiskReview = $false
+            }
             $reviewPayloadInfo = Get-CompactReviewPayload -PlanText $planOutput -InvestigationText $investigationBlock -ReproductionText $reproductionBlock -DiffText $diffForReview -DiffStat $diffStatForReview -ChangedFiles $changedFiles -WarningText $warningText -HistoryText $historyForReview -LowRiskReview $lowRiskReview
             if ($lowRiskReview -and $reviewPayloadInfo.omittedProductionHunks) {
                 $lowRiskReview = $false
@@ -3489,11 +4916,14 @@ FIX ONLY THESE MINOR ISSUES IN THE CURRENT WORKTREE.
 
 FEEDBACK:
 $($verdict.feedback)
+
+$retryContextRemediateBlock
 "@
-                    $minorRescueModel = Get-ModelForRepair -PhaseName "REVIEW_MINOR" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt
+                    $minorRescueModel = Get-ModelForRepair -PhaseName "REVIEW_MINOR" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                     $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $minorRescueModel -Attempt (500 + $implementAttempt * 10 + $reviewCycle) -CanWrite
                     if ($minorRescue.success) {
                         $changedFiles = Get-ChangedFiles
+                        Update-ImplementationScopeCheck -ArtifactLabel "review-minor-rescue-$cycleLabel" -Phase "REVIEW"
                         $reviewCycle = 0
                         continue
                     }
@@ -3513,12 +4943,14 @@ Fix only the following review feedback in the current worktree.
 FEEDBACK:
 $($verdict.feedback)
 
+$retryContextRemediateBlock
+
 OUTPUT FORMAT AT THE END:
 RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
 <Short rationale>
 "@
-            $reviewFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt
+            $reviewFixModel = Get-ModelForRepair -PhaseName "IMPLEMENT" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt -PipelineProfile $pipelineProfile
             $fixResult = Invoke-ClaudeImplement -Prompt $fixPrompt -Model $reviewFixModel -Attempt (200 + $implementAttempt * 10 + $reviewCycle)
             if (-not $fixResult.success) {
                 Add-FeedbackEntry -Attempt $reviewCycle -Source "REMEDIATE" -Category "NO_CHANGE_TOOL_FAILURE" -Feedback $fixResult.output
@@ -3528,6 +4960,7 @@ SUMMARY:
                 Fail-ChangedFilesDetection -ChangedFilesResult $changedFilesResult -Phase "CHANGE_VALIDATE"
             }
             $changedFiles = @($changedFilesResult.files)
+            Update-ImplementationScopeCheck -ArtifactLabel "review-remediate-$cycleLabel" -Phase "REVIEW"
         }
 
         if ($accepted) { break }
@@ -3556,12 +4989,12 @@ SUMMARY:
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     } else {
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force") | Out-Null
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     }
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
@@ -3577,7 +5010,7 @@ SUMMARY:
             Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
             $worktreePath = $null
         }
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     } else {
         Write-Host "[ERROR] $errMsg"
         $finalStatus = "ERROR"
@@ -3585,7 +5018,7 @@ SUMMARY:
         $finalSummary = "Unexpected error in phase $currentPhase."
         $finalFeedback = $errMsg
         Write-TimelineArtifact
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
     }
 } finally {
     Set-Location $originalDir -ErrorAction SilentlyContinue

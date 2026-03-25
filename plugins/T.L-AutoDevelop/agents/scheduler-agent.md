@@ -21,6 +21,7 @@ You receive:
 - the subset of newly added tasks
 - currently running tasks
 - pending merge tasks
+- completed task discovery briefs from recent finished work
 - recent planner feedback from prior tasks in this repo
 - relevant markdown documentation near the affected code
 
@@ -60,12 +61,19 @@ Consider:
 - tasks already running
 - tasks already pending merge
 - retry-scheduled tasks that will run again from current HEAD
+- completed task discovery briefs as advisory ground truth for recently touched files, shared modules, and retry/conflict patterns
 - user-declared hard constraints:
   - `declaredDependencies`
   - `declaredPriority`
   - `serialOnly`
 - recent planner hit/miss feedback from earlier tasks
 - whether a task looks broad even if concrete files are unknown
+
+When using `completedTaskBriefs`:
+- treat accepted or merged work as higher-confidence than failed or no-change outcomes
+- prefer actual changed files in briefs over older predicted files when reasoning about overlap
+- use failed-task briefs only as hints about risky/shared areas, not as hard dependency evidence
+- if a brief is vague or clearly unrelated, ignore it instead of serializing work unnecessarily
 
 # Output Contract
 

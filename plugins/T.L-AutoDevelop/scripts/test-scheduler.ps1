@@ -3,6 +3,7 @@ param()
 $ErrorActionPreference = "Stop"
 
 $script:SchedulerPath = Join-Path $PSScriptRoot "scheduler.ps1"
+$script:PreflightPath = Join-Path $PSScriptRoot "preflight.ps1"
 
 function Assert-True {
     param(
@@ -40,6 +41,164 @@ function New-TestRepo {
         tasksDir = Join-Path $root ".claude-develop-logs\scheduler\tasks"
         resultsDir = Join-Path $root ".claude-develop-logs\scheduler\results"
     }
+}
+
+function Write-TestFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.Encoding]::UTF8)
+}
+
+function New-TestBlazorRepo {
+    $root = Join-Path $env:TEMP ("autodev-preflight-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    Push-Location $root
+    try {
+        git init | Out-Null
+        git config user.email "autodev-tests@example.com"
+        git config user.name "AutoDevelop Tests"
+
+        $projectPath = Join-Path $root "TestApp.csproj"
+        Write-TestFile -Path $projectPath -Content @"
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.2" />
+  </ItemGroup>
+</Project>
+"@
+        Write-TestFile -Path (Join-Path $root "_Imports.razor") -Content @"
+@namespace TestApp
+@using Microsoft.AspNetCore.Components
+"@
+        Write-TestFile -Path (Join-Path $root "ChildWidget.razor") -Content @"
+<div>Child widget</div>
+"@
+        Write-TestFile -Path (Join-Path $root "ParentHost.razor") -Content @"
+<ChildWidget />
+"@
+        Write-TestFile -Path (Join-Path $root "InteropBridge.cs") -Content @"
+using System.Threading.Tasks;
+
+namespace TestApp;
+
+public static class InteropBridge
+{
+    public static Task BootAsync() => Task.CompletedTask;
+}
+"@
+        Write-TestFile -Path (Join-Path $root "wwwroot\app.js") -Content @"
+export function boot() {
+  return true;
+}
+"@
+        Write-TestFile -Path (Join-Path $root ".gitignore") -Content ".claude-develop-logs/"
+        $restore = & dotnet restore $projectPath 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to restore the Blazor test project: $restore"
+        }
+        git add . | Out-Null
+        git commit -m "init" | Out-Null
+    } finally {
+        Pop-Location
+    }
+
+    return [pscustomobject]@{
+        root = $root
+        solution = Join-Path $root "TestApp.csproj"
+        childComponent = Join-Path $root "ChildWidget.razor"
+        parentComponent = Join-Path $root "ParentHost.razor"
+        interopBridge = Join-Path $root "InteropBridge.cs"
+        scriptFile = Join-Path $root "wwwroot\app.js"
+    }
+}
+
+function Invoke-PreflightJson {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath
+    )
+    Push-Location $RepoRoot
+    try {
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:PreflightPath -SolutionPath $SolutionPath -SkipRun
+        return ($raw | Out-String | ConvertFrom-Json)
+    } finally {
+        Pop-Location
+    }
+}
+
+function Invoke-UsageGateJson {
+    param(
+        [string]$ClaudeHome,
+        [string]$Mode = "probe",
+        [int]$ThresholdPercent = 90,
+        [string]$MockUsageJson = "",
+        [string]$MockErrorKind = "",
+        [string]$MockUsageSequencePath = "",
+        [int]$PollSeconds = 1,
+        [int]$FastPollSeconds = 1,
+        [int]$FastWindowSeconds = 1
+    )
+
+    $gatePath = Join-Path $PSScriptRoot "claude-usage-gate.ps1"
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $gatePath,
+        "-Mode", $Mode,
+        "-ClaudeHome", $ClaudeHome,
+        "-ThresholdPercent", $ThresholdPercent.ToString(),
+        "-PollSeconds", $PollSeconds.ToString(),
+        "-FastPollSeconds", $FastPollSeconds.ToString(),
+        "-FastWindowSeconds", $FastWindowSeconds.ToString()
+    )
+
+    if ($MockUsageJson) {
+        $arguments += @("-MockUsageJson", $MockUsageJson)
+    }
+    if ($MockErrorKind) {
+        $arguments += @("-MockErrorKind", $MockErrorKind)
+    }
+    if ($MockUsageSequencePath) {
+        $arguments += @("-MockUsageSequencePath", $MockUsageSequencePath)
+    }
+
+    $raw = & powershell.exe @arguments
+    $rawText = ($raw | Out-String).Trim()
+    if (-not $rawText) {
+        throw "Usage gate returned no JSON output. Args: $($arguments -join ' ')"
+    }
+
+    try {
+        return ($rawText | ConvertFrom-Json)
+    } catch {
+        throw "Usage gate returned invalid JSON: $($_.Exception.Message)`nRAW:`n$rawText"
+    }
+}
+
+function Write-UsageGateMockFile {
+    param(
+        [string]$Root,
+        [object]$Payload,
+        [string]$FileName = "usage-mock.json"
+    )
+
+    $path = Join-Path $Root $FileName
+    [System.IO.File]::WriteAllText($path, ($Payload | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+    return $path
 }
 
 function New-TestLatestRun {
@@ -351,13 +510,77 @@ exit 0
         "compile-fail" {
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-Write-Output "error CS1002: ; expected"
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
+Write-Output 'error CS1002: ; expected'
 exit 1
+'@
+        }
+        "restore-fail" {
+@'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'error NU1101: Unable to find package ModelContextProtocol.'
+    exit 1
+}
+Write-Output 'Build succeeded.'
+exit 0
+'@
+        }
+        "lock-then-restore-fail" {
+@'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+$sequenceFile = $env:AUTODEV_TEST_DOTNET_SEQUENCE_FILE
+$sequence = 0
+if ($sequenceFile -and (Test-Path -LiteralPath $sequenceFile)) {
+    $sequence = [int](Get-Content -LiteralPath $sequenceFile -Raw)
+}
+$sequence++
+if ($sequenceFile) {
+    Set-Content -LiteralPath $sequenceFile -Value $sequence -Encoding UTF8
+}
+if ($sequence -eq 1) {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
+if ($sequence -eq 2) {
+    Write-Output "error MSB3027: Could not copy `"bin\Debug\net8.0\Hmd.Docs.dll`" because it is being used by another process."
+    Write-Output "error MSB3021: Access to the path `"bin\Debug\net8.0\Hmd.Docs.dll`" is denied."
+    exit 1
+}
+if ($sequence -eq 3) {
+    Write-Output 'error NU1101: Unable to find package ModelContextProtocol.'
+    exit 1
+}
+Write-Output 'Build succeeded.'
+exit 0
 '@
         }
         "success" {
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
 Write-Output 'Build succeeded.'
 exit 0
 '@
@@ -365,6 +588,14 @@ exit 0
         default {
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
 $countFile = $env:AUTODEV_TEST_DOTNET_COUNT_FILE
 $count = 0
 if ($countFile -and (Test-Path -LiteralPath $countFile)) {
@@ -912,12 +1143,274 @@ function Test-PreflightMissingSolutionIsEnvironmentFailure {
     $repo = New-TestRepo
     try {
         $missingSolution = Join-Path $repo.root "Missing.slnx"
-        $scriptPath = 'D:\Repos\T.L-Marketplace\plugins\T.L-AutoDevelop\scripts\preflight.ps1'
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -SolutionPath $missingSolution
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:PreflightPath -SolutionPath $missingSolution
         $result = ($raw | Out-String | ConvertFrom-Json)
         Assert-True ($result.passed -eq $false) "Missing solution path should fail preflight."
         Assert-True ($result.environmentFailure -eq $true) "Missing solution path should be marked as environment failure."
         Assert-True ([string]$result.environmentCategory -eq "SOLUTION_PATH_MISSING") "Preflight should classify missing solution paths explicitly."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightWarnsOnUnboundEventCallback {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "EventCallback wiring warnings should not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 1) "Preflight should warn when a newly introduced EventCallback is unbound in existing parent usages."
+        Assert-True ([string]$wiringWarnings[0].message -match "OnSave") "EventCallback warning should identify the missing callback binding."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightAcceptsExplicitEventCallbackBinding {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+        Write-TestFile -Path $repo.parentComponent -Content @"
+<ChildWidget OnSave="HandleSave" />
+
+@code {
+    private Task HandleSave()
+    {
+        return Task.CompletedTask;
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Bound EventCallback changes should pass preflight."
+        Assert-True ($wiringWarnings.Count -eq 0) "Explicit parent callback bindings should satisfy the wiring check."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightAcceptsBindSyntaxForChangedCallback {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="NotifyChange">Update</button>
+
+@code {
+    [Parameter] public string Value { get; set; } = "";
+    [Parameter] public EventCallback<string> ValueChanged { get; set; }
+
+    private async Task NotifyChange()
+    {
+        await ValueChanged.InvokeAsync("next");
+    }
+}
+"@
+        Write-TestFile -Path $repo.parentComponent -Content @"
+<ChildWidget @bind-Value="CurrentValue" />
+
+@code {
+    private string CurrentValue { get; set; } = "seed";
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Component @bind wiring should pass preflight."
+        Assert-True ($wiringWarnings.Count -eq 0) "@bind-X should satisfy the XChanged EventCallback requirement."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightSkipsPageComponentsForEventCallbackWiring {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+@page "/child"
+
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Page components should not fail preflight for parent-binding checks."
+        Assert-True ($wiringWarnings.Count -eq 0) "Components with @page should be excluded from EventCallback parent-binding warnings."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightBlocksMissingStaticJsInvokableTarget {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot() {
+  return DotNet.invokeMethodAsync('TestApp', 'MissingMethod');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringBlockers = @($result.blockers | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $false) "Missing local static JS interop targets should fail preflight."
+        Assert-True ($wiringBlockers.Count -eq 1) "Preflight should block unresolved local static JS interop calls."
+        Assert-True ([string]$wiringBlockers[0].message -match "MissingMethod") "Static JS interop blocker should name the missing identifier."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightAcceptsAliasedStaticJsInvokableTarget {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.interopBridge -Content @"
+using System.Threading.Tasks;
+using Microsoft.JSInterop;
+
+namespace TestApp;
+
+public static class InteropBridge
+{
+    [JSInvokable("OpenDialog")]
+    public static Task OpenDialogAsync()
+    {
+        return Task.CompletedTask;
+    }
+}
+"@
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot() {
+  return DotNet.invokeMethodAsync('TestApp', 'OpenDialog');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringBlockers = @($result.blockers | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $true) "Matching aliased static JS interop targets should pass preflight."
+        Assert-True ($wiringBlockers.Count -eq 0) "[JSInvokable(\"Alias\")] should satisfy the static JS interop wiring check."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightWarnsOnMissingInstanceJsInvokableTarget {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot(dotNetHelper) {
+  return dotNetHelper.invokeMethodAsync('MissingMethod');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $true) "Missing instance JS interop targets should warn but not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 1) "Preflight should warn on unresolved instance JS interop calls."
+        Assert-True ([string]$wiringWarnings[0].message -match "MissingMethod") "Instance JS interop warning should name the missing identifier."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightIgnoresNonDotNetInvokeMethodPatterns {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot(widget) {
+  return widget.invokeMethodAsync('MissingMethod');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $true) "Non-.NET JS invokeMethodAsync patterns should not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 0) "Arbitrary JS objects should not be treated as DotNetObjectReference helpers."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightDoesNotCrossWireDuplicateComponentNames {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+        Write-TestFile -Path (Join-Path $repo.root "Admin\_Imports.razor") -Content @"
+@namespace TestApp.Admin
+@using Microsoft.AspNetCore.Components
+"@
+        Write-TestFile -Path (Join-Path $repo.root "Admin\ChildWidget.razor") -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+        Write-TestFile -Path (Join-Path $repo.root "Admin\AdminHost.razor") -Content @"
+<TestApp.Admin.ChildWidget OnSave="HandleSave" />
+
+@code {
+    private Task HandleSave()
+    {
+        return Task.CompletedTask;
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Duplicate component names in other namespaces should not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 1) "Bindings for a different namespace-qualified component should not suppress the root component warning."
+        $warningPath = [string]$wiringWarnings[0].file
+        Assert-True (($warningPath -match '(^|[\\/])ChildWidget\.razor$') -and ($warningPath -notmatch '(^|[\\/])Admin[\\/]')) "The warning should remain attached to the changed root component."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -1338,12 +1831,15 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     $promptFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md'
     $solutionPath = 'D:\Repos\My Repo\My Solution.slnx'
     $resultFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json'
+    $plannerContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json'
+    $retryContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json'
+    $briefsFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\worker briefs.json'
     $taskName = 'develop-task-a1'
     $taskId = 'task-spaces'
     $commandType = 'develop'
 
     $encoded = Invoke-SchedulerHelperFunctions -FunctionNames @("ConvertTo-PowerShellSingleQuotedLiteral", "Get-EncodedWorkerLaunchCommand") -ScriptBlock {
-        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
+        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -PlannerContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json' -RetryContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json' -BriefsFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\worker briefs.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
     }
 
     $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(([string]$encoded).Trim()))
@@ -1353,7 +1849,1261 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     Assert-True ($decoded -match [regex]::Escape($promptFile)) "Encoded worker launch must preserve the full spaced prompt path."
     Assert-True ($decoded -match [regex]::Escape($solutionPath)) "Encoded worker launch must preserve the full spaced solution path."
     Assert-True ($decoded -match [regex]::Escape($resultFile)) "Encoded worker launch must preserve the full spaced result path."
+    Assert-True ($decoded -match [regex]::Escape($plannerContextFile)) "Encoded worker launch must preserve the planner context file path."
+    Assert-True ($decoded -match [regex]::Escape($retryContextFile)) "Encoded worker launch must preserve the retry context file path."
+    Assert-True ($decoded -match [regex]::Escape($briefsFile)) "Encoded worker launch must preserve the worker briefs file path."
     Assert-True ($decoded -notmatch '-File\s+C:\\Users\\Example') "Encoded worker launch must not rely on a raw -File argument that can split at spaces."
+}
+
+function Test-WritePlannerContextFilePersistsEffortClass {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @("Ensure-Directory", "Ensure-ParentDirectory", "Write-PlannerContextFile") -ScriptBlock {
+        $path = Join-Path $env:TEMP ("planner-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        $task = [pscustomobject]@{
+            taskId = "task-planner"
+            waveNumber = 3
+            attemptsUsed = 2
+            workerLaunchSequence = 5
+            plannerMetadata = [pscustomobject]@{
+                effortClass = "LOW"
+                likelyFiles = @("src\App.cs")
+            }
+        }
+        Write-PlannerContextFile -Path $path -Task $task
+        try {
+            [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    Assert-True ([string]$parsed.taskId -eq "task-planner") "Planner context file should persist the task id."
+    Assert-True ([int]$parsed.waveNumber -eq 3) "Planner context file should persist the wave number."
+    Assert-True ([int]$parsed.attemptNumber -eq 2) "Planner context file should persist the current worker attempt number."
+    Assert-True ([int]$parsed.launchSequence -eq 5) "Planner context file should persist the current launch sequence."
+    Assert-True ([string]$parsed.plannerMetadata.effortClass -eq "LOW") "Planner context file should persist plannerMetadata.effortClass."
+}
+
+function Test-PlannerContextLowEffortSelectsSimpleProfile {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Get-NormalizedPlannerEffortClass",
+        "Get-PipelineProfile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("planner-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"plannerMetadata":{"effortClass":"LOW"}}', [System.Text.Encoding]::UTF8)
+        try {
+            $context = Read-JsonFileBestEffort -Path $path
+            [pscustomobject]@{
+                plannerEffortClass = Get-NormalizedPlannerEffortClass -EffortClass ([string]$context.plannerMetadata.effortClass)
+                pipelineProfile = Get-PipelineProfile -PlannerEffortClass ([string]$context.plannerMetadata.effortClass)
+            } | ConvertTo-Json -Depth 6
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.plannerEffortClass -eq "LOW") "LOW planner effort should remain normalized as LOW."
+    Assert-True ([string]$parsed.pipelineProfile -eq "SIMPLE") "LOW planner effort should select the SIMPLE pipeline profile."
+}
+
+function Test-MissingPlannerContextFallsBackToComplexProfile {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Get-NormalizedPlannerEffortClass",
+        "Get-PipelineProfile"
+    ) -ScriptBlock {
+        $missingPath = Join-Path $env:TEMP ("missing-planner-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        $context = Read-JsonFileBestEffort -Path $missingPath
+        $plannerEffortClass = if ($context -and $context.plannerMetadata) {
+            Get-NormalizedPlannerEffortClass -EffortClass ([string]$context.plannerMetadata.effortClass)
+        } else {
+            "UNKNOWN"
+        }
+        [pscustomobject]@{
+            contextLoaded = [bool]$context
+            plannerEffortClass = $plannerEffortClass
+            pipelineProfile = Get-PipelineProfile -PlannerEffortClass $plannerEffortClass
+        } | ConvertTo-Json -Depth 6
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.contextLoaded -eq $false) "Missing planner context should not load successfully."
+    Assert-True ([string]$parsed.plannerEffortClass -eq "UNKNOWN") "Missing planner context should fall back to UNKNOWN effort."
+    Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
+}
+
+function Test-WriteWorkerBriefsFilePersistsAcceptedCompletedBriefs {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs",
+        "Get-WorkerBriefEntries",
+        "Get-WorkerBriefsPayload",
+        "Ensure-Directory",
+        "Ensure-ParentDirectory",
+        "Write-WorkerBriefsFile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("worker-briefs-" + [guid]::NewGuid().ToString("N") + ".json")
+        $state = [pscustomobject]@{
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "accepted-brief"
+                    submissionOrder = 2
+                    waveNumber = 2
+                    state = "merged"
+                    taskText = "Reuse the existing converter in OrderService."
+                    plannerMetadata = [pscustomobject]@{ likelyAreas = @("Services") }
+                    plannerFeedback = [pscustomobject]@{ classification = "broad" }
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Reused the existing converter path in OrderService."
+                        feedback = ""
+                        investigationConclusion = "OrderService already shared the same conversion path."
+                        actualFiles = @("src\\Services\\OrderService.cs", "tests\\OrderServiceTests.cs")
+                        completedAt = "2026-03-25T10:00:00.0000000Z"
+                    }
+                }
+                [pscustomobject]@{
+                    taskId = "failed-brief"
+                    submissionOrder = 1
+                    waveNumber = 1
+                    state = "completed_failed_terminal"
+                    taskText = "Broken attempt"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "FAILED"
+                        finalCategory = "PREFLIGHT_FAILED"
+                        summary = "Failed"
+                        feedback = "Do not use this brief."
+                        investigationConclusion = ""
+                        actualFiles = @("src\\Ignore.cs")
+                        completedAt = "2026-03-25T09:00:00.0000000Z"
+                    }
+                }
+            )
+        }
+        $task = [pscustomobject]@{ taskId = "task-current" }
+        $payload = Write-WorkerBriefsFile -Path $path -State $state -Task $task
+        try {
+            [pscustomobject]@{
+                hasPayload = [bool]$payload
+                raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            } | ConvertTo-Json -Depth 16
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    $json = $parsed.raw | ConvertFrom-Json
+    Assert-True ($parsed.hasPayload -eq $true) "Worker briefs should be written when accepted completed-task briefs exist."
+    Assert-True ([string]$json.taskId -eq "task-current") "Worker briefs payload should preserve the current task id."
+    Assert-True ([int]$json.briefCount -eq 1) "Worker briefs should exclude failed-terminal completed tasks."
+    Assert-True ([string]$json.briefs[0].taskId -eq "accepted-brief") "Worker briefs should preserve accepted completed-task brief content."
+}
+
+function Test-WorkerBriefsRoundTripLoadsWorkerState {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-WorkerBriefsState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("worker-briefs-state-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-briefs","briefCount":1,"briefs":[{"taskId":"accepted-brief","waveNumber":2,"status":"ACCEPTED","finalCategory":"ACCEPTED","taskSummary":"Reuse the existing converter in OrderService.","whatWasBuilt":"Reused the existing converter path in OrderService.","discoveries":["OrderService already shared the same conversion path."],"filesChanged":[".\\src\\Services\\OrderService.cs"],"conflictHints":"Touches Services."}]}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-WorkerBriefsState -BriefsFile $path -ExpectedTaskId "task-briefs") | ConvertTo-Json -Depth 16
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $true) "Valid worker briefs files should load successfully."
+    Assert-True ([int]$parsed.briefCount -eq 1) "Worker briefs should preserve the brief count."
+    Assert-True ([string]$parsed.briefs[0].taskId -eq "accepted-brief") "Worker briefs should preserve brief task ids."
+    Assert-True (@($parsed.briefs[0].filesChanged) -contains "src\Services\OrderService.cs") "Worker briefs should normalize changed-file paths."
+}
+
+function Test-FormatWorkerBriefsPromptBlockIncludesDiscoveries {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Clip-Text",
+        "Format-WorkerBriefsPromptBlock"
+    ) -ScriptBlock {
+        $briefs = [pscustomobject]@{
+            loaded = $true
+            briefs = @(
+                [pscustomobject]@{
+                    taskId = "accepted-brief"
+                    taskSummary = "Reuse the existing converter in OrderService."
+                    whatWasBuilt = "Reused the existing converter path in OrderService."
+                    discoveries = @("OrderService already shared the same conversion path.")
+                    filesChanged = @("src\Services\OrderService.cs")
+                    conflictHints = "Touches Services."
+                }
+            )
+        }
+
+        Format-WorkerBriefsPromptBlock -WorkerBriefs $briefs -Mode "INVESTIGATE" -MaxChars 1200
+    }
+
+    Assert-True ([string]$output -match "accepted-brief") "Worker briefs prompt blocks should include the source task id."
+    Assert-True ([string]$output -match "Discoveries") "Worker briefs prompt blocks should include compact discovery summaries."
+    Assert-True ([string]$output -match "BRIEF RULE") "Worker briefs prompt blocks should include the mode-specific grounding rule."
+}
+
+function Test-InvestigationPriorArtOutputBlockUsesFileQualifiedSearchHitContract {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-InvestigationPriorArtOutputBlock"
+    ) -ScriptBlock {
+        Get-InvestigationPriorArtOutputBlock -Required $true
+    }
+
+    Assert-True ([string]$output -match "file-qualified search hit") "Investigation prior-art contract should allow file-qualified search hits."
+    Assert-True ([string]$output -match "REUSE_STRATEGY") "Investigation prior-art contract should require a reuse strategy."
+}
+
+function Test-PlanPriorArtOutputBlockRequiresConcreteRelativePath {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-PlanPriorArtOutputBlock"
+    ) -ScriptBlock {
+        Get-PlanPriorArtOutputBlock -Required $true
+    }
+
+    Assert-True ([string]$output -match "<concrete relative path>") "Plan prior-art contract should require concrete relative paths."
+    Assert-True ([string]$output -notmatch "search pattern") "Plan prior-art contract should not advertise search patterns."
+}
+
+function Test-PriorArtRequirementDetectsReuseAndCrossLayerSignals {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Test-PriorArtReuseText",
+        "Get-TaskCodeReferenceHints",
+        "Get-PriorArtRequirement"
+    ) -ScriptBlock {
+        (Get-PriorArtRequirement -TaskText "Reuse the existing OrderConverter and align SaveDialogInterop.InvokeSave with the current handler." -TaskClass "INVESTIGATIVE" -Targets @("Components\\Editor.razor", "Services\\OrderService.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.required -eq $true) "Reuse-heavy cross-layer tasks should require prior-art grounding."
+    Assert-True ([string]$parsed.triggerKind -eq "reuse_text") "Explicit reuse wording should trigger the prior-art requirement."
+    Assert-True (@($parsed.namedReferences).Count -gt 0) "Named code references should be captured for prior-art grounding."
+}
+
+function Test-PriorArtRequirementSkipsSimpleDirectEdit {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Test-PriorArtReuseText",
+        "Get-TaskCodeReferenceHints",
+        "Get-PriorArtRequirement"
+    ) -ScriptBlock {
+        (Get-PriorArtRequirement -TaskText "Rename the banner title text on the settings page." -TaskClass "DIRECT_EDIT" -Targets @("Pages\\Settings.razor")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.required -eq $false) "Simple direct-edit tasks should not be forced through prior-art grounding."
+}
+
+function Test-PriorArtRequirementIgnoresGenericRoleNouns {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Test-PriorArtReuseText",
+        "Get-TaskCodeReferenceHints",
+        "Get-PriorArtRequirement"
+    ) -ScriptBlock {
+        [pscustomobject]@{
+            callback = Get-PriorArtRequirement -TaskText "Add a callback so the new wizard can notify completion." -TaskClass "DIRECT_EDIT" -Targets @("Pages\\Wizard.razor")
+            converter = Get-PriorArtRequirement -TaskText "Create a new converter for CSV import." -TaskClass "DIRECT_EDIT" -Targets @("Converters\\CsvImportConverter.cs")
+        } | ConvertTo-Json -Depth 10
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.callback.required -eq $false) "Generic callback wording must not force prior-art grounding."
+    Assert-True ($parsed.converter.required -eq $false) "Generic converter wording must not force prior-art grounding."
+}
+
+function Test-InvestigationVerdictParsesPriorArtFields {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-SectionLines",
+        "Get-BulletSectionValues",
+        "Get-ScalarSectionText",
+        "Get-InvestigationVerdict"
+    ) -ScriptBlock {
+        @"
+RESULT: CHANGE_NEEDED
+TARGET_FILES:
+- Components\Editor.razor
+ROOT_CAUSE:
+The current callback path already exists in the editor service.
+TESTABILITY_REASSESSMENT: YES
+RECOMMENDED_NEXT_PHASE: FIX_PLAN
+NEXT_ACTION:
+Reuse the existing callback path.
+PRIOR_ART_REQUIRED: YES
+REFERENCE_FILES:
+- Services\EditorService.cs
+- Components\Shared\EditorCallbacks.razor
+REFERENCE_FINDINGS:
+EditorService already owns the callback registration.
+REUSE_STRATEGY:
+Bind the existing callback path instead of introducing a parallel implementation.
+"@ | ForEach-Object {
+            (Get-InvestigationVerdict -Output $_) | ConvertTo-Json -Depth 12
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.priorArtRequired -eq $true) "Investigation verdicts should preserve the prior-art-required marker."
+    Assert-True (@($parsed.referenceFiles).Count -eq 2) "Investigation verdicts should parse concrete reference files."
+    Assert-True ([string]$parsed.reuseStrategy -match "existing callback path") "Investigation verdicts should preserve the reuse strategy."
+}
+
+function Test-InvestigationPriorArtValidationRequiresAllFields {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-InvestigationPriorArtValidation"
+    ) -ScriptBlock {
+        $verdict = [pscustomobject]@{
+            priorArtRequired = $true
+            referenceFiles = @("Services\\EditorService.cs")
+            referenceFindings = ""
+            reuseStrategy = ""
+        }
+
+        (Get-InvestigationPriorArtValidation -PriorArtRequired $true -InvestigationVerdict $verdict) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Prior-art validation should reject investigations that omit findings and reuse strategy."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reference findings") "Prior-art validation should report missing findings."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reuse strategy") "Prior-art validation should report missing reuse strategy."
+}
+
+function Test-InvestigationPriorArtValidationAcceptsFileQualifiedSearchHits {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-InvestigationPriorArtValidation"
+    ) -ScriptBlock {
+        $verdict = [pscustomobject]@{
+            priorArtRequired = $true
+            referenceFiles = @("Services\\EditorService.cs:42 callback registration")
+            referenceFindings = "EditorService already owns the callback registration."
+            reuseStrategy = "Reuse the existing callback registration path."
+        }
+
+        (Get-InvestigationPriorArtValidation -PriorArtRequired $true -InvestigationVerdict $verdict) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "File-qualified search hits should satisfy investigation prior-art validation."
+    Assert-True (@($parsed.referenceFiles) -contains "Services\\EditorService.cs") "File-qualified search hits should normalize to concrete reference files."
+}
+
+function Test-InvestigationPriorArtValidationRejectsRawSearchCommands {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-InvestigationPriorArtValidation"
+    ) -ScriptBlock {
+        $verdict = [pscustomobject]@{
+            priorArtRequired = $true
+            referenceFiles = @('rg "OrderConverter" src')
+            referenceFindings = "Search output looked relevant."
+            reuseStrategy = "Reuse the converter path."
+        }
+
+        (Get-InvestigationPriorArtValidation -PriorArtRequired $true -InvestigationVerdict $verdict) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Raw search commands should not satisfy investigation prior-art validation."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reference file") "Investigation prior-art validation should explain that concrete reference evidence is missing."
+}
+
+function Test-PlanValidationRequiresReuseSectionWhenPriorArtRequired {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Fix the editor callback.
+
+## Files
+- Path: Components\Editor.razor
+- Action: MODIFY
+- Changes: Wire the callback.
+
+## Order
+1. Update the component.
+2. Run the build.
+
+## Constraints
+- Keep the change focused.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Plans missing the reuse/reference section should fail validation when prior-art is required."
+    Assert-True ((@($parsed.issues) -join "`n") -match "Reuse / Reference Pattern") "Validation should explain that the reuse/reference section is missing."
+}
+
+function Test-PlanValidationAcceptsConcreteReuseSectionWhenPriorArtRequired {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Fix the editor callback.
+
+## Files
+- Path: Components\Editor.razor
+- Action: MODIFY
+- Changes: Wire the callback.
+
+## Order
+1. Update the component.
+2. Run the build.
+
+## Constraints
+- Keep the change focused.
+
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- Services\EditorService.cs
+- Components\Shared\EditorCallbacks.razor
+Reuse Path:
+Reuse the existing callback registration path from EditorService.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "Concrete reuse/reference sections should satisfy prior-art plan validation."
+    Assert-True (@($parsed.referenceFiles).Count -eq 2) "Plan validation should preserve parsed reference files separately from implementation targets."
+}
+
+function Test-PlanValidationRejectsSearchPatternReferenceWhenPriorArtRequired {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Fix the editor callback.
+
+## Files
+- Path: Components\Editor.razor
+- Action: MODIFY
+- Changes: Wire the callback.
+
+## Order
+1. Update the component.
+2. Run the build.
+
+## Constraints
+- Keep the change focused.
+
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- rg ""EditorService"" Services
+Reuse Path:
+Reuse the existing callback registration path from EditorService.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Search-pattern-only references should not satisfy plan prior-art validation."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reference file paths") "Plan validation should explain that concrete reference file paths are required."
+}
+
+function Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Clip-Text",
+        "Get-RetryLessonComparisonText",
+        "Get-RetryLessonsFromFeedbackHistory"
+    ) -ScriptBlock {
+        $history = [System.Collections.ArrayList]::new()
+        [void]$history.Add([ordered]@{
+            attempt = 1
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Use the existing converter`nDo not add a parallel path."
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 1
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Use the existing converter."
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 2
+            source = "PREFLIGHT"
+            category = "PREFLIGHT_FAILED"
+            feedback = "Build failed with CS0103."
+        })
+
+        (Get-RetryLessonsFromFeedbackHistory -History $history -RunAttemptNumber 2) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ConvertFrom-Json $output
+    $parsed = @($parsed)
+    Assert-True ($parsed.Count -eq 2) "Retry lesson extraction should deduplicate repeated lessons and keep the most recent distinct blockers."
+    Assert-True ([string]$parsed[0].category -eq "PREFLIGHT_FAILED") "Retry lessons should keep the most recent unique blocker first."
+    Assert-True ([string]$parsed[1].category -eq "REVIEW_DENIED_MAJOR") "Retry lessons should retain prior review-denial context."
+    Assert-True ([int]$parsed[0].runAttemptNumber -eq 2) "Retry lessons should persist the scheduler run attempt number."
+    Assert-True ([int]$parsed[0].phaseAttempt -eq 2) "Retry lessons should preserve the local phase attempt number separately."
+}
+
+function Test-RetryContextRoundTripLoadsWorkerState {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-retry","attemptNumber":2,"latestFailure":{"finalCategory":"REVIEW_DENIED_MAJOR","summary":"review denied"},"priorChangedFiles":[".\\src\\Feature.cs"],"retryLessons":[{"runAttemptNumber":1,"phaseAttempt":1,"source":"REVIEW","category":"REVIEW_DENIED_MAJOR","feedbackExcerpt":"Reuse the existing converter."}]}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-RetryContextState -RetryContextFile $path -ExpectedTaskId "task-retry") | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $true) "Valid retry context files should load successfully."
+    Assert-True ([int]$parsed.attemptNumber -eq 2) "Retry context should preserve the retry attempt number."
+    Assert-True ([string]$parsed.latestFailure.finalCategory -eq "REVIEW_DENIED_MAJOR") "Retry context should preserve the latest failure category."
+    Assert-True (@($parsed.priorChangedFiles) -contains "src\Feature.cs") "Retry context should normalize prior changed files."
+    Assert-True (@($parsed.retryLessons).Count -eq 1) "Retry context should preserve structured retry lessons."
+    Assert-True ([int]$parsed.retryLessons[0].runAttemptNumber -eq 1) "Retry context should preserve lesson run attempt numbers."
+    Assert-True ([int]$parsed.retryLessons[0].phaseAttempt -eq 1) "Retry context should preserve lesson phase attempt numbers."
+}
+
+function Test-WrongTaskRetryContextFallsBackGracefully {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-wrong-task-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-retry","attemptNumber":2,"latestFailure":{"finalCategory":"REVIEW_DENIED_MAJOR","summary":"review denied"}}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-RetryContextState -RetryContextFile $path -ExpectedTaskId "task-other") | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $false) "Retry context should reject payloads for the wrong task."
+}
+
+function Test-EmptyRetryContextPayloadFallsBackGracefully {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-empty-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-retry","attemptNumber":2}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-RetryContextState -RetryContextFile $path -ExpectedTaskId "task-retry") | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $false) "Retry context should reject payloads without actionable signal."
+}
+
+function Test-MissingRetryContextFallsBackGracefully {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $missingPath = Join-Path $env:TEMP ("missing-retry-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        (Get-RetryContextState -RetryContextFile $missingPath) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $false) "Missing retry context should fall back without loading."
+    Assert-True ([int]$parsed.attemptNumber -eq 0) "Missing retry context should preserve the empty-state attempt number."
+    Assert-True (@($parsed.retryLessons).Count -eq 0) "Missing retry context should not synthesize lessons."
+}
+
+function Test-RetryContextPromptBlockIncludesPriorDenialText {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Clip-Text",
+        "Format-BulletList",
+        "Format-RetryContextPromptBlock"
+    ) -ScriptBlock {
+        $retryContext = [pscustomobject]@{
+            loaded = $true
+            attemptNumber = 2
+            latestFailure = [pscustomobject]@{
+                finalCategory = "REVIEW_DENIED_MAJOR"
+                summary = "review denied"
+                feedback = "Reuse the existing converter."
+                investigationConclusion = ""
+            }
+            priorChangedFiles = @("src\Feature.cs")
+            retryLessons = @(
+                [pscustomobject]@{
+                    runAttemptNumber = 1
+                    phaseAttempt = 1
+                    source = "REVIEW"
+                    category = "REVIEW_DENIED_MAJOR"
+                    feedbackExcerpt = "Reuse the existing converter."
+                }
+            )
+        }
+
+        Format-RetryContextPromptBlock -RetryContext $retryContext -Mode "IMPLEMENT" -MaxChars 1200
+    }
+
+    Assert-True ([string]$output -match "existing converter") "Retry prompt blocks should include prior denial text."
+    Assert-True ([string]$output -match "RETRY RULE") "Retry prompt blocks should include the mode-specific retry rule."
+    Assert-True ([string]$output -match "- Run 1 \[REVIEW/REVIEW_DENIED_MAJOR\]") "Retry prompt blocks should label prior lessons with the scheduler run number."
+    Assert-True ([string]$output -notmatch "- Attempt 1 \[") "Retry prompt blocks should not expose ambiguous phase attempt labels."
+}
+
+function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Normalize-RetryLessons",
+        "Ensure-Directory",
+        "Ensure-ParentDirectory",
+        "Get-EnvironmentFailureCategories",
+        "Is-EnvironmentFailureCategory",
+        "Clip-DiscoveryBriefText",
+        "Get-RetryLessonComparisonText",
+        "Is-RetryContextSemanticCategory",
+        "Get-RetryContextRelevantRuns",
+        "Get-FallbackRetryLesson",
+        "Get-RetryContextPayload",
+        "Write-RetryContextFile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        $task = [pscustomobject]@{
+            taskId = "task-retry"
+            runs = @(
+                [pscustomobject]@{
+                    attemptNumber = 1
+                    launchSequence = 1
+                    finalStatus = "FAILED"
+                    finalCategory = "REVIEW_DENIED_MAJOR"
+                    summary = "The reviewer rejected the first attempt."
+                    feedback = "REVIEW DENIED (MAJOR): Reuse the existing converter instead of adding a parallel path."
+                    investigationConclusion = "CHANGE_NEEDED"
+                    retryLessons = @(
+                        [pscustomobject]@{
+                            runAttemptNumber = 1
+                            phaseAttempt = 1
+                            source = "REVIEW"
+                            category = "REVIEW_DENIED_MAJOR"
+                            feedbackExcerpt = "Reuse the existing converter instead of adding a parallel path."
+                        }
+                    )
+                    actualFiles = @("src\Feature.cs", "src\ExistingConverter.cs")
+                    completedAt = (Get-Date).AddMinutes(-6).ToString("o")
+                }
+                [pscustomobject]@{
+                    attemptNumber = 2
+                    launchSequence = 2
+                    finalStatus = "FAILED"
+                    finalCategory = "REVIEW_INFRA_FAILURE"
+                    summary = "review infra issue"
+                    feedback = "review call failed"
+                    retryLessons = @()
+                    actualFiles = @()
+                    completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                }
+                [pscustomobject]@{
+                    attemptNumber = 3
+                    launchSequence = 3
+                    finalStatus = "ERROR"
+                    finalCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    summary = "environment issue"
+                    feedback = "worker crashed"
+                    retryLessons = @()
+                    actualFiles = @()
+                    completedAt = (Get-Date).AddMinutes(-4).ToString("o")
+                }
+                [pscustomobject]@{
+                    attemptNumber = 4
+                    launchSequence = 4
+                    finalStatus = "NO_CHANGE"
+                    finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+                    summary = "already done"
+                    feedback = "already done"
+                    retryLessons = @()
+                    actualFiles = @("src\Ignore.cs")
+                    completedAt = (Get-Date).AddMinutes(-3).ToString("o")
+                }
+            )
+        }
+
+        $payload = Write-RetryContextFile -Path $path -Task $task -AttemptNumber 5
+        try {
+            [pscustomobject]@{
+                payload = $payload
+                json = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            } | ConvertTo-Json -Depth 16
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    $payload = $parsed.payload
+    $json = $parsed.json | ConvertFrom-Json
+    Assert-True ([int]$payload.attemptNumber -eq 5) "Retry context files should preserve the target retry attempt number."
+    Assert-True ([string]$payload.latestFailure.finalCategory -eq "REVIEW_DENIED_MAJOR") "Retry context should use the latest semantically relevant failure as the current blocker."
+    Assert-True (@($payload.retryLessons).Count -eq 1) "Retry context should exclude infra-only, environment-only, and already-satisfied runs."
+    Assert-True ([int]$payload.retryLessons[0].runAttemptNumber -eq 1) "Retry context should preserve lesson run attempt numbers."
+    Assert-True ([string]$payload.retryLessons[0].category -eq "REVIEW_DENIED_MAJOR") "Retry context should preserve prior review-denial lessons."
+    Assert-True (@($payload.priorChangedFiles) -contains "src\Feature.cs") "Retry context should carry prior changed files from relevant runs."
+    Assert-True (-not (@($payload.priorChangedFiles) -contains "src\Ignore.cs")) "Retry context should exclude already-satisfied runs from prior changed files."
+    Assert-True ([string]$json.retryLessons[0].feedbackExcerpt -match "converter") "Retry context JSON should persist the prior denial text."
+}
+
+function Test-WriteRetryContextFileSkipsInfraOnlyHistory {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Normalize-RetryLessons",
+        "Ensure-Directory",
+        "Ensure-ParentDirectory",
+        "Get-EnvironmentFailureCategories",
+        "Is-EnvironmentFailureCategory",
+        "Clip-DiscoveryBriefText",
+        "Get-RetryLessonComparisonText",
+        "Is-RetryContextSemanticCategory",
+        "Get-RetryContextRelevantRuns",
+        "Get-FallbackRetryLesson",
+        "Get-RetryContextPayload",
+        "Write-RetryContextFile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-none-" + [guid]::NewGuid().ToString("N") + ".json")
+        $task = [pscustomobject]@{
+            taskId = "task-retry-none"
+            runs = @(
+                [pscustomobject]@{
+                    attemptNumber = 1
+                    launchSequence = 1
+                    finalStatus = "FAILED"
+                    finalCategory = "REVIEW_INFRA_FAILURE"
+                    summary = "review infra failed"
+                    feedback = "review call failed"
+                    retryLessons = @()
+                    actualFiles = @()
+                }
+                [pscustomobject]@{
+                    attemptNumber = 2
+                    launchSequence = 2
+                    finalStatus = "ERROR"
+                    finalCategory = "UNEXPECTED_ERROR"
+                    summary = "unexpected worker exception"
+                    feedback = "unexpected worker exception"
+                    retryLessons = @()
+                    actualFiles = @()
+                }
+                [pscustomobject]@{
+                    attemptNumber = 3
+                    launchSequence = 3
+                    finalStatus = "ERROR"
+                    finalCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    summary = "worker exited"
+                    feedback = "worker exited"
+                    retryLessons = @()
+                    actualFiles = @()
+                }
+            )
+        }
+
+        try {
+            $payload = Write-RetryContextFile -Path $path -Task $task -AttemptNumber 4
+            [pscustomobject]@{
+                hasPayload = [bool]$payload
+                fileExists = Test-Path -LiteralPath $path
+            } | ConvertTo-Json -Depth 8
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    Assert-True ($parsed.hasPayload -eq $false) "Retry context should not be generated from infra-only history."
+    Assert-True ($parsed.fileExists -eq $false) "Retry context files should not be written when no semantic retry memory exists."
+}
+
+function Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "retry-context-reconcile-result.json"
+        $plannerContextPath = Join-Path $repo.root "planner-context.json"
+        $retryContextPath = Join-Path $repo.root "retry-context.json"
+        $briefsFilePath = Join-Path $repo.root "worker-briefs.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "FAILED"
+            finalCategory = "REVIEW_DENIED_MAJOR"
+            summary = "review denied"
+            feedback = "Reuse the existing converter."
+            noChangeReason = ""
+            files = @("src\Feature.cs")
+            branch = ""
+            retryLessons = @(
+                @{
+                    runAttemptNumber = 1
+                    phaseAttempt = 1
+                    source = "REVIEW"
+                    category = "REVIEW_DENIED_MAJOR"
+                    feedbackExcerpt = "Reuse the existing converter."
+                }
+            )
+            artifacts = @{
+                runDir = ""
+                timeline = ""
+                debugDir = (Join-Path $repo.root "debug")
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $latestRun = New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-retry-context-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o")
+        $latestRun.artifacts = [pscustomobject]@{
+            plannerContext = $plannerContextPath
+            retryContext = $retryContextPath
+            briefs = $briefsFilePath
+        }
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "retry-context-reconcile"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "retry context reconcile"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "retry-context-reconcile.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = $latestRun
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "retry-context-reconcile" })[0]
+        Assert-True ([string]$task.state -eq "retry_scheduled") "Review-denied results should reconcile into retry_scheduled."
+        Assert-True (@($task.runs[0].retryLessons).Count -eq 1) "Reconciled run records should persist retry lessons."
+        Assert-True ([int]$task.runs[0].retryLessons[0].runAttemptNumber -eq 1) "Persisted retry lessons should preserve the scheduler run attempt number."
+        Assert-True ([string]$task.runs[0].retryLessons[0].category -eq "REVIEW_DENIED_MAJOR") "Persisted retry lessons should preserve the original blocker category."
+        Assert-True ([string]$task.progress.artifactPointers.plannerContextPath -eq $plannerContextPath) "Task progress should expose the preserved planner context path."
+        Assert-True ([string]$task.progress.artifactPointers.retryContextPath -eq $retryContextPath) "Task progress should expose the preserved retry context path."
+        Assert-True ([string]$task.progress.artifactPointers.briefsFilePath -eq $briefsFilePath) "Task progress should expose the preserved worker briefs path."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-DirectionCheckVerdictParsesOnTrackCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "ALIGNMENT: ON_TRACK`nDRIFT_DESCRIPTION: Plan is correctly scoped.`nRECOMMENDATION: CONTINUE") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "A valid ON_TRACK direction-check response should parse successfully."
+    Assert-True ([string]$parsed.alignment -eq "ON_TRACK") "ON_TRACK alignment should be preserved."
+    Assert-True ($parsed.shouldContinue -eq $true) "ON_TRACK should continue implementation."
+}
+
+function Test-DirectionCheckVerdictParsesMinorDriftCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail"
+    ) -ScriptBlock {
+        $verdict = Get-DirectionCheckVerdict -Output "ALIGNMENT: MINOR_DRIFT`nDRIFT_DESCRIPTION: The plan proposes an adjacent cleanup that is not required.`nRECOMMENDATION: TRIM_PLAN"
+        [pscustomobject]@{
+            verdict = $verdict
+            guardrail = (Get-DirectionCheckGuardrail -Verdict $verdict)
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.verdict.valid -eq $true) "A valid MINOR_DRIFT direction-check response should parse successfully."
+    Assert-True ([string]$parsed.verdict.alignment -eq "MINOR_DRIFT") "MINOR_DRIFT alignment should be preserved."
+    Assert-True ($parsed.verdict.shouldTrim -eq $true) "MINOR_DRIFT should request plan trimming."
+    Assert-True ([string]$parsed.guardrail -match "adjacent cleanup") "Minor drift should produce an implementation guardrail that includes the drift description."
+}
+
+function Test-DirectionCheckVerdictParsesMajorDriftCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "ALIGNMENT: MAJOR_DRIFT`nDRIFT_DESCRIPTION: The plan broadens into a refactor beyond the requested fix.`nRECOMMENDATION: ABORT") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "A valid MAJOR_DRIFT direction-check response should parse successfully."
+    Assert-True ([string]$parsed.recommendation -eq "ABORT") "Major drift should preserve the ABORT recommendation."
+    Assert-True ($parsed.shouldReplan -eq $true) "MAJOR_DRIFT should force replanning."
+}
+
+function Test-DirectionCheckVerdictRejectsMissingMarkers {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "The plan looks broadly correct but may touch too much code.") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Direction-check output without required markers must be rejected."
+}
+
+function Test-DirectionCheckVerdictRejectsMixedCombination {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict"
+    ) -ScriptBlock {
+        (Get-DirectionCheckVerdict -Output "ALIGNMENT: ON_TRACK`nDRIFT_DESCRIPTION: Looks good.`nRECOMMENDATION: ABORT") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Direction-check output with an incompatible alignment/recommendation pair must be rejected."
+}
+
+function Test-AcceptedPlanTargetsKeepExistingTargetsWhenCandidateRejected {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-AcceptedPlanTargets"
+    ) -ScriptBlock {
+        (Get-AcceptedPlanTargets -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Overreach\\Rejected.cs") -AcceptCandidate $false) | ConvertTo-Json -Depth 8
+    }
+
+    Assert-True ($output -like '*Existing.cs*') "Rejected candidate targets must preserve the previously accepted target."
+    Assert-True ($output -notlike '*Rejected.cs*') "Rejected candidate targets must not leak into the accepted target set."
+}
+
+function Test-AcceptedPlanTargetsReplaceExistingTargetsWhenAccepted {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-AcceptedPlanTargets"
+    ) -ScriptBlock {
+        (Get-AcceptedPlanTargets -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -AcceptCandidate $true) | ConvertTo-Json -Depth 8
+    }
+
+    Assert-True ($output -like '*Existing.cs*') "Accepted candidate targets should preserve previously accepted targets that remain in the candidate set."
+    Assert-True ($output -like '*Accepted.cs*') "Accepted candidate targets should include the new accepted target."
+}
+
+function Test-FixPlanFailureOutcomeUsesInsufficientForNonFinalDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-FixPlanFailureOutcome"
+    ) -ScriptBlock {
+        (Get-FixPlanFailureOutcome -LastPlanFailureReason "PLAN_INVALID") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.finalCategory -eq "FIX_PLAN_INSUFFICIENT") "Non-drift final failures must report FIX_PLAN_INSUFFICIENT."
+    Assert-True ([string]$parsed.terminalFailureCode -eq "TERMINAL_FIX_PLAN_INSUFFICIENT") "Non-drift final failures must use the insufficient terminal code."
+}
+
+function Test-FixPlanFailureOutcomeUsesDirectionDriftWhenFinalReasonIsDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-FixPlanFailureOutcome"
+    ) -ScriptBlock {
+        (Get-FixPlanFailureOutcome -LastPlanFailureReason "DIRECTION_DRIFT") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.finalCategory -eq "FIX_PLAN_DIRECTION_DRIFT") "Final drift failures must report FIX_PLAN_DIRECTION_DRIFT."
+    Assert-True ([string]$parsed.terminalFailureCode -eq "TERMINAL_FIX_PLAN_DIRECTION_DRIFT") "Final drift failures must use the drift terminal code."
+}
+
+function Test-PlanDirectionCheckRejectsRepairedPlanWithMajorDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail",
+        "Get-AcceptedPlanTargets",
+        "Invoke-PlanDirectionCheck"
+    ) -ScriptBlock {
+        $script:attemptsByPhase = [ordered]@{ directionCheck = 0 }
+        $script:CONST_MODEL_FAST = "test-fast"
+
+        function Save-JsonArtifact { param([string]$Name, $Object) return $null }
+        function Add-FeedbackEntry { param([int]$Attempt, [string]$Source, [string]$Category, [string]$Feedback) }
+        function Add-TimelineEvent { param([string]$Phase, [string]$Message, [string]$Category, $Data) }
+        function Write-SchedulerSnapshot { }
+        function Invoke-ClaudeDirectionCheck {
+            param([string]$Prompt, [string]$Model, [int]$Attempt)
+            return @{ success = $true; output = "ALIGNMENT: MAJOR_DRIFT`nDRIFT_DESCRIPTION: The repaired plan widens into a refactor.`nRECOMMENDATION: ABORT" }
+        }
+
+        (Invoke-PlanDirectionCheck -PlanAttempt 1 -PlanOutput "repaired plan" -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -TaskPrompt "Fix the bug only." -TaskClass "BUG" -DiscoverConclusion "Known defect." -RouteDecision "DIRECT" -Testability "HIGH" -DiscoverBlock "discover" -InvestigationBlock "investigate" -ReproductionBlock "reproduce") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.accepted -eq $false) "Major drift must not accept a repaired plan."
+    Assert-True ($parsed.requiresReplan -eq $true) "Major drift must force replanning for repaired plans."
+    Assert-True ([string]$parsed.lastPlanFailureReason -eq "DIRECTION_DRIFT") "Major drift must report the direction-drift failure reason."
+    Assert-True (($parsed.planTargets | ConvertTo-Json -Compress) -notlike '*Accepted.cs*') "Rejected repaired-plan targets must not replace the accepted target set."
+}
+
+function Test-PlanDirectionCheckAcceptsRepairedPlanWhenOnTrack {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail",
+        "Get-AcceptedPlanTargets",
+        "Invoke-PlanDirectionCheck"
+    ) -ScriptBlock {
+        $script:attemptsByPhase = [ordered]@{ directionCheck = 0 }
+        $script:CONST_MODEL_FAST = "test-fast"
+
+        function Save-JsonArtifact { param([string]$Name, $Object) return $null }
+        function Add-FeedbackEntry { param([int]$Attempt, [string]$Source, [string]$Category, [string]$Feedback) }
+        function Add-TimelineEvent { param([string]$Phase, [string]$Message, [string]$Category, $Data) }
+        function Write-SchedulerSnapshot { }
+        function Invoke-ClaudeDirectionCheck {
+            param([string]$Prompt, [string]$Model, [int]$Attempt)
+            return @{ success = $true; output = "ALIGNMENT: ON_TRACK`nDRIFT_DESCRIPTION: The repaired plan is tightly scoped.`nRECOMMENDATION: CONTINUE" }
+        }
+
+        (Invoke-PlanDirectionCheck -PlanAttempt 1 -PlanOutput "repaired plan" -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -TaskPrompt "Fix the bug only." -TaskClass "BUG" -DiscoverConclusion "Known defect." -RouteDecision "DIRECT" -Testability "HIGH" -DiscoverBlock "discover" -InvestigationBlock "investigate" -ReproductionBlock "reproduce") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.accepted -eq $true) "An on-track repaired plan should be accepted."
+    Assert-True ($parsed.requiresReplan -eq $false) "An on-track repaired plan should not replan."
+    Assert-True (($parsed.planTargets | ConvertTo-Json -Compress) -like '*Accepted.cs*') "Accepted repaired-plan targets should include the repaired target."
+}
+
+function Test-PlanDirectionCheckAddsGuardrailForRepairedMinorDrift {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-DirectionCheckVerdict",
+        "Get-DirectionCheckGuardrail",
+        "Get-AcceptedPlanTargets",
+        "Invoke-PlanDirectionCheck"
+    ) -ScriptBlock {
+        $script:attemptsByPhase = [ordered]@{ directionCheck = 0 }
+        $script:CONST_MODEL_FAST = "test-fast"
+
+        function Save-JsonArtifact { param([string]$Name, $Object) return $null }
+        function Add-FeedbackEntry { param([int]$Attempt, [string]$Source, [string]$Category, [string]$Feedback) }
+        function Add-TimelineEvent { param([string]$Phase, [string]$Message, [string]$Category, $Data) }
+        function Write-SchedulerSnapshot { }
+        function Invoke-ClaudeDirectionCheck {
+            param([string]$Prompt, [string]$Model, [int]$Attempt)
+            return @{ success = $true; output = "ALIGNMENT: MINOR_DRIFT`nDRIFT_DESCRIPTION: The repaired plan includes adjacent cleanup.`nRECOMMENDATION: TRIM_PLAN" }
+        }
+
+        (Invoke-PlanDirectionCheck -PlanAttempt 1 -PlanOutput "repaired plan" -ExistingTargets @("src\\Core\\Existing.cs") -CandidateTargets @("src\\Core\\Existing.cs", "src\\Fix\\Accepted.cs") -TaskPrompt "Fix the bug only." -TaskClass "BUG" -DiscoverConclusion "Known defect." -RouteDecision "DIRECT" -Testability "HIGH" -DiscoverBlock "discover" -InvestigationBlock "investigate" -ReproductionBlock "reproduce") | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.accepted -eq $true) "Minor drift should still accept the repaired plan with a guardrail."
+    Assert-True ([string]$parsed.directionCheckVerdict.alignment -eq "MINOR_DRIFT") "Minor drift should preserve the parsed direction-check verdict."
+    Assert-True ([string]$parsed.directionCheckGuardrail -match "adjacent cleanup") "Minor drift should populate the repaired-plan guardrail."
+}
+
+function Test-ImplementationScopeCheckIsTightForExactMatches {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Feature.cs") -ChangedFiles @("src\\Feature.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.evaluated -eq $true) "Exact file matches should be evaluated."
+    Assert-True ([string]$parsed.classification -eq "tight") "Exact file matches should classify as tight."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 0) "Exact file matches should not report out-of-scope files."
+    Assert-True ($parsed.shouldEscalateReview -eq $false) "Tight matches should not escalate review."
+}
+
+function Test-ImplementationScopeCheckAcceptsUniqueSuffixMatches {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("Feature.cs") -ChangedFiles @("src\\Feature.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "acceptable") "Unique filename-only targets should classify as acceptable."
+    Assert-True ([int]$parsed.matchKindsSummary.suffix -eq 1) "Unique filename-only targets should count as suffix matches."
+    Assert-True ($parsed.shouldEscalateReview -eq $false) "Acceptable suffix matches should not escalate review."
+}
+
+function Test-ImplementationScopeCheckEscalatesDirectoryTargets {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services") -ChangedFiles @("src\\Services\\OrderService.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "broad") "Directory targets should classify as broad."
+    Assert-True ([int]$parsed.matchKindsSummary.directory -eq 1) "Directory targets should count as directory matches."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Broad scope matches should escalate review."
+}
+
+function Test-ImplementationScopeCheckDetectsOutOfScopeFiles {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\OrderService.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Shared\\CustomerDto.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "drifted") "Extra changed files outside the plan should classify as drifted."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 1) "Scope drift should report the unexpected changed file."
+    Assert-True ([string]$parsed.outOfScopeFiles[0] -eq "src\\Shared\\CustomerDto.cs") "Scope drift should preserve the unexpected file path."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Scope drift should escalate review."
+}
+
+function Test-ImplementationScopeCheckTreatsWildcardMatchesAsBroad {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\*.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Services\\CustomerService.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "broad") "Wildcard targets should classify as broad when they match the changed files."
+    Assert-True ([int]$parsed.matchKindsSummary.wildcard -eq 1) "Wildcard targets should count as wildcard matches."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 0) "Wildcard-matched files should not be treated as out-of-scope."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Wildcard matches should escalate review for stricter inspection."
+}
+
+function Test-ImplementationScopeCheckWildcardStillDetectsOutOfScopeFiles {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\*.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Shared\\CustomerDto.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "drifted") "Wildcard targets should still classify as drifted when unrelated files change."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 1) "Wildcard scope drift should report the unrelated changed file."
+    Assert-True ([string]$parsed.outOfScopeFiles[0] -eq "src\\Shared\\CustomerDto.cs") "Wildcard scope drift should preserve the unrelated file path."
+    Assert-True ($parsed.shouldEscalateReview -eq $true) "Wildcard scope drift should escalate review."
+}
+
+function Test-ImplementationScopeCheckReportsUnmatchedWildcardTargets {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\*.cs") -ChangedFiles @("docs\\note.md")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "drifted") "Unmatched wildcard targets should classify as drifted when all changes fall outside the allowed area."
+    Assert-True (@($parsed.unmatchedTargets).Count -eq 1) "Unmatched wildcard targets should be surfaced explicitly."
+    Assert-True ([string]$parsed.unmatchedTargets[0] -eq "src\\Services\\*.cs") "The unmatched wildcard target should be preserved."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 1 -and [string]$parsed.outOfScopeFiles[0] -eq "docs\\note.md") "All changed files should remain out-of-scope when the wildcard target does not match."
+}
+
+function Test-ImplementationScopeCheckSupportsMixedExactAndWildcardTargets {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-CanonicalComparisonPath",
+        "Get-PathComparisonProfile",
+        "Get-TargetPathMatches",
+        "Match-AllowedTargetPaths",
+        "Get-ImplementationScopeCheck"
+    ) -ScriptBlock {
+        (Get-ImplementationScopeCheck -PlanTargets @("src\\Services\\OrderService.cs", "src\\Tests\\*.cs") -ChangedFiles @("src\\Services\\OrderService.cs", "src\\Tests\\OrderServiceTests.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.classification -eq "broad") "Mixed exact and wildcard targets should classify as broad when wildcard matching is involved without drift."
+    Assert-True ([int]$parsed.matchKindsSummary.exact -eq 1) "Mixed targets should preserve exact-match accounting."
+    Assert-True ([int]$parsed.matchKindsSummary.wildcard -eq 1) "Mixed targets should preserve wildcard-match accounting."
+    Assert-True (@($parsed.outOfScopeFiles).Count -eq 0) "Mixed exact and wildcard targets should not produce out-of-scope files when all changes are covered."
 }
 
 function Test-RegistrationRejectsMissingPromptFile {
@@ -1828,6 +3578,538 @@ function Test-UsageProjectionAndPlannerFeedback {
     }
 }
 
+function Test-UsageGateWritesAutodevCacheOnFreshSuccess {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $sequencePath = Write-UsageGateMockFile -Root $root -FileName "usage-success.json" -Payload @(
+            [ordered]@{
+                five_hour = [ordered]@{
+                    utilization = 42.5
+                    resets_at = "2026-03-25T18:00:00Z"
+                }
+                seven_day = [ordered]@{
+                    utilization = 22.0
+                    resets_at = "2026-03-30T18:00:00Z"
+                }
+            }
+        )
+        $result = Invoke-UsageGateJson -ClaudeHome $root -MockUsageSequencePath $sequencePath
+        $cachePath = Join-Path $root "tl-autodev-usage-cache.json"
+
+        Assert-True ($result.ok -eq $true) "Fresh success should mark the usage gate as available."
+        Assert-True ([string]$result.processStatus -eq "ok") "Fresh success below threshold should return ok."
+        Assert-True ([string]$result.source -eq "oauth") "Fresh success should report oauth as the source."
+        Assert-True ($result.fresh -eq $true) "Fresh success should be marked as fresh."
+        Assert-True (Test-Path -LiteralPath $cachePath) "Fresh success should create the autodev usage cache."
+
+        $cache = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+        Assert-True ([double]$cache.fiveHourUtilization -eq 42.5) "Cache should persist the fetched five-hour utilization."
+        Assert-True ([string]$cache.source -eq "oauth") "Cache should record oauth as the source."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateBlocksWhenThresholdIsExceeded {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $sequencePath = Write-UsageGateMockFile -Root $root -FileName "usage-blocked.json" -Payload @(
+            [ordered]@{
+                five_hour = [ordered]@{
+                    utilization = 94.0
+                    resets_at = "2026-03-25T18:00:00Z"
+                }
+                seven_day = [ordered]@{
+                    utilization = 35.0
+                    resets_at = "2026-03-30T18:00:00Z"
+                }
+            }
+        )
+        $result = Invoke-UsageGateJson -ClaudeHome $root -ThresholdPercent 90 -MockUsageSequencePath $sequencePath
+
+        Assert-True ($result.ok -eq $true) "Blocked usage should still count as a fresh verified state."
+        Assert-True ([string]$result.processStatus -eq "blocked") "Threshold breaches should return blocked."
+        Assert-True ($result.shouldBlock -eq $true) "Threshold breaches should set shouldBlock."
+        Assert-True ([string]$result.fiveHourResetAt -eq "2026-03-25T18:00:00.0000000+00:00") "The reset time should be normalized and preserved."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateNeverTrustsStaleCacheForLaunchDecisions {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $cachePath = Join-Path $root "tl-autodev-usage-cache.json"
+        Write-TestFile -Path $cachePath -Content @"
+{
+  "fetchedAt": "2026-03-25T14:00:00Z",
+  "source": "oauth",
+  "fiveHourUtilization": 12.0,
+  "fiveHourResetAt": "2026-03-25T18:00:00Z",
+  "sevenDayUtilization": 8.0,
+  "thresholdPercent": 90,
+  "shouldBlock": false,
+  "lastError": ""
+}
+"@
+
+        $result = Invoke-UsageGateJson -ClaudeHome $root -MockErrorKind "timeout"
+
+        Assert-True ($result.ok -eq $false) "Timeouts must not authorize a launch from stale cache."
+        Assert-True ([string]$result.processStatus -eq "unavailable_timeout") "Timeouts should classify as unavailable_timeout."
+        Assert-True ([string]$result.source -eq "none") "Stale cache should not become the active source."
+        Assert-True ([double]$result.fiveHourUtilization -eq 12.0) "Stale cache may still be returned as informational context."
+        Assert-True ([string]$result.lastSuccessfulFetchAt -eq "2026-03-25T14:00:00.0000000+00:00") "Timeouts should surface the last successful fetch time from cache."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateWaitModeSleepsUntilUsageOpens {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $sequencePath = Join-Path $root "usage-sequence.json"
+        Write-TestFile -Path $sequencePath -Content @"
+[
+  {
+    "five_hour": {
+      "utilization": 95.0,
+      "resets_at": "2000-01-01T00:00:00Z"
+    },
+    "seven_day": {
+      "utilization": 20.0,
+      "resets_at": "2026-03-30T18:00:00Z"
+    }
+  },
+  {
+    "five_hour": {
+      "utilization": 45.0,
+      "resets_at": "2026-03-25T19:00:00Z"
+    },
+    "seven_day": {
+      "utilization": 20.0,
+      "resets_at": "2026-03-30T18:00:00Z"
+    }
+  }
+]
+"@
+
+        $result = Invoke-UsageGateJson -ClaudeHome $root -Mode "wait" -MockUsageSequencePath $sequencePath -PollSeconds 1 -FastPollSeconds 1 -FastWindowSeconds 1
+
+        Assert-True ($result.ok -eq $true) "Wait mode should end once usage opens."
+        Assert-True ([string]$result.processStatus -eq "ok") "Wait mode should finish with ok when the follow-up probe opens."
+        Assert-True ($result.waitedSeconds -ge 1) "Wait mode should record time spent waiting."
+        Assert-True (@($result.history).Count -ge 2) "Wait mode should record both the blocked and the open probe."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedState {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $sequencePath = Write-UsageGateMockFile -Root $root -FileName "usage-preblocked.json" -Payload @(
+            [ordered]@{
+                five_hour = [ordered]@{
+                    utilization = 95.0
+                    resets_at = "2000-01-01T00:00:00Z"
+                }
+                seven_day = [ordered]@{
+                    utilization = 20.0
+                    resets_at = "2026-03-30T18:00:00Z"
+                }
+            }
+        )
+        $blockedResult = Invoke-UsageGateJson -ClaudeHome $root -MockUsageSequencePath $sequencePath
+        Assert-True ([string]$blockedResult.processStatus -eq "blocked") "The setup probe should confirm a blocked state."
+
+        $waitResult = Invoke-UsageGateJson -ClaudeHome $root -Mode "wait" -MockErrorKind "timeout" -PollSeconds 1 -FastPollSeconds 1 -FastWindowSeconds 1
+
+        Assert-True ($waitResult.ok -eq $false) "Wait mode should not mask a failed refresh after a blocked state."
+        Assert-True ([string]$waitResult.processStatus -eq "unavailable_timeout") "A failed refresh after waiting should surface as unavailable_timeout."
+        Assert-True (@($waitResult.history).Count -ge 1) "Wait mode should record the failed refresh attempt in history."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-TaskDiscoveryBriefUsesCompactCompletedTaskData {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief"
+    ) -ScriptBlock {
+        $task = [pscustomobject]@{
+            taskId = "task-brief"
+            waveNumber = 2
+            state = "pending_merge"
+            taskText = "Fix null reference in OrderService.GetById by tightening DTO access and keeping test coverage up to date."
+            plannerMetadata = [pscustomobject]@{
+                likelyAreas = @("Services", "DTO")
+                likelyFiles = @("src\\Services\\OrderService.cs")
+            }
+            plannerFeedback = [pscustomobject]@{
+                classification = "broad"
+            }
+            latestRun = [pscustomobject]@{
+                finalStatus = "ACCEPTED"
+                finalCategory = "ACCEPTED"
+                summary = "Added null-safe navigation in OrderService and extended regression test coverage for the failing DTO branch."
+                investigationConclusion = "OrderService shares CustomerDto with ShippingService and both paths rely on the same null-sensitive shape."
+                feedback = ""
+                actualFiles = @(
+                    "src\\Services\\OrderService.cs",
+                    "tests\\OrderServiceTests.cs",
+                    "src\\Shared\\CustomerDto.cs",
+                    "docs\\note.md",
+                    "extra\\one.cs",
+                    "extra\\two.cs",
+                    "extra\\three.cs"
+                )
+                completedAt = "2026-03-24T10:00:00.0000000Z"
+            }
+        }
+        (Get-TaskDiscoveryBrief -Task $task) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.taskId -eq "task-brief") "Discovery brief should preserve task id."
+    Assert-True ([string]$parsed.status -eq "ACCEPTED") "Discovery brief should use latest final status."
+    Assert-True (@($parsed.filesChanged).Count -eq 6) "Discovery brief should cap changed files."
+    Assert-True (@($parsed.discoveries).Count -le 2) "Discovery brief should cap discoveries."
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$parsed.conflictHints)) "Discovery brief should emit a compact conflict hint when useful."
+}
+
+function Test-CompletedTaskBriefsAreOrderedAndCapped {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs"
+    ) -ScriptBlock {
+        $state = [pscustomobject]@{
+            tasks = @(
+                1..10 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "task-$($_)"
+                        submissionOrder = $_
+                        waveNumber = 1
+                        state = "merged"
+                        taskText = "Task $_"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            finalStatus = "ACCEPTED"
+                            finalCategory = "ACCEPTED"
+                            summary = "Done $_"
+                            feedback = ""
+                            investigationConclusion = ""
+                            actualFiles = @("src\\File$($_).cs")
+                            completedAt = ("2026-03-24T{0:d2}:00:00.0000000Z" -f $_)
+                        }
+                    }
+                }
+            )
+        }
+        (Get-CompletedTaskBriefs -State $state) | ConvertTo-Json -Depth 8
+    }
+
+    [object[]]$parsed = ConvertFrom-Json $output
+    Assert-True ($parsed.Count -eq 8) "Completed task briefs should be capped to the most recent eight entries."
+    Assert-True ([string]$parsed[0].taskId -eq "task-10") "Completed task briefs should order newest completed tasks first."
+    Assert-True ([string]$parsed[-1].taskId -eq "task-3") "Completed task briefs should trim older completed tasks."
+}
+
+function Test-CompletedTaskBriefsPreferHigherConfidenceStatesWhenCapped {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs"
+    ) -ScriptBlock {
+        $state = [pscustomobject]@{
+            tasks = @(
+                1..5 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "merged-$($_)"
+                        submissionOrder = $_
+                        waveNumber = 1
+                        state = "merged"
+                        taskText = "Merged $_"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            finalStatus = "ACCEPTED"
+                            finalCategory = "ACCEPTED"
+                            summary = "Merged $_"
+                            feedback = ""
+                            investigationConclusion = ""
+                            actualFiles = @("src\\Merged$($_).cs")
+                            completedAt = ("2026-03-24T0{0}:00:00.0000000Z" -f $_)
+                        }
+                    }
+                }
+                6..10 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "failed-$($_)"
+                        submissionOrder = $_
+                        waveNumber = 1
+                        state = "completed_failed_terminal"
+                        taskText = "Failed $_"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            finalStatus = "FAILED"
+                            finalCategory = "PREFLIGHT_FAILED"
+                            summary = "Failed $_"
+                            feedback = "Failure $_"
+                            investigationConclusion = ""
+                            actualFiles = @("src\\Failed$($_).cs")
+                            completedAt = ("2026-03-24T1{0}:00:00.0000000Z" -f ($_ - 5))
+                        }
+                    }
+                }
+            )
+        }
+        (Get-CompletedTaskBriefs -State $state) | ConvertTo-Json -Depth 8
+    }
+
+    [object[]]$parsed = ConvertFrom-Json $output
+    Assert-True ($parsed.Count -eq 8) "Completed task briefs should still cap to eight entries after priority sorting."
+    Assert-True (@($parsed | Where-Object { [string]$_.taskId -like 'merged-*' }).Count -eq 5) "Higher-confidence merged briefs should survive capping."
+    Assert-True (@($parsed | Where-Object { [string]$_.taskId -like 'failed-*' }).Count -eq 3) "Lower-confidence failed briefs should only fill remaining brief slots."
+}
+
+function Test-CompletedTaskBriefsUseRecencyWithinSameConfidenceTier {
+    $output = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs"
+    ) -ScriptBlock {
+        $state = [pscustomobject]@{
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "pending-newer"
+                    submissionOrder = 2
+                    waveNumber = 1
+                    state = "pending_merge"
+                    taskText = "Newer pending"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Newer pending"
+                        feedback = ""
+                        investigationConclusion = ""
+                        actualFiles = @("src\\PendingNewer.cs")
+                        completedAt = "2026-03-24T11:00:00.0000000Z"
+                    }
+                },
+                [pscustomobject]@{
+                    taskId = "pending-older"
+                    submissionOrder = 1
+                    waveNumber = 1
+                    state = "pending_merge"
+                    taskText = "Older pending"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Older pending"
+                        feedback = ""
+                        investigationConclusion = ""
+                        actualFiles = @("src\\PendingOlder.cs")
+                        completedAt = "2026-03-24T10:00:00.0000000Z"
+                    }
+                },
+                [pscustomobject]@{
+                    taskId = "failed-newer"
+                    submissionOrder = 4
+                    waveNumber = 1
+                    state = "completed_failed_terminal"
+                    taskText = "Newer failed"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "FAILED"
+                        finalCategory = "PREFLIGHT_FAILED"
+                        summary = "Newer failed"
+                        feedback = "Failure"
+                        investigationConclusion = ""
+                        actualFiles = @("src\\FailedNewer.cs")
+                        completedAt = "2026-03-24T13:00:00.0000000Z"
+                    }
+                },
+                [pscustomobject]@{
+                    taskId = "failed-older"
+                    submissionOrder = 3
+                    waveNumber = 1
+                    state = "completed_failed_terminal"
+                    taskText = "Older failed"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "FAILED"
+                        finalCategory = "PREFLIGHT_FAILED"
+                        summary = "Older failed"
+                        feedback = "Failure"
+                        investigationConclusion = ""
+                        actualFiles = @("src\\FailedOlder.cs")
+                        completedAt = "2026-03-24T12:00:00.0000000Z"
+                    }
+                }
+            )
+        }
+        (Get-CompletedTaskBriefs -State $state) | ConvertTo-Json -Depth 8
+    }
+
+    [object[]]$parsed = ConvertFrom-Json $output
+    Assert-True ([string]$parsed[0].taskId -eq "pending-newer") "Newer tasks should sort first within the same confidence tier."
+    Assert-True ([string]$parsed[1].taskId -eq "pending-older") "Older tasks should follow within the same confidence tier."
+    Assert-True ([string]$parsed[2].taskId -eq "failed-newer") "Lower-confidence tiers should still be ordered by recency internally."
+    Assert-True ([string]$parsed[3].taskId -eq "failed-older") "Older tasks in the same lower-confidence tier should follow newer ones."
+}
+
+function Test-SnapshotIncludesCompletedTaskBriefs {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = [pscustomobject]@{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-complete"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "Tighten the null handling in OrderService."
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-complete.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "merged"
+                    plannerMetadata = [pscustomobject]@{ likelyAreas = @("Services") }
+                    plannerFeedback = [pscustomobject]@{ classification = "acceptable" }
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        launchSequence = 1
+                        taskName = "develop-task-complete-a1"
+                        resultFile = (Join-Path $repo.resultsDir "task-complete.json")
+                        processId = 0
+                        startedAt = (Get-Date).AddMinutes(-20).ToString("o")
+                        completedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Updated OrderService null handling and kept the regression test passing."
+                        feedback = ""
+                        noChangeReason = ""
+                        investigationConclusion = "OrderService and CustomerDto are shared with shipping-related code paths."
+                        reproductionConfirmed = $false
+                        actualFiles = @("src\\Services\\OrderService.cs", "tests\\OrderServiceTests.cs")
+                        branchName = "auto/task-complete"
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "task-running"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "Still running."
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-running.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        attemptNumber = 1
+                        taskName = "develop-task-running-a1"
+                        resultFile = (Join-Path $repo.resultsDir "task-running.json")
+                        processId = 999999
+                        startedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                        finalStatus = ""
+                        finalCategory = ""
+                        summary = ""
+                        feedback = ""
+                        noChangeReason = ""
+                        actualFiles = @()
+                        branchName = ""
+                        artifacts = $null
+                    }
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True (@($snapshot.completedTaskBriefs).Count -eq 1) "Snapshot should expose one completed task brief for the finished task."
+        Assert-True ([string]$snapshot.completedTaskBriefs[0].taskId -eq "task-complete") "Snapshot should include the completed task brief."
+        Assert-True (@($snapshot.completedTaskBriefs | Where-Object { [string]$_.taskId -eq "task-running" }).Count -eq 0) "Snapshot should exclude running tasks from completed task briefs."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-RetryDoesNotBlockMerge {
     $repo = New-TestRepo
     try {
@@ -1977,6 +4259,165 @@ function Test-TlaMergeLockRemediation {
         $taskkillEntries = @(Get-Content -LiteralPath $taskkillLog)
         Assert-True ($taskkillEntries.Count -eq 2) "taskkill should be called once per candidate process."
         Assert-True ((Get-Content -LiteralPath $dotnetCountFile -Raw).Trim() -eq "2") "dotnet build should be retried once after taskkill remediation."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-TlaMergeLockRemediationUsesRestoreFailureReason {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "lock-then-restore-fail"
+        $dotnetSequenceFile = Join-Path $repo.root "dotnet-sequence.txt"
+        $taskkillLog = Join-Path $repo.root "taskkill-restore.log"
+        $dotnetLog = Join-Path $repo.root "dotnet-restore.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "tla-merge-restore-fail"
+                    sourceCommand = "TLA-develop"
+                    sourceInputType = "inline"
+                    taskText = "merge autonomously but fail on rerun restore"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "tla-merge-restore-fail.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "tla-merge-restore-fail" -ResultFile (Join-Path $repo.tasksDir "tla-merge-restore-fail-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/tla-merge-restore-fail"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_DOTNET_SEQUENCE_FILE = $dotnetSequenceFile
+            AUTODEV_TEST_TASKKILL_LOG = $taskkillLog
+            AUTODEV_TEST_DOTNET_LOG = $dotnetLog
+            AUTODEV_TEST_PROCESS_CANDIDATES = (@(
+                @{ id = 1111; processName = "devenv" },
+                @{ id = 2222; processName = "iisexpress" }
+            ) | ConvertTo-Json -Depth 8 -Compress)
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $false) "TLA prepare-merge should still fail when the rerun restore fails after lock remediation."
+        Assert-True ($prepareResult.lockRemediationAttempted -eq $true) "TLA prepare-merge should record the remediation attempt before the rerun restore fails."
+        Assert-True ([string]$prepareResult.task.state -eq "merge_retry_scheduled") "Rerun restore failure should stay on the merge retry path."
+        Assert-True ([string]$prepareResult.reason -match '^Restore failed after autonomous lock remediation\.') "Post-remediation restore failures should surface a restore-specific reason."
+        Assert-True ([string]$prepareResult.reason -notmatch '^Build failed after autonomous lock remediation\.') "Post-remediation restore failures must not be mislabeled as build failures."
+
+        $taskkillEntries = if (Test-Path -LiteralPath $taskkillLog) { @(Get-Content -LiteralPath $taskkillLog) } else { @() }
+        Assert-True ($taskkillEntries.Count -eq 2) "Lock remediation should still terminate the mocked processes before the rerun restore fails."
+
+        $dotnetEntries = if (Test-Path -LiteralPath $dotnetLog) { @(Get-Content -LiteralPath $dotnetLog) } else { @() }
+        $normalizedDotnetEntries = @($dotnetEntries | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF).Trim() })
+        Assert-True ($normalizedDotnetEntries.Count -eq 3) "Lock remediation rerun should execute restore, build, then restore."
+        Assert-True ($normalizedDotnetEntries[0] -match '^restore\b') "The first merge attempt should start with restore."
+        Assert-True ($normalizedDotnetEntries[1] -match '^build\b') "The initial failure should come from build before remediation."
+        Assert-True ($normalizedDotnetEntries[2] -match '^restore\b') "The rerun after remediation should restart with restore."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareMergeRunsRestoreBeforeBuild {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "success"
+        $dotnetLog = Join-Path $repo.root "dotnet.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "merge-restore-order"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "run restore before build"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "merge-restore-order.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "merge-restore-order" -ResultFile (Join-Path $repo.tasksDir "merge-restore-order-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/merge-restore-order"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_DOTNET_LOG = $dotnetLog
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $true) "Prepare-merge should succeed when restore and build both succeed."
+
+        $dotnetEntries = if (Test-Path -LiteralPath $dotnetLog) { @(Get-Content -LiteralPath $dotnetLog) } else { @() }
+        $normalizedDotnetEntries = @($dotnetEntries | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF).Trim() })
+        Assert-True ($normalizedDotnetEntries.Count -eq 2) "Prepare-merge should invoke dotnet exactly twice on success."
+        Assert-True ($normalizedDotnetEntries[0] -match '^restore\b') "Prepare-merge must run dotnet restore before build."
+        Assert-True ($normalizedDotnetEntries[1] -match '^build\b') "Prepare-merge must run dotnet build after restore."
+        Assert-True ($normalizedDotnetEntries[1] -match '--no-restore') "Prepare-merge build should keep --no-restore after the explicit restore step."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -3446,6 +5887,85 @@ function Test-MergeBuildFailurePreservesBranch {
     }
 }
 
+function Test-MergeRestoreFailurePreservesBranch {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "restore-fail"
+        $gitLog = Join-Path $repo.root "git-restore.log"
+        $dotnetLog = Join-Path $repo.root "dotnet-restore.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "merge-restore-retry"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "preserve branch on restore fail"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "merge-restore-retry.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "merge-restore-retry" -ResultFile (Join-Path $repo.tasksDir "merge-restore-retry-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/merge-restore-retry"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_GIT_LOG = $gitLog
+            AUTODEV_TEST_DOTNET_LOG = $dotnetLog
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $false) "Restore failure should fail merge preparation."
+        Assert-True ([string]$prepareResult.task.state -eq "merge_retry_scheduled") "Restore failures during prepare-merge should preserve accepted work as merge_retry_scheduled."
+        Assert-True ([string]$prepareResult.task.branchName -eq "auto/merge-restore-retry") "Merge-stage retry must preserve the accepted branch after restore failure."
+        Assert-True ([int]$prepareResult.task.mergeAttemptsUsed -eq 1) "Restore failure should consume merge retry budget."
+        Assert-True ([string]$prepareResult.reason -match 'NU1101|Restore failed') "Restore failure reason should be surfaced."
+
+        $gitEntries = if (Test-Path -LiteralPath $gitLog) { @(Get-Content -LiteralPath $gitLog) } else { @() }
+        Assert-True (@($gitEntries | Where-Object { $_ -match 'branch\s+-D' }).Count -eq 0) "Branch should not be deleted on merge-stage restore failure."
+
+        $dotnetEntries = if (Test-Path -LiteralPath $dotnetLog) { @(Get-Content -LiteralPath $dotnetLog) } else { @() }
+        $normalizedDotnetEntries = @($dotnetEntries | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF).Trim() })
+        Assert-True ($normalizedDotnetEntries.Count -eq 1) "Prepare-merge should stop after restore failure."
+        Assert-True ($normalizedDotnetEntries[0] -match '^restore\b') "Restore failure should happen before any build invocation."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-AdminEditTask {
     $repo = New-TestRepo
     try {
@@ -4704,18 +7224,84 @@ Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
 Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
 Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames
 Test-PreflightMissingSolutionIsEnvironmentFailure
+Test-PreflightWarnsOnUnboundEventCallback
+Test-PreflightAcceptsExplicitEventCallbackBinding
+Test-PreflightAcceptsBindSyntaxForChangedCallback
+Test-PreflightSkipsPageComponentsForEventCallbackWiring
+Test-PreflightBlocksMissingStaticJsInvokableTarget
+Test-PreflightAcceptsAliasedStaticJsInvokableTarget
+Test-PreflightWarnsOnMissingInstanceJsInvokableTarget
+Test-PreflightIgnoresNonDotNetInvokeMethodPatterns
+Test-PreflightDoesNotCrossWireDuplicateComponentNames
 Test-InvestigationInconclusiveGetsOneNormalRetry
 Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded
 Test-ManualDebugTaskResumesToQueuedOnPositiveReplan
 Test-ManualDebugTaskStaysPausedWithoutPositiveWaveReplan
 Test-SnapshotResilience
 Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
+Test-WritePlannerContextFilePersistsEffortClass
+Test-PlannerContextLowEffortSelectsSimpleProfile
+Test-MissingPlannerContextFallsBackToComplexProfile
+Test-WriteWorkerBriefsFilePersistsAcceptedCompletedBriefs
+Test-WorkerBriefsRoundTripLoadsWorkerState
+Test-FormatWorkerBriefsPromptBlockIncludesDiscoveries
+Test-InvestigationPriorArtOutputBlockUsesFileQualifiedSearchHitContract
+Test-PlanPriorArtOutputBlockRequiresConcreteRelativePath
+Test-PriorArtRequirementDetectsReuseAndCrossLayerSignals
+Test-PriorArtRequirementSkipsSimpleDirectEdit
+Test-PriorArtRequirementIgnoresGenericRoleNouns
+Test-InvestigationVerdictParsesPriorArtFields
+Test-InvestigationPriorArtValidationRequiresAllFields
+Test-InvestigationPriorArtValidationAcceptsFileQualifiedSearchHits
+Test-InvestigationPriorArtValidationRejectsRawSearchCommands
+Test-PlanValidationRequiresReuseSectionWhenPriorArtRequired
+Test-PlanValidationAcceptsConcreteReuseSectionWhenPriorArtRequired
+Test-PlanValidationRejectsSearchPatternReferenceWhenPriorArtRequired
+Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons
+Test-RetryContextRoundTripLoadsWorkerState
+Test-WrongTaskRetryContextFallsBackGracefully
+Test-EmptyRetryContextPayloadFallsBackGracefully
+Test-MissingRetryContextFallsBackGracefully
+Test-RetryContextPromptBlockIncludesPriorDenialText
+Test-WriteRetryContextFilePersistsRelevantPriorFailures
+Test-WriteRetryContextFileSkipsInfraOnlyHistory
+Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts
+Test-DirectionCheckVerdictParsesOnTrackCombination
+Test-DirectionCheckVerdictParsesMinorDriftCombination
+Test-DirectionCheckVerdictParsesMajorDriftCombination
+Test-DirectionCheckVerdictRejectsMissingMarkers
+Test-DirectionCheckVerdictRejectsMixedCombination
+Test-AcceptedPlanTargetsKeepExistingTargetsWhenCandidateRejected
+Test-AcceptedPlanTargetsReplaceExistingTargetsWhenAccepted
+Test-FixPlanFailureOutcomeUsesInsufficientForNonFinalDrift
+Test-FixPlanFailureOutcomeUsesDirectionDriftWhenFinalReasonIsDrift
+Test-PlanDirectionCheckRejectsRepairedPlanWithMajorDrift
+Test-PlanDirectionCheckAcceptsRepairedPlanWhenOnTrack
+Test-PlanDirectionCheckAddsGuardrailForRepairedMinorDrift
+Test-ImplementationScopeCheckIsTightForExactMatches
+Test-ImplementationScopeCheckAcceptsUniqueSuffixMatches
+Test-ImplementationScopeCheckEscalatesDirectoryTargets
+Test-ImplementationScopeCheckDetectsOutOfScopeFiles
+Test-ImplementationScopeCheckTreatsWildcardMatchesAsBroad
+Test-ImplementationScopeCheckWildcardStillDetectsOutOfScopeFiles
+Test-ImplementationScopeCheckReportsUnmatchedWildcardTargets
+Test-ImplementationScopeCheckSupportsMixedExactAndWildcardTargets
 Test-RegistrationRejectsMissingPromptFile
 Test-SnapshotSurfacesMissingPromptFileIntegrityError
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
+Test-UsageGateWritesAutodevCacheOnFreshSuccess
+Test-UsageGateBlocksWhenThresholdIsExceeded
+Test-UsageGateNeverTrustsStaleCacheForLaunchDecisions
+Test-UsageGateWaitModeSleepsUntilUsageOpens
+Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedState
 Test-UsageProjectionAndPlannerFeedback
+Test-TaskDiscoveryBriefUsesCompactCompletedTaskData
+Test-CompletedTaskBriefsAreOrderedAndCapped
+Test-CompletedTaskBriefsPreferHigherConfidenceStatesWhenCapped
+Test-CompletedTaskBriefsUseRecencyWithinSameConfidenceTier
+Test-SnapshotIncludesCompletedTaskBriefs
 Test-PlannerFeedbackMatchesFilenameOnlyPredictions
 Test-PlannerFeedbackTreatsDirectoryPredictionsAsBroadMatches
 Test-PlannerFeedbackDoesNotOvermatchAmbiguousFilenamePredictions
@@ -4730,6 +7316,7 @@ Test-ManualOverridePersistsAcrossSnapshots
 Test-SharedFileWithoutConflictDoesNotRequeue
 Test-RealMergeConflictStillRetries
 Test-ExternalMergeReconciliation
+Test-PrepareMergeRunsRestoreBeforeBuild
 Test-SnapshotIncludesStructuredProgress
 Test-MalformedProgressArtifactsDoNotBreakSnapshot
 Test-ProgressMilestonesTranslateToEnglish
@@ -4737,6 +7324,8 @@ Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun
 Test-QueueStallDoesNotTriggerWhileWaitingForUserMergeDecision
 Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen
 Test-TlaMergeLockRemediation
+Test-TlaMergeLockRemediationUsesRestoreFailureReason
+Test-MergeRestoreFailurePreservesBranch
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
 Test-RunHistoryCapturesLaunchSequence
