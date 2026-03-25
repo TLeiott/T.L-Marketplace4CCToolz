@@ -177,7 +177,28 @@ function Invoke-UsageGateJson {
     }
 
     $raw = & powershell.exe @arguments
-    return ($raw | Out-String | ConvertFrom-Json)
+    $rawText = ($raw | Out-String).Trim()
+    if (-not $rawText) {
+        throw "Usage gate returned no JSON output. Args: $($arguments -join ' ')"
+    }
+
+    try {
+        return ($rawText | ConvertFrom-Json)
+    } catch {
+        throw "Usage gate returned invalid JSON: $($_.Exception.Message)`nRAW:`n$rawText"
+    }
+}
+
+function Write-UsageGateMockFile {
+    param(
+        [string]$Root,
+        [object]$Payload,
+        [string]$FileName = "usage-mock.json"
+    )
+
+    $path = Join-Path $Root $FileName
+    [System.IO.File]::WriteAllText($path, ($Payload | ConvertTo-Json -Depth 10), [System.Text.Encoding]::UTF8)
+    return $path
 }
 
 function New-TestLatestRun {
@@ -3561,7 +3582,19 @@ function Test-UsageGateWritesAutodevCacheOnFreshSuccess {
     $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     try {
-        $result = Invoke-UsageGateJson -ClaudeHome $root -MockUsageJson '{"five_hour":{"utilization":42.5,"resets_at":"2026-03-25T18:00:00Z"},"seven_day":{"utilization":22.0,"resets_at":"2026-03-30T18:00:00Z"}}'
+        $sequencePath = Write-UsageGateMockFile -Root $root -FileName "usage-success.json" -Payload @(
+            [ordered]@{
+                five_hour = [ordered]@{
+                    utilization = 42.5
+                    resets_at = "2026-03-25T18:00:00Z"
+                }
+                seven_day = [ordered]@{
+                    utilization = 22.0
+                    resets_at = "2026-03-30T18:00:00Z"
+                }
+            }
+        )
+        $result = Invoke-UsageGateJson -ClaudeHome $root -MockUsageSequencePath $sequencePath
         $cachePath = Join-Path $root "tl-autodev-usage-cache.json"
 
         Assert-True ($result.ok -eq $true) "Fresh success should mark the usage gate as available."
@@ -3582,7 +3615,19 @@ function Test-UsageGateBlocksWhenThresholdIsExceeded {
     $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     try {
-        $result = Invoke-UsageGateJson -ClaudeHome $root -ThresholdPercent 90 -MockUsageJson '{"five_hour":{"utilization":94.0,"resets_at":"2026-03-25T18:00:00Z"},"seven_day":{"utilization":35.0,"resets_at":"2026-03-30T18:00:00Z"}}'
+        $sequencePath = Write-UsageGateMockFile -Root $root -FileName "usage-blocked.json" -Payload @(
+            [ordered]@{
+                five_hour = [ordered]@{
+                    utilization = 94.0
+                    resets_at = "2026-03-25T18:00:00Z"
+                }
+                seven_day = [ordered]@{
+                    utilization = 35.0
+                    resets_at = "2026-03-30T18:00:00Z"
+                }
+            }
+        )
+        $result = Invoke-UsageGateJson -ClaudeHome $root -ThresholdPercent 90 -MockUsageSequencePath $sequencePath
 
         Assert-True ($result.ok -eq $true) "Blocked usage should still count as a fresh verified state."
         Assert-True ([string]$result.processStatus -eq "blocked") "Threshold breaches should return blocked."
@@ -3668,7 +3713,19 @@ function Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedSta
     $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     try {
-        $blockedResult = Invoke-UsageGateJson -ClaudeHome $root -MockUsageJson '{"five_hour":{"utilization":95.0,"resets_at":"2000-01-01T00:00:00Z"},"seven_day":{"utilization":20.0,"resets_at":"2026-03-30T18:00:00Z"}}'
+        $sequencePath = Write-UsageGateMockFile -Root $root -FileName "usage-preblocked.json" -Payload @(
+            [ordered]@{
+                five_hour = [ordered]@{
+                    utilization = 95.0
+                    resets_at = "2000-01-01T00:00:00Z"
+                }
+                seven_day = [ordered]@{
+                    utilization = 20.0
+                    resets_at = "2026-03-30T18:00:00Z"
+                }
+            }
+        )
+        $blockedResult = Invoke-UsageGateJson -ClaudeHome $root -MockUsageSequencePath $sequencePath
         Assert-True ([string]$blockedResult.processStatus -eq "blocked") "The setup probe should confirm a blocked state."
 
         $waitResult = Invoke-UsageGateJson -ClaudeHome $root -Mode "wait" -MockErrorKind "timeout" -PollSeconds 1 -FastPollSeconds 1 -FastWindowSeconds 1
