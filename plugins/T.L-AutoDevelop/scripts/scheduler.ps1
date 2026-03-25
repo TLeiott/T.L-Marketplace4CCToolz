@@ -5,6 +5,7 @@ param(
     [string]$TasksFile = "",
     [string]$PlanFile = "",
     [string]$EditFile = "",
+    [ValidateSet("Full", "Compact")][string]$View = "Full",
     [string]$TaskId = "",
     [string]$Decision = "",
     [string]$CommitMessage = "",
@@ -488,6 +489,9 @@ function New-LatestRunRecord {
         finalCategory = ""
         summary = ""
         feedback = ""
+        validationIssues = @()
+        failurePhase = ""
+        readOnlyPhaseConfusion = $false
         noChangeReason = ""
         investigationConclusion = ""
         reproductionConfirmed = $false
@@ -644,6 +648,8 @@ function Normalize-LatestRun {
             "finalCategory",
             "summary",
             "feedback",
+            "failurePhase",
+            "readOnlyPhaseConfusion",
             "noChangeReason",
             "investigationConclusion",
             "reproductionConfirmed",
@@ -659,6 +665,7 @@ function Normalize-LatestRun {
                 Set-ObjectProperty -Object $normalized -Name $property -Value $LatestRun.$property
             }
         }
+        Set-ObjectProperty -Object $normalized -Name "validationIssues" -Value @(Normalize-StringArray -Value $LatestRun.validationIssues)
         Set-ObjectProperty -Object $normalized -Name "actualFiles" -Value (Normalize-StringArray -Value $LatestRun.actualFiles)
     }
     if ($ResultFile -and -not $normalized.resultFile) {
@@ -682,6 +689,9 @@ function Normalize-RunRecords {
             finalCategory = [string]$run.finalCategory
             summary = [string]$run.summary
             feedback = [string]$run.feedback
+            validationIssues = @(Normalize-StringArray -Value $run.validationIssues)
+            failurePhase = [string]$run.failurePhase
+            readOnlyPhaseConfusion = [bool]$run.readOnlyPhaseConfusion
             noChangeReason = [string]$run.noChangeReason
             investigationConclusion = [string]$run.investigationConclusion
             reproductionConfirmed = [bool]$run.reproductionConfirmed
@@ -743,6 +753,13 @@ function Normalize-TaskRecord {
     }
     if ($null -eq $Task.maxEnvironmentRepairAttempts) {
         Set-ObjectProperty -Object $Task -Name "maxEnvironmentRepairAttempts" -Value 2
+    }
+    if ($null -eq $Task.lastPlannedWaveNumber) {
+        Set-ObjectProperty -Object $Task -Name "lastPlannedWaveNumber" -Value ([int]$Task.waveNumber)
+    }
+    Set-ObjectProperty -Object $Task -Name "lastPlannedBlockedBy" -Value @(Normalize-StringArray -Value $Task.lastPlannedBlockedBy)
+    if (-not $Task.lastPlanSignature) {
+        Set-ObjectProperty -Object $Task -Name "lastPlanSignature" -Value ""
     }
     if ($null -eq $Task.mergeAttemptsUsed) {
         Set-ObjectProperty -Object $Task -Name "mergeAttemptsUsed" -Value 0
@@ -1559,6 +1576,8 @@ function ConvertTo-TaskSnapshot {
         waveNumber = [int]$Task.waveNumber
         submissionOrder = [int]$Task.submissionOrder
         blockedBy = @($Task.blockedBy)
+        lastPlannedWaveNumber = [int]$Task.lastPlannedWaveNumber
+        lastPlannedBlockedBy = @(Normalize-StringArray -Value $Task.lastPlannedBlockedBy)
         declaredDependencies = @($Task.declaredDependencies)
         declaredPriority = [string]$Task.declaredPriority
         serialOnly = [bool]$Task.serialOnly
@@ -1586,6 +1605,9 @@ function ConvertTo-TaskSnapshot {
         summary = Get-TaskSummaryText -Task $Task
         finalStatus = [string]$Task.latestRun.finalStatus
         finalCategory = [string]$Task.latestRun.finalCategory
+        validationIssues = @(Normalize-StringArray -Value $Task.latestRun.validationIssues)
+        failurePhase = [string]$Task.latestRun.failurePhase
+        readOnlyPhaseConfusion = [bool]$Task.latestRun.readOnlyPhaseConfusion
         noChangeReason = [string]$Task.latestRun.noChangeReason
         actualFiles = @($Task.latestRun.actualFiles)
         plannerMetadata = $Task.plannerMetadata
@@ -1603,6 +1625,44 @@ function Write-TaskResultFile {
     param($Task)
     Ensure-ParentDirectory -Path $Task.resultFile
     [System.IO.File]::WriteAllText($Task.resultFile, ((ConvertTo-TaskSnapshot -Task $Task -RepoRoot $script:CurrentSnapshotRepoRoot) | ConvertTo-Json -Depth 24), [System.Text.Encoding]::UTF8)
+}
+
+function Get-CompactTaskSnapshot {
+    param(
+        $Task,
+        [string]$RepoRoot = $script:CurrentSnapshotRepoRoot
+    )
+
+    return [pscustomobject]@{
+        taskId = [string]$Task.taskId
+        taskText = [string]$Task.taskText
+        state = [string]$Task.state
+        waveNumber = [int]$Task.waveNumber
+        submissionOrder = [int]$Task.submissionOrder
+        blockedBy = @(Normalize-StringArray -Value $Task.blockedBy)
+        declaredDependencies = @(Normalize-StringArray -Value $Task.declaredDependencies)
+        declaredPriority = [string]$Task.declaredPriority
+        serialOnly = [bool]$Task.serialOnly
+        attemptsUsed = [int]$Task.attemptsUsed
+        attemptsRemaining = [int]$Task.attemptsRemaining
+        workerLaunchSequence = [int]$Task.workerLaunchSequence
+        environmentRepairAttemptsUsed = [int]$Task.environmentRepairAttemptsUsed
+        environmentRepairAttemptsRemaining = [int]$Task.environmentRepairAttemptsRemaining
+        mergeAttemptsUsed = [int]$Task.mergeAttemptsUsed
+        mergeAttemptsRemaining = [int]$Task.mergeAttemptsRemaining
+        summary = Get-TaskSummaryText -Task $Task
+        finalStatus = [string]$Task.latestRun.finalStatus
+        finalCategory = [string]$Task.latestRun.finalCategory
+        noChangeReason = [string]$Task.latestRun.noChangeReason
+        progress = Get-TaskProgress -RepoRoot $RepoRoot -Task $Task
+        progressArtifacts = [pscustomobject]@{
+            runDir = if ($Task.latestRun.artifacts) { [string]$Task.latestRun.artifacts.runDir } else { "" }
+            schedulerSnapshotPath = if ($Task.latestRun.artifacts) { [string]$Task.latestRun.artifacts.schedulerSnapshotPath } else { "" }
+            timelinePath = if ($Task.latestRun.artifacts) { [string]$Task.latestRun.artifacts.timelinePath } else { "" }
+            resultFile = if ($Task.resultFile) { [string]$Task.resultFile } elseif ($Task.latestRun.resultFile) { [string]$Task.latestRun.resultFile } else { "" }
+            retryContextPath = if ($Task.latestRun.artifacts) { [string]$Task.latestRun.artifacts.retryContextPath } else { "" }
+        }
+    }
 }
 
 function Write-PlannerContextFile {
@@ -1714,7 +1774,10 @@ function Is-RetryContextSemanticCategory {
     if ($value -in @(
         "PREFLIGHT_FAILED",
         "INVESTIGATION_INCONCLUSIVE",
+        "INVESTIGATION_PHASE_CONFUSION",
+        "PRIOR_ART_INSUFFICIENT",
         "FIX_PLAN_INSUFFICIENT",
+        "FIX_PLAN_PHASE_CONFUSION",
         "FIX_PLAN_DIRECTION_DRIFT"
     )) {
         return $true
@@ -1771,6 +1834,26 @@ function Get-FallbackRetryLesson {
         category = if ([string]$Run.finalCategory) { [string]$Run.finalCategory } else { "RETRY_CONTEXT" }
         feedbackExcerpt = Clip-DiscoveryBriefText -Text $feedbackText -MaxLength 260
     }
+}
+
+function Get-ValidationIssuesFromResult {
+    param($Result)
+
+    if ($null -eq $Result) { return @() }
+
+    $issues = @()
+    foreach ($candidate in @($Result.validationIssues)) {
+        $text = ([string]$candidate).Trim()
+        if ($text) { $issues += $text }
+    }
+    return @($issues | Select-Object -Unique | Select-Object -First 12)
+}
+
+function Test-ReadOnlyPhaseConfusionCategory {
+    param([string]$Category)
+
+    $value = ([string]$Category).Trim().ToUpperInvariant()
+    return $value -in @("FIX_PLAN_PHASE_CONFUSION", "INVESTIGATION_PHASE_CONFUSION")
 }
 
 function Get-RetryContextPayload {
@@ -1840,8 +1923,9 @@ function Get-RetryContextPayload {
     $latestFailureSummary = Clip-DiscoveryBriefText -Text ([string]$latestRun.summary) -MaxLength 240
     $latestFailureFeedback = Clip-DiscoveryBriefText -Text ([string]$latestRun.feedback) -MaxLength 500
     $latestInvestigationConclusion = Clip-DiscoveryBriefText -Text ([string]$latestRun.investigationConclusion) -MaxLength 180
+    $latestValidationIssues = @(Get-ValidationIssuesFromResult -Result $latestRun)
 
-    $hasSignal = $compiledLessons.Count -gt 0 -or $priorChangedFiles.Count -gt 0 -or $latestFailureSummary -or $latestFailureFeedback -or $latestInvestigationConclusion
+    $hasSignal = $compiledLessons.Count -gt 0 -or $priorChangedFiles.Count -gt 0 -or $latestFailureSummary -or $latestFailureFeedback -or $latestInvestigationConclusion -or $latestValidationIssues.Count -gt 0
     if (-not $hasSignal) { return $null }
 
     return [ordered]@{
@@ -1853,6 +1937,9 @@ function Get-RetryContextPayload {
             finalCategory = [string]$latestRun.finalCategory
             summary = $latestFailureSummary
             feedback = $latestFailureFeedback
+            validationIssues = @($latestValidationIssues)
+            failurePhase = [string]$latestRun.failurePhase
+            readOnlyPhaseConfusion = [bool]$latestRun.readOnlyPhaseConfusion
             investigationConclusion = $latestInvestigationConclusion
         }
         priorChangedFiles = @($priorChangedFiles)
@@ -2751,10 +2838,84 @@ function Get-ManualDebugReason {
     return "Repeated inconclusive investigation produced no new evidence, so another cold retry would likely be blind."
 }
 
+function Restore-RetryWavePlacement {
+    param(
+        $Task,
+        $State = $null
+    )
+
+    if (-not $Task) { return $false }
+
+    $restoredWave = if ($null -ne $Task.lastPlannedWaveNumber) { [int]$Task.lastPlannedWaveNumber } else { 0 }
+    $declaredDependencies = @(Normalize-StringArray -Value $Task.declaredDependencies)
+    $plannedDependencies = @(Normalize-StringArray -Value $Task.lastPlannedBlockedBy)
+    $hasDependencySignal = $declaredDependencies.Count -gt 0 -or $plannedDependencies.Count -gt 0
+
+    if ($restoredWave -le 0) {
+        $Task.waveNumber = 0
+        $Task.blockedBy = @()
+        return $false
+    }
+
+    if ($State) {
+        $activeWaveNumbers = @(
+            @(Get-Tasks -State $State) |
+                Where-Object {
+                    $_ -and
+                    [string]$_.taskId -ne [string]$Task.taskId -and
+                    -not (Is-TerminalState -State ([string]$_.state)) -and
+                    [int]$_.waveNumber -gt 0
+                } |
+                ForEach-Object { [int]$_.waveNumber } |
+                Sort-Object -Unique
+        )
+        $maxActiveWave = if ($activeWaveNumbers.Count -gt 0) {
+            ($activeWaveNumbers | Measure-Object -Maximum).Maximum
+        } else {
+            0
+        }
+        if ($maxActiveWave -gt 0 -and $restoredWave -gt ($maxActiveWave + 1)) {
+            $Task.waveNumber = 0
+            $Task.blockedBy = @()
+            return $false
+        }
+
+        $taskIndex = @{}
+        foreach ($candidate in @(Get-Tasks -State $State)) {
+            if (-not $candidate) { continue }
+            $taskIndex[[string]$candidate.taskId] = $candidate
+        }
+
+        foreach ($dependencyId in @($plannedDependencies + $declaredDependencies | Select-Object -Unique)) {
+            $dependencyTask = $taskIndex[[string]$dependencyId]
+            if ($null -eq $dependencyTask) {
+                $Task.waveNumber = 0
+                $Task.blockedBy = @()
+                return $false
+            }
+            if ([string]$dependencyTask.taskId -eq [string]$Task.taskId) {
+                $Task.waveNumber = 0
+                $Task.blockedBy = @()
+                return $false
+            }
+            if (-not (Is-TerminalState -State ([string]$dependencyTask.state)) -and [int]$dependencyTask.waveNumber -ge $restoredWave) {
+                $Task.waveNumber = 0
+                $Task.blockedBy = @()
+                return $false
+            }
+        }
+    }
+
+    $Task.waveNumber = $restoredWave
+    $Task.blockedBy = if ($plannedDependencies.Count -gt 0) { @($plannedDependencies) } else { @($declaredDependencies) }
+    return (-not $hasDependencySignal -or $Task.blockedBy.Count -gt 0)
+}
+
 function Get-RetryableResult {
     param(
         $Task,
-        [string]$Reason
+        [string]$Reason,
+        $State = $null
     )
 
     $hasBudget = ([int]$Task.attemptsUsed -lt [int]$Task.maxAttempts)
@@ -2762,12 +2923,14 @@ function Get-RetryableResult {
         $Task.state = "retry_scheduled"
         $Task.retryScheduled = $true
         $Task.waitingUserTest = $false
-        $Task.waveNumber = 0
-        $Task.blockedBy = @()
+        $restoredWave = Restore-RetryWavePlacement -Task $Task -State $State
         $Task.mergeState = ""
         $Task.merge.state = ""
         $Task.merge.reason = $Reason
         $Task.manualDebugReason = ""
+        if (-not $restoredWave) {
+            $Task.waveNumber = 0
+        }
     } else {
         $Task.state = "completed_failed_terminal"
         $Task.retryScheduled = $false
@@ -2802,7 +2965,8 @@ function Get-ManualDebugResult {
 function Get-EnvironmentRetryableResult {
     param(
         $Task,
-        [string]$Reason
+        [string]$Reason,
+        $State = $null
     )
 
     if ([int]$Task.attemptsUsed -gt 0) {
@@ -2814,20 +2978,22 @@ function Get-EnvironmentRetryableResult {
     $Task.lastEnvironmentFailureCategory = [string]$Reason
     $Task.retryScheduled = $true
     $Task.waitingUserTest = $false
-    $Task.waveNumber = 0
-    $Task.blockedBy = @()
+    $restoredWave = Restore-RetryWavePlacement -Task $Task -State $State
     $Task.mergeState = ""
     $Task.merge.state = ""
     $Task.merge.reason = [string]$Reason
     $Task.merge.branchName = ""
     $Task.manualDebugReason = ""
+    if (-not $restoredWave) {
+        $Task.waveNumber = 0
+    }
 
     if ([int]$Task.environmentRepairAttemptsUsed -lt [int]$Task.maxEnvironmentRepairAttempts) {
         $Task.state = "environment_retry_scheduled"
         return
     }
 
-    Get-RetryableResult -Task $Task -Reason ([string]$Reason)
+    Get-RetryableResult -Task $Task -Reason ([string]$Reason) -State $State
 }
 
 function Get-MergeRetryableResult {
@@ -3034,6 +3200,7 @@ function Apply-PipelineResultToTask {
     param(
         $Task,
         $PipelineResult,
+        $State = $null,
         [string]$RepoRoot = ""
     )
 
@@ -3042,6 +3209,9 @@ function Apply-PipelineResultToTask {
     Set-ObjectProperty -Object $Task.latestRun -Name "finalCategory" -Value ([string]$PipelineResult.finalCategory)
     Set-ObjectProperty -Object $Task.latestRun -Name "summary" -Value ([string]$PipelineResult.summary)
     Set-ObjectProperty -Object $Task.latestRun -Name "feedback" -Value ([string]$PipelineResult.feedback)
+    Set-ObjectProperty -Object $Task.latestRun -Name "validationIssues" -Value @(Get-ValidationIssuesFromResult -Result $PipelineResult)
+    Set-ObjectProperty -Object $Task.latestRun -Name "failurePhase" -Value ([string]$PipelineResult.phase)
+    Set-ObjectProperty -Object $Task.latestRun -Name "readOnlyPhaseConfusion" -Value ([bool](Test-ReadOnlyPhaseConfusionCategory -Category ([string]$PipelineResult.finalCategory)))
     Set-ObjectProperty -Object $Task.latestRun -Name "noChangeReason" -Value ([string]$PipelineResult.noChangeReason)
     Set-ObjectProperty -Object $Task.latestRun -Name "investigationConclusion" -Value ([string]$PipelineResult.investigationConclusion)
     Set-ObjectProperty -Object $Task.latestRun -Name "reproductionConfirmed" -Value ([bool]$PipelineResult.reproductionConfirmed)
@@ -3070,6 +3240,9 @@ function Apply-PipelineResultToTask {
         finalCategory = [string]$PipelineResult.finalCategory
         summary = [string]$PipelineResult.summary
         feedback = [string]$PipelineResult.feedback
+        validationIssues = @(Get-ValidationIssuesFromResult -Result $PipelineResult)
+        failurePhase = [string]$PipelineResult.phase
+        readOnlyPhaseConfusion = [bool](Test-ReadOnlyPhaseConfusionCategory -Category ([string]$PipelineResult.finalCategory))
         noChangeReason = [string]$PipelineResult.noChangeReason
         investigationConclusion = [string]$PipelineResult.investigationConclusion
         reproductionConfirmed = [bool]$PipelineResult.reproductionConfirmed
@@ -3086,7 +3259,7 @@ function Apply-PipelineResultToTask {
     }
 
     if (Is-EnvironmentFailureCategory -Category ([string]$PipelineResult.finalCategory)) {
-        Get-EnvironmentRetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
+        Get-EnvironmentRetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory) -State $State
         $Task.latestRun.branchName = ""
         return
     }
@@ -3115,7 +3288,7 @@ function Apply-PipelineResultToTask {
                 $Task.merge.branchName = ""
                 $Task.manualDebugReason = ""
             } else {
-                Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
+                Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory) -State $State
             }
         }
         "FAILED" {
@@ -3127,10 +3300,10 @@ function Apply-PipelineResultToTask {
                     break
                 }
             }
-            Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
+            Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory) -State $State
         }
         default {
-            Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory)
+            Get-RetryableResult -Task $Task -Reason ([string]$PipelineResult.finalCategory) -State $State
         }
     }
 
@@ -3140,6 +3313,7 @@ function Apply-PipelineResultToTask {
 function Reconcile-TaskState {
     param(
         $Task,
+        $State = $null,
         [string]$RepoRoot = ""
     )
 
@@ -3153,7 +3327,7 @@ function Reconcile-TaskState {
                 ($lateStatus -eq "NO_CHANGE" -and $lateCategory -eq "NO_CHANGE_ALREADY_SATISFIED")
             )
         if ($canRecoverFromLateResult) {
-            Apply-PipelineResultToTask -Task $Task -PipelineResult $latePipelineResult -RepoRoot $RepoRoot
+            Apply-PipelineResultToTask -Task $Task -PipelineResult $latePipelineResult -State $State -RepoRoot $RepoRoot
             return
         }
     }
@@ -3186,11 +3360,11 @@ function Reconcile-TaskState {
 
     $pipelineResult = Read-JsonFileBestEffort -Path $Task.latestRun.resultFile
     if ($pipelineResult) {
-        Apply-PipelineResultToTask -Task $Task -PipelineResult $pipelineResult -RepoRoot $RepoRoot
+        Apply-PipelineResultToTask -Task $Task -PipelineResult $pipelineResult -State $State -RepoRoot $RepoRoot
         return
     }
 
-    Get-EnvironmentRetryableResult -Task $Task -Reason "WORKER_EXITED_WITHOUT_RESULT"
+    Get-EnvironmentRetryableResult -Task $Task -Reason "WORKER_EXITED_WITHOUT_RESULT" -State $State
 }
 
 function Reconcile-State {
@@ -3204,7 +3378,7 @@ function Reconcile-State {
         try {
             $previousState = [string]$task.state
             Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
-            Reconcile-TaskState -Task $task -RepoRoot $State.repoRoot
+            Reconcile-TaskState -Task $task -State $State -RepoRoot $State.repoRoot
             Ensure-TaskShape -Task $task -RepoRoot $State.repoRoot
             if ($EventsFile -and $previousState -in @("pending_merge", "merge_retry_scheduled", "merge_prepared", "waiting_user_test") -and [string]$task.state -eq "merged") {
                 Append-StateEvent -EventsFile $EventsFile -TaskId ([string]$task.taskId) -Kind "external_merge_detected" -Message "Task was marked merged because its branch is already reachable from HEAD." -Data @{
@@ -3324,6 +3498,9 @@ function New-TaskRecord {
         retryScheduled = $false
         waitingUserTest = $false
         mergeState = ""
+        lastPlannedWaveNumber = 0
+        lastPlannedBlockedBy = @()
+        lastPlanSignature = ""
         state = "queued"
         plannerMetadata = if ($InputTask.plannerMetadata) { $InputTask.plannerMetadata } else { [pscustomobject]@{} }
         plannerFeedback = [pscustomobject]@{}
@@ -3814,8 +3991,125 @@ function Get-SnapshotPayload {
     }
 }
 
+function Get-SnapshotCommonData {
+    param(
+        $State,
+        [string]$EventsFile = "",
+        [object[]]$ReconcileErrors = @()
+    )
+
+    $script:CurrentSnapshotRepoRoot = [string]$State.repoRoot
+    $tasks = @((Get-Tasks -State $State) | Sort-Object waveNumber, submissionOrder)
+    $knownBranches = Get-KnownBranches -State $State
+    $unknownBranches = Get-UnknownAutoBranches -RepoRoot $State.repoRoot -KnownBranches $knownBranches
+    $nextMergeTask = Get-NextMergeCandidate -State $State
+    $mergePreparedTask = Get-MergePreparedTask -State $State
+    $breaker = Update-CircuitBreakerState -State $State
+    $usageProjection = Get-UsageProjection -State $State
+    $plannerFeedbackSummary = Get-PlannerFeedbackSummary -State $State
+    $completedTaskBriefs = Get-CompletedTaskBriefs -State $State
+    $recentEvents = Get-RecentQueueEvents -EventsFile $EventsFile
+    $stateIntegrity = Get-StateIntegritySummary -State $State
+    $startableTaskIds = @(Get-StartableTaskIds -State $State)
+
+    return [pscustomobject]@{
+        tasks = $tasks
+        unknownBranches = @($unknownBranches)
+        nextMergeTask = $nextMergeTask
+        mergePreparedTask = $mergePreparedTask
+        breaker = $breaker
+        usageProjection = $usageProjection
+        plannerFeedbackSummary = $plannerFeedbackSummary
+        completedTaskBriefs = @($completedTaskBriefs)
+        recentEvents = @($recentEvents)
+        stateIntegrity = $stateIntegrity
+        startableTaskIds = @($startableTaskIds)
+    }
+}
+
+function Get-SnapshotPayloadCompact {
+    param(
+        $State,
+        [string]$EventsFile = "",
+        [object[]]$ReconcileErrors = @()
+    )
+
+    $common = Get-SnapshotCommonData -State $State -EventsFile $EventsFile -ReconcileErrors $ReconcileErrors
+    $compactTasks = @($common.tasks | ForEach-Object { Get-CompactTaskSnapshot -Task $_ -RepoRoot $State.repoRoot })
+    $queueStall = Get-QueueStallSummary -State $State -StartableTaskIds $common.startableTaskIds -NextMergeTask $common.nextMergeTask -MergePreparedTask $common.mergePreparedTask -CircuitBreaker $common.breaker -ReconcileErrors $ReconcileErrors
+    $runningTaskProgress = @($compactTasks | Where-Object { $_.state -eq "running" } | ForEach-Object {
+        [pscustomobject]@{
+            taskId = [string]$_.taskId
+            taskText = [string]$_.taskText
+            waveNumber = [int]$_.waveNumber
+            progress = $_.progress
+        }
+    })
+    $queuedTaskProgress = @($compactTasks | Where-Object { $_.state -in @("queued", "retry_scheduled", "environment_retry_scheduled", "manual_debug_needed", "merge_retry_scheduled") } | ForEach-Object {
+        [pscustomobject]@{
+            taskId = [string]$_.taskId
+            taskText = [string]$_.taskText
+            waveNumber = [int]$_.waveNumber
+            progress = $_.progress
+        }
+    })
+    $mergeTaskProgress = if ($common.mergePreparedTask) {
+        [pscustomobject]@{
+            taskId = [string]$common.mergePreparedTask.taskId
+            taskText = [string]$common.mergePreparedTask.taskText
+            progress = Get-TaskProgress -RepoRoot $State.repoRoot -Task $common.mergePreparedTask
+        }
+    } elseif ($common.nextMergeTask) {
+        [pscustomobject]@{
+            taskId = [string]$common.nextMergeTask.taskId
+            taskText = [string]$common.nextMergeTask.taskText
+            progress = Get-TaskProgress -RepoRoot $State.repoRoot -Task $common.nextMergeTask
+        }
+    } else {
+        $null
+    }
+
+    return [pscustomobject]@{
+        repoRoot = $State.repoRoot
+        updatedAt = [string]$State.updatedAt
+        lastPlanAppliedAt = [string]$State.lastPlanAppliedAt
+        tasks = $compactTasks
+        runningTaskIds = @($common.tasks | Where-Object { $_.state -eq "running" } | ForEach-Object { [string]$_.taskId })
+        queuedTaskIds = @($common.tasks | Where-Object { $_.state -eq "queued" } | ForEach-Object { [string]$_.taskId })
+        retryTaskIds = @($common.tasks | Where-Object { $_.state -eq "retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+        environmentRetryTaskIds = @($common.tasks | Where-Object { $_.state -eq "environment_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+        manualDebugTaskIds = @($common.tasks | Where-Object { $_.state -eq "manual_debug_needed" } | ForEach-Object { [string]$_.taskId })
+        mergeRetryTaskIds = @($common.tasks | Where-Object { $_.state -eq "merge_retry_scheduled" } | ForEach-Object { [string]$_.taskId })
+        pendingMergeTaskIds = @($common.tasks | Where-Object { $_.state -eq "pending_merge" } | ForEach-Object { [string]$_.taskId })
+        startableTaskIds = @($common.startableTaskIds)
+        nextMergeTaskId = if ($common.nextMergeTask) { [string]$common.nextMergeTask.taskId } else { "" }
+        mergePreparedTaskId = if ($common.mergePreparedTask) { [string]$common.mergePreparedTask.taskId } else { "" }
+        mergePreparedPreview = if ($common.mergePreparedTask) { Get-TaskMergePreview -RepoRoot $State.repoRoot -Task $common.mergePreparedTask } else { $null }
+        unknownAutoBranches = @($common.unknownBranches)
+        plannerFeedbackSummary = $common.plannerFeedbackSummary
+        completedTaskBriefs = @($common.completedTaskBriefs)
+        usageProjection = $common.usageProjection
+        stateIntegrity = $common.stateIntegrity
+        hasIntegrityWarnings = [bool]($common.stateIntegrity.status -eq "warning")
+        circuitBreaker = $common.breaker
+        queueStall = $queueStall
+        needsReplan = [bool]($queueStall.status -eq "stalled")
+        queueProgressSummary = Get-QueueProgressSummary -State $State
+        runningTaskProgress = $runningTaskProgress
+        queuedTaskProgress = $queuedTaskProgress
+        mergeTaskProgress = $mergeTaskProgress
+        recentQueueEvents = @($common.recentEvents)
+        schedulerHealthy = (@($ReconcileErrors).Count -eq 0)
+        reconcileErrors = @($ReconcileErrors)
+        view = "Compact"
+    }
+}
+
 function Snapshot-Queue {
-    param([string]$ResolvedSolutionPath)
+    param(
+        [string]$ResolvedSolutionPath,
+        [string]$View = "Full"
+    )
 
     $context = Get-SchedulerContext -ResolvedSolutionPath $ResolvedSolutionPath
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
@@ -3824,6 +4118,9 @@ function Snapshot-Queue {
         $reconcileErrors = @(Reconcile-State -State $state -EventsFile $context.paths.eventsFile)
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
         Save-State -StateFile $context.paths.stateFile -State $state
+        if ([string]$View -eq "Compact") {
+            return (Get-SnapshotPayloadCompact -State $state -EventsFile $context.paths.eventsFile -ReconcileErrors $reconcileErrors)
+        }
         return (Get-SnapshotPayload -State $state -EventsFile $context.paths.eventsFile -ReconcileErrors $reconcileErrors)
     } finally {
         Release-Lock -LockHandle $lock
@@ -4171,6 +4468,9 @@ function Apply-Plan {
 
             if ($assignment.waveNumber) { $task.waveNumber = [int]$assignment.waveNumber }
             Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $assignment.blockedBy))
+            Set-ObjectProperty -Object $task -Name "lastPlannedWaveNumber" -Value ([int]$task.waveNumber)
+            Set-ObjectProperty -Object $task -Name "lastPlannedBlockedBy" -Value ([object[]](Normalize-StringArray -Value $task.blockedBy))
+            Set-ObjectProperty -Object $task -Name "lastPlanSignature" -Value ("wave={0};blockedBy={1}" -f ([int]$task.waveNumber), ((@($task.blockedBy) | ForEach-Object { [string]$_ }) -join ","))
             if ($assignment.plannerMetadata) {
                 $task.plannerMetadata = $assignment.plannerMetadata
             }
@@ -4387,7 +4687,7 @@ function Run-Task {
             $task = Get-TaskById -State $state -TaskId $TaskId
             if ($task) {
                 Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
-                Get-EnvironmentRetryableResult -Task $task -Reason "WORKER_START_FAILED"
+                Get-EnvironmentRetryableResult -Task $task -Reason "WORKER_START_FAILED" -State $state
                 $task.latestRun.processId = 0
                 $task.latestRun.finalStatus = "ERROR"
                 $task.latestRun.finalCategory = "WORKER_START_FAILED"
@@ -4480,7 +4780,7 @@ function Run-Task {
             throw "Task '$TaskId' disappeared during execution."
         }
         Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
-        Apply-PipelineResultToTask -Task $task -PipelineResult $pipelineResult -RepoRoot $context.repoRoot
+        Apply-PipelineResultToTask -Task $task -PipelineResult $pipelineResult -State $state -RepoRoot $context.repoRoot
         Update-TaskUsageEstimate -State $state -Task $task
         Write-TaskResultFile -Task $task
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
@@ -4673,12 +4973,12 @@ function Prepare-Merge {
         } else {
             $requiresWorkerRetry = ($mergeAttempt.phase -eq "merge")
             if ($requiresWorkerRetry) {
-                Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
+                Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason) -State $state
                 Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$selectedTask.latestRun.branchName)
             } else {
                 $scheduled = Get-MergeRetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
                 if (-not $scheduled) {
-                    Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason)
+                    Get-RetryableResult -Task $selectedTask -Reason ([string]$mergeResult.reason) -State $state
                     Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$selectedTask.latestRun.branchName)
                 }
             }
@@ -4881,7 +5181,7 @@ function Resolve-Merge {
                 Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$task.latestRun.branchName)
             }
             "requeue" {
-                Get-RetryableResult -Task $task -Reason ([string]$operation.reason)
+                Get-RetryableResult -Task $task -Reason ([string]$operation.reason) -State $state
                 Remove-TaskBranch -RepoRoot $context.repoRoot -BranchName ([string]$task.latestRun.branchName)
             }
         }
@@ -4944,7 +5244,7 @@ switch ($Mode) {
         break
     }
     "snapshot-queue" {
-        Write-JsonOutput -Object (Snapshot-Queue -ResolvedSolutionPath $resolvedSolutionPath)
+        Write-JsonOutput -Object (Snapshot-Queue -ResolvedSolutionPath $resolvedSolutionPath -View $View)
         break
     }
     "register-tasks" {

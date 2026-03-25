@@ -64,6 +64,8 @@ Read the returned JSON and report:
   - `queueStall`
   - `circuitBreaker`
 
+When you need a queue snapshot outside of `prepare-environment`, prefer `snapshot-queue -View Compact` for routine reads and only use the full view for deep debugging.
+
 Interpretation:
 - `status == "ready"`: report that AutoDevelop is ready
 - `status == "cleaned"`: report what was cleaned and that AutoDevelop is now ready

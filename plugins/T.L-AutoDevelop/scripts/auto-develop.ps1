@@ -139,11 +139,15 @@ $retryContextState = [ordered]@{
         finalCategory = ""
         summary = ""
         feedback = ""
+        validationIssues = @()
+        failurePhase = ""
+        readOnlyPhaseConfusion = $false
         investigationConclusion = ""
     }
     priorChangedFiles = @()
     retryLessons = @()
 }
+$resultValidationIssues = @()
 $workerBriefsState = [ordered]@{
     loaded = $false
     path = ""
@@ -282,6 +286,9 @@ function Get-RetryContextState {
             finalCategory = ""
             summary = ""
             feedback = ""
+            validationIssues = @()
+            failurePhase = ""
+            readOnlyPhaseConfusion = $false
             investigationConclusion = ""
         }
         priorChangedFiles = @()
@@ -308,6 +315,9 @@ function Get-RetryContextState {
         finalCategory = if ($context.latestFailure) { [string]$context.latestFailure.finalCategory } else { "" }
         summary = if ($context.latestFailure) { [string]$context.latestFailure.summary } else { "" }
         feedback = if ($context.latestFailure) { [string]$context.latestFailure.feedback } else { "" }
+        validationIssues = if ($context.latestFailure) { @($context.latestFailure.validationIssues | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique) } else { @() }
+        failurePhase = if ($context.latestFailure) { [string]$context.latestFailure.failurePhase } else { "" }
+        readOnlyPhaseConfusion = if ($context.latestFailure) { [bool]$context.latestFailure.readOnlyPhaseConfusion } else { $false }
         investigationConclusion = if ($context.latestFailure) { [string]$context.latestFailure.investigationConclusion } else { "" }
     }
 
@@ -329,6 +339,9 @@ function Get-RetryContextState {
         $latestFailure.finalCategory -or
         $latestFailure.summary -or
         $latestFailure.feedback -or
+        $latestFailure.validationIssues.Count -gt 0 -or
+        $latestFailure.failurePhase -or
+        $latestFailure.readOnlyPhaseConfusion -or
         $latestFailure.investigationConclusion -or
         $priorChangedFiles.Count -gt 0 -or
         $retryLessons.Count -gt 0
@@ -368,6 +381,15 @@ function Format-RetryContextPromptBlock {
     }
     if ($RetryContext.latestFailure.feedback) {
         [void]$lines.Add("LATEST FAILURE FEEDBACK: $([string]$RetryContext.latestFailure.feedback)")
+    }
+    if (@($RetryContext.latestFailure.validationIssues).Count -gt 0) {
+        [void]$lines.Add("LATEST FAILURE VALIDATION ISSUES:`n$(Format-BulletList -Items @($RetryContext.latestFailure.validationIssues) -MaxItems 8 -EmptyText '- None')")
+    }
+    if ($RetryContext.latestFailure.failurePhase) {
+        [void]$lines.Add("LATEST FAILURE PHASE: $([string]$RetryContext.latestFailure.failurePhase)")
+    }
+    if ($RetryContext.latestFailure.readOnlyPhaseConfusion) {
+        [void]$lines.Add("LATEST FAILURE READ-ONLY PHASE CONFUSION: YES")
     }
     if ($RetryContext.latestFailure.investigationConclusion) {
         [void]$lines.Add("LATEST INVESTIGATION CONCLUSION: $([string]$RetryContext.latestFailure.investigationConclusion)")
@@ -1386,6 +1408,9 @@ function Get-PriorArtRequirement {
     if ($RetryContext -and $RetryContext.loaded) {
         $retryParts = [System.Collections.ArrayList]::new()
         if ($RetryContext.latestFailure.feedback) { [void]$retryParts.Add([string]$RetryContext.latestFailure.feedback) }
+        foreach ($issue in @($RetryContext.latestFailure.validationIssues | Select-Object -First 6)) {
+            if ($issue) { [void]$retryParts.Add([string]$issue) }
+        }
         foreach ($lesson in @($RetryContext.retryLessons | Select-Object -First 3)) {
             if ($lesson.feedbackExcerpt) { [void]$retryParts.Add([string]$lesson.feedbackExcerpt) }
         }
@@ -1473,6 +1498,87 @@ One sentence describing which existing path is being reused or extended.
 "@
 }
 
+function Get-ConcretePathToken {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+    $value = ([string]$Text).Trim()
+    if (-not $value -or $value -match '^<') { return "" }
+
+    $value = $value -replace '^\*+\s*', ''
+    $value = $value -replace '\s*\*+$', ''
+    $value = $value -replace '^[`'']+', ''
+    $value = $value -replace '[`'']+$', ''
+
+    $match = [regex]::Match(
+        $value,
+        '(?<path>[\w\-.\\/]+\.(csproj|razor|css|js|ts|xaml|cs))(?:[:#][^\s\)]*)?',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if (-not $match.Success) { return "" }
+
+    return (Normalize-RepoRelativePath -Path $match.Groups['path'].Value)
+}
+
+function Get-ReadOnlyPhaseConfusionPatterns {
+    return @(
+        '(?i)\bwaiting for permission\b',
+        '(?i)\bplease approve\b',
+        '(?i)\bapprove the (file edit|prompt above|file write)\b',
+        '(?i)\bonce approved\b',
+        '(?i)\bawaiting write permission\b',
+        '(?i)\bpermission needed to write\b',
+        '(?i)\bwaiting for approval\b'
+    )
+}
+
+function Test-ReadOnlyPhaseConfusion {
+    param([string]$Text)
+
+    if (-not $Text) { return $false }
+    foreach ($pattern in @(Get-ReadOnlyPhaseConfusionPatterns)) {
+        if ([string]$Text -match $pattern) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-ReadOnlyPhaseConfusionIssue {
+    return "Output contains approval or permission chatter that is invalid in this read-only phase."
+}
+
+function Test-ReadOnlyPhaseConfusionIssuePresent {
+    param([string[]]$Issues = @())
+
+    $expected = Get-ReadOnlyPhaseConfusionIssue
+    return (@($Issues | Where-Object { $_ }) -contains $expected)
+}
+
+function Sanitize-ReadOnlyPhaseText {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+
+    $filtered = [System.Collections.ArrayList]::new()
+    foreach ($line in ([string]$Text -split "`r?`n")) {
+        $keepLine = $true
+        foreach ($pattern in @(Get-ReadOnlyPhaseConfusionPatterns)) {
+            if ($line -match $pattern) {
+                $keepLine = $false
+                break
+            }
+        }
+        if ($keepLine) {
+            [void]$filtered.Add($line)
+        }
+    }
+
+    $result = (($filtered | ForEach-Object { [string]$_ }) -join "`n")
+    $result = [regex]::Replace($result, '(\r?\n){3,}', "`n`n")
+    return $result.Trim()
+}
+
 function Get-PriorArtReferenceFiles {
     param(
         [string[]]$Entries = @(),
@@ -1485,10 +1591,7 @@ function Get-PriorArtReferenceFiles {
         if (-not $value -or $value -match '^<') { continue }
         if ($value -match '^(?i)\s*(rg|ripgrep|git grep|select-string)\b') { continue }
 
-        $match = [regex]::Match($value, '^(?<path>[\w\-.\\/]+\.(razor|cs|css|js|ts|xaml|csproj))(?:[:#].*)?$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if (-not $match.Success) { continue }
-
-        $path = Normalize-RepoRelativePath -Path $match.Groups['path'].Value
+        $path = Get-ConcretePathToken -Text $value
         if ($path) {
             [void]$validated.Add($path)
         }
@@ -2746,7 +2849,8 @@ function Write-ResultJson {
         [bool]$targetedVerificationPassed = $false,
         [string]$plannerEffortClass = "UNKNOWN",
         [string]$pipelineProfile = "COMPLEX",
-        $directionCheck = $null
+        $directionCheck = $null,
+        [string[]]$validationIssues = @()
     )
     $metricsSummary = Get-PhaseMetricsSummary
     $retryLessons = @(Get-RetryLessonsFromFeedbackHistory -History $feedbackHistory -RunAttemptNumber $currentRunAttemptNumber)
@@ -2766,6 +2870,7 @@ function Write-ResultJson {
         taskName = $TaskName
         severity = $severity
         summary = $summary
+        validationIssues = @($validationIssues)
         attempts = Get-TotalAttempts
         attemptsByPhase = $attemptsByPhase
         artifacts = [ordered]@{
@@ -3095,8 +3200,8 @@ function Get-PlanValidation {
     $referenceFiles = [System.Collections.ArrayList]::new()
     $reusePath = ""
 
-    if ($Plan -match "Freigabe bereit|approval pending|plan ready for approval") {
-        [void]$issues.Add("Plan contains UI or approval text.")
+    if (Test-ReadOnlyPhaseConfusion -Text $Plan -or $Plan -match "Freigabe bereit|approval pending|plan ready for approval") {
+        [void]$issues.Add((Get-ReadOnlyPhaseConfusionIssue))
     }
     if ($Plan -notmatch "##\s*(Goal|Ziel)") { [void]$issues.Add("Section ## Goal is missing.") }
     if ($Plan -notmatch "##\s*(Files|Dateien)") { [void]$issues.Add("Section ## Files is missing.") }
@@ -3108,10 +3213,10 @@ function Get-PlanValidation {
     $nonEmpty = @($Plan -split "`n" | Where-Object { $_.Trim() -ne "" })
     if ($nonEmpty.Count -lt 10) { [void]$issues.Add("Plan is too short.") }
 
-    $pathMatches = [regex]::Matches($Plan, "(?im)^\s*-\s*(Path|Pfad)\s*:\s*(.+)$")
+    $pathMatches = [regex]::Matches($Plan, "(?im)^\s*-\s*(?:\*\*)?(Path|Pfad)(?:\*\*)?\s*:\s*(.+)$")
     foreach ($match in $pathMatches) {
-        $value = $match.Groups[2].Value.Trim()
-        if ($value -and $value -notmatch "^<" -and $value -match "(\\|/|\*|\.[A-Za-z0-9]{1,8}\b)") {
+        $value = Get-ConcretePathToken -Text $match.Groups[2].Value
+        if ($value) {
             [void]$targets.Add($value)
         }
     }
@@ -3621,16 +3726,16 @@ try {
     Write-Host "[VALIDATE] Checking git status..."
     $r = Invoke-NativeCommand git @("rev-parse", "--is-inside-work-tree")
     if ($r.output -ne "true") {
-        Write-ResultJson -status "ERROR" -finalCategory "VALIDATION_ERROR" -summary "No git repository was found." -error "No git repository was found." -phase "VALIDATE"
+        Write-ResultJson -status "ERROR" -finalCategory "VALIDATION_ERROR" -summary "No git repository was found." -error "No git repository was found." -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
     $r = Invoke-NativeCommand git @("status", "--porcelain")
     if ($r.output) {
-        Write-ResultJson -status "ERROR" -finalCategory "DIRTY_WORKTREE" -summary "The working tree is not clean." -error "The working tree is not clean.`nDirty files:`n$($r.output)" -phase "VALIDATE"
+        Write-ResultJson -status "ERROR" -finalCategory "DIRTY_WORKTREE" -summary "The working tree is not clean." -error "The working tree is not clean.`nDirty files:`n$($r.output)" -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
     if (-not (Test-Path $SolutionPath)) {
-        Write-ResultJson -status "ERROR" -finalCategory "MISSING_SOLUTION" -summary "The solution was not found." -error "Solution not found: $SolutionPath" -phase "VALIDATE"
+        Write-ResultJson -status "ERROR" -finalCategory "MISSING_SOLUTION" -summary "The solution was not found." -error "Solution not found: $SolutionPath" -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
 
@@ -3692,7 +3797,7 @@ try {
     Write-Host "[WORKTREE] Erstelle $branchName..."
     $r = Invoke-NativeCommand git @("worktree", "add", $worktreePath, "-b", $branchName)
     if ($r.exitCode -ne 0) {
-        Write-ResultJson -status "ERROR" -finalCategory "WORKTREE_ERROR" -summary "The worktree could not be created." -error $r.output -phase "WORKTREE"
+        Write-ResultJson -status "ERROR" -finalCategory "WORKTREE_ERROR" -summary "The worktree could not be created." -error $r.output -phase "WORKTREE" -validationIssues $resultValidationIssues
         exit 1
     }
 
@@ -3824,7 +3929,7 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
             $currentPhase = "INVESTIGATE"
             $attemptsByPhase.investigate = $investigateAttempt
             Write-Host "[INVESTIGATE] Attempt $investigateAttempt/$CONST_INVESTIGATION_ATTEMPTS..."
-            $historyText = Format-FeedbackHistory -History $feedbackHistory -MaxEntries 2 -MaxChars 1200
+            $historyText = Sanitize-ReadOnlyPhaseText -Text (Format-FeedbackHistory -History $feedbackHistory -MaxEntries 2 -MaxChars 1200)
             $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
             $investigationTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
             $investigationContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $investigationTargets
@@ -3834,6 +3939,7 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
             $investigatePrompt = @"
 Investigate the task read-only and decide whether a code change is required. Also assess whether an automated bug reproduction through tests is worthwhile.
 Be concise. TARGET_FILES may contain at most 5 entries. ROOT_CAUSE and NEXT_ACTION may each use at most 2 sentences.
+This is a read-only phase. Do not ask for approval, do not mention write access or blocked edits, and do not say you are waiting for permission.
 
 TASK:
 $taskPrompt
@@ -3855,7 +3961,7 @@ $investigationPriorArtBlock
 PRIOR FEEDBACK:
 $historyText
 
-$retryContextInvestigateBlock
+$(Sanitize-ReadOnlyPhaseText -Text $retryContextInvestigateBlock)
 
 OUTPUT FORMAT:
 RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
@@ -3876,8 +3982,10 @@ $investigationPriorArtOutputBlock
                 continue
             }
 
-            $investigationOutput = $investigateResult.output.Trim()
-            Save-Artifact -Name "investigation-v$investigateAttempt.txt" -Content $investigationOutput | Out-Null
+            $rawInvestigationOutput = $investigateResult.output.Trim()
+            Save-Artifact -Name "investigation-v$investigateAttempt.txt" -Content $rawInvestigationOutput | Out-Null
+            $investigationPhaseConfusion = Test-ReadOnlyPhaseConfusion -Text $rawInvestigationOutput
+            $investigationOutput = Sanitize-ReadOnlyPhaseText -Text $rawInvestigationOutput
             $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
             $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($investigationTargets + $investigationVerdict.targets) -RetryContext $retryContextState
             $investigationConclusion = $investigationVerdict.result
@@ -3892,10 +4000,16 @@ $investigationPriorArtOutputBlock
             $investigationVerdict.referenceFiles = @($priorArtValidation.referenceFiles)
             $investigationVerdict.referenceFindings = [string]$priorArtValidation.referenceFindings
             $investigationVerdict.reuseStrategy = [string]$priorArtValidation.reuseStrategy
+            if ($investigationPhaseConfusion) {
+                $investigationVerdict.result = "INCONCLUSIVE"
+                $investigationConclusion = "INVESTIGATION_PHASE_CONFUSION"
+                Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_PHASE_CONFUSION" -Feedback (Get-ReadOnlyPhaseConfusionIssue)
+                Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation output contained approval or permission chatter invalid in a read-only phase." -Category "INVESTIGATION_PHASE_CONFUSION"
+            }
             Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation result: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets; nextPhase = $investigationVerdict.nextPhase }
             Write-SchedulerSnapshot
 
-            if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
+            if (-not $investigationPhaseConfusion -and $investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                 $investigationVerdict.result = "CHANGE_NEEDED"
                 $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
                 $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
@@ -3953,13 +4067,19 @@ REASON:
                 break
             }
 
-            Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_INCONCLUSIVE" -Feedback $investigationOutput
+            if (-not $investigationPhaseConfusion) {
+                Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_INCONCLUSIVE" -Feedback $investigationOutput
+            }
             for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
                 $repairReasons = @("Your output was not specific enough for the pipeline to continue automatically.")
                 if ($priorArtRequirement.required -and $priorArtValidation -and @($priorArtValidation.issues).Count -gt 0) {
                     $repairReasons += @($priorArtValidation.issues)
                 }
-                $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons $repairReasons -PreviousOutput $investigationOutput
+                if ($investigationPhaseConfusion) {
+                    $repairReasons += "This is a read-only phase. Do not ask for approval, mention write access, or say you are waiting for permission."
+                }
+                $repairFailureCode = if ($investigationPhaseConfusion) { "INVESTIGATION_PHASE_CONFUSION" } else { "INVESTIGATION_INCONCLUSIVE" }
+                $repairBlock = Get-RepairBlock -FailureCode $repairFailureCode -Reasons $repairReasons -PreviousOutput (Sanitize-ReadOnlyPhaseText -Text $investigationOutput)
                 $repairTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
                 $repairContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $repairTargets
                 $repairTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $repairTargets
@@ -3969,6 +4089,7 @@ REASON:
 $repairBlock
 
 PRODUCE A USABLE INVESTIGATION RESULT NOW.
+This is a read-only phase. Do not ask for approval, do not mention write access or blocked edits, and do not say you are waiting for permission.
 
 TASK:
 $taskPrompt
@@ -3999,8 +4120,10 @@ $repairPriorArtOutputBlock
                 $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $needsInvestigation -Targets $repairTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
                 $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $repairModel -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
                 if (-not $repairResult.success) { continue }
-                $investigationOutput = $repairResult.output.Trim()
-                Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $investigationOutput | Out-Null
+                $rawInvestigationOutput = $repairResult.output.Trim()
+                Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $rawInvestigationOutput | Out-Null
+                $investigationPhaseConfusion = Test-ReadOnlyPhaseConfusion -Text $rawInvestigationOutput
+                $investigationOutput = Sanitize-ReadOnlyPhaseText -Text $rawInvestigationOutput
                 $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
                 $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($repairTargets + $investigationVerdict.targets) -RetryContext $retryContextState
                 if ($investigationVerdict.testability -ne "UNKNOWN") {
@@ -4013,7 +4136,12 @@ $repairPriorArtOutputBlock
                 $investigationVerdict.referenceFiles = @($priorArtValidation.referenceFiles)
                 $investigationVerdict.referenceFindings = [string]$priorArtValidation.referenceFindings
                 $investigationVerdict.reuseStrategy = [string]$priorArtValidation.reuseStrategy
-                if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
+                if ($investigationPhaseConfusion) {
+                    Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_PHASE_CONFUSION" -Feedback (Get-ReadOnlyPhaseConfusionIssue)
+                    $investigationVerdict.result = "INCONCLUSIVE"
+                    $investigationConclusion = "INVESTIGATION_PHASE_CONFUSION"
+                }
+                if (-not $investigationPhaseConfusion -and $investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                     $investigationVerdict.result = "CHANGE_NEEDED"
                     $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
                     $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
@@ -4208,7 +4336,7 @@ RATIONALE:
         Write-Host "[FIX_PLAN] Attempt $planAttempt/$CONST_PLAN_ATTEMPTS..."
         $replanBlock = if ($replanReason) { "`nCRITIQUE OF THE PREVIOUS FIX PLAN:`n$replanReason`n" } else { "" }
         $discoverBlock = if ($discoverOutput) { $discoverOutput } else { "ROUTE: $routeDecision`nTESTABILITY: $testability" }
-        $investigationBlock = if ($investigationOutput) { $investigationOutput } else { "No separate investigation was performed." }
+        $investigationBlock = if ($investigationOutput) { (Sanitize-ReadOnlyPhaseText -Text $investigationOutput) } else { "No separate investigation was performed." }
         $planContextTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
         $planContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $planContextTargets
         $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $reproductionConfirmed
@@ -4236,6 +4364,7 @@ $($reproductionTests.rationale)
         $planPrompt = @"
 Create the concrete fix plan now based on the evidence already collected. Do not plan speculatively anymore.
 Stay compact: at most 5 files or search areas and at most 4 ordered steps.
+This is a read-only planning phase. Do not ask for approval, do not mention write access or blocked edits, and do not say you are waiting for permission.
 
 TASK:
 $taskPrompt
@@ -4262,7 +4391,7 @@ CONTEXT:
 $planContext
 $validatedPriorArtBlock
 $priorArtPlanRequirementBlock
-$retryContextPlanBlock
+$(Sanitize-ReadOnlyPhaseText -Text $retryContextPlanBlock)
 $replanBlock
 RULES:
 - No TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) comments
@@ -4333,19 +4462,25 @@ Write ONLY the plan.
 
         $replanReason = ($planValidation.issues -join "`n")
         $lastPlanFailureReason = "PLAN_INVALID"
-        Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN" -Category "FIX_PLAN_INSUFFICIENT" -Feedback $replanReason
-        Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan wurde verworfen." -Category "FIX_PLAN_INSUFFICIENT" -Data @{ issues = $planValidation.issues }
+        $fixPlanFailureCategory = if (Test-ReadOnlyPhaseConfusionIssuePresent -Issues @($planValidation.issues)) { "FIX_PLAN_PHASE_CONFUSION" } else { "FIX_PLAN_INSUFFICIENT" }
+        $fixPlanFailureMessage = if ($fixPlanFailureCategory -eq "FIX_PLAN_PHASE_CONFUSION") { "Fix-plan contained approval or permission chatter invalid in a read-only phase." } else { "Fix-Plan wurde verworfen." }
+        Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN" -Category $fixPlanFailureCategory -Feedback $replanReason
+        Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message $fixPlanFailureMessage -Category $fixPlanFailureCategory -Data @{ issues = $planValidation.issues }
         for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
             $repairReasons = @($planValidation.issues)
             if ($reproductionConfirmed) {
                 $repairReasons += "If reproduction tests exist, the plan must mention them explicitly."
             }
-            $repairBlock = Get-RepairBlock -FailureCode "FIX_PLAN_INSUFFICIENT" -Reasons $repairReasons -PreviousOutput $planOutput
+            if ($fixPlanFailureCategory -eq "FIX_PLAN_PHASE_CONFUSION") {
+                $repairReasons += "This is a read-only phase. Do not ask for approval, mention write access, or say you are waiting for permission."
+            }
+            $repairBlock = Get-RepairBlock -FailureCode $fixPlanFailureCategory -Reasons $repairReasons -PreviousOutput (Sanitize-ReadOnlyPhaseText -Text $planOutput)
             $repairPrompt = @"
 $repairBlock
 
 PRODUCE A CORRECTED FIX PLAN NOW IN THE REQUIRED FORMAT.
 Stay compact: at most 5 files or search areas and at most 4 ordered steps.
+This is a read-only planning phase. Do not ask for approval, do not mention write access or blocked edits, and do not say you are waiting for permission.
 
 TASK:
 $taskPrompt
@@ -4372,7 +4507,7 @@ CONTEXT:
 $planContext
 $validatedPriorArtBlock
 $priorArtPlanRequirementBlock
-$retryContextPlanBlock
+$(Sanitize-ReadOnlyPhaseText -Text $retryContextPlanBlock)
 
 OUTPUT FORMAT:
 ## Goal
@@ -4421,6 +4556,7 @@ Write ONLY the plan.
                 if ($directionCheckResult.accepted) {
                     $planTargets = @($directionCheckResult.planTargets)
                     $planReadyForImplementation = $true
+                    $resultValidationIssues = @()
                     Write-SchedulerSnapshot
                     break
                 }
@@ -4428,7 +4564,8 @@ Write ONLY the plan.
 
             $replanReason = ($planValidation.issues -join "`n")
             $lastPlanFailureReason = "PLAN_INVALID"
-            Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN_REPAIR" -Category "FIX_PLAN_REPAIR_INSUFFICIENT" -Feedback $replanReason
+            $repairFailureCategory = if (Test-ReadOnlyPhaseConfusionIssuePresent -Issues @($planValidation.issues)) { "FIX_PLAN_REPAIR_PHASE_CONFUSION" } else { "FIX_PLAN_REPAIR_INSUFFICIENT" }
+            Add-FeedbackEntry -Attempt $planAttempt -Source "FIX_PLAN_REPAIR" -Category $repairFailureCategory -Feedback $replanReason
         }
         if ($planValidation.valid) {
             break
@@ -4438,6 +4575,7 @@ Write ONLY the plan.
             $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
             $planValidation.valid = $true
             $lastPlanFailureReason = ""
+            $resultValidationIssues = @()
             Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan via Salvage fortgesetzt." -Category "FIX_PLAN_SALVAGED" -Data @{ targets = $planTargets }
             $planReadyForImplementation = $true
             Write-SchedulerSnapshot
@@ -4452,6 +4590,7 @@ Write ONLY the plan.
         $finalCategory = [string]$fixPlanFailureOutcome.finalCategory
         $finalSummary = [string]$fixPlanFailureOutcome.finalSummary
         $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory -MaxChars 1200 }
+        $resultValidationIssues = @($planValidation.issues | Select-Object -Unique)
         $terminalFailureCode = [string]$fixPlanFailureOutcome.terminalFailureCode
         throw [System.Exception]::new($terminalFailureCode)
     }
@@ -4989,12 +5128,12 @@ SUMMARY:
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     } else {
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force") | Out-Null
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     }
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
@@ -5010,7 +5149,7 @@ SUMMARY:
             Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
             $worktreePath = $null
         }
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     } else {
         Write-Host "[ERROR] $errMsg"
         $finalStatus = "ERROR"
@@ -5018,7 +5157,7 @@ SUMMARY:
         $finalSummary = "Unexpected error in phase $currentPhase."
         $finalFeedback = $errMsg
         Write-TimelineArtifact
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     }
 } finally {
     Set-Location $originalDir -ErrorAction SilentlyContinue
