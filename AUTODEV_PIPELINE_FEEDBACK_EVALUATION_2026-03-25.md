@@ -36,6 +36,27 @@ The biggest gaps are:
 4. deterministic checks do not currently verify cross-file wiring such as `EventCallback` bindings or JS interop chains
 5. remediation prompts are too thin for reliable self-correction on compile and wiring failures
 
+## Follow-Up Status Update
+
+Added after the original 2026-03-25 evaluation.
+
+The following items from this document are now implemented on `DEV`:
+
+- merge preparation restore before build: solved
+- retry-context injection across attempts: solved
+- retry-context hardening so only semantic blockers carry forward: solved
+
+What this means in practice:
+
+- merge verification now restores before the `--no-restore` build
+- retries now receive structured retry context compiled from prior semantic failures
+- prior review denials and other actionable blockers are injected into DISCOVER, INVESTIGATE, FIX_PLAN, IMPLEMENT, and remediation prompts
+- infra/runtime noise is excluded from retry memory so future retries do not get polluted by non-semantic failures
+
+Highest open item after these fixes:
+
+- prior-art scan requirement for reuse-heavy and cross-file tasks
+
 ## High-Level Recommendation
 
 Do not redesign the scheduler or weaken the reviewer.
@@ -323,7 +344,7 @@ Important status note already recorded there:
 - planner effort wiring: done
 - discovery briefs to scheduler-agent: done
 - direction check after fix-plan: done or pending in current 4.2.11 line
-- retry context injection: still open
+- retry context injection: done
 
 Conclusion:
 
@@ -334,14 +355,15 @@ Conclusion:
 
 ### Immediate
 
-- add `dotnet restore` before merge verification build
-- keep `dotnet build --no-restore` afterward so the build still proves restore completeness
+- done: `dotnet restore` before merge verification build
+- done: keep `dotnet build --no-restore` afterward so the build still proves restore completeness
 
 ### Next Highest Value
 
-- add retry-context injection for new attempts
-- pass prior review denials and failed-attempt lessons into DISCOVER, INVESTIGATE, FIX_PLAN, and IMPLEMENT
-- explicitly state prior blockers as must-fix constraints
+- done: add retry-context injection for new attempts
+- done: pass prior review denials and failed-attempt lessons into DISCOVER, INVESTIGATE, FIX_PLAN, and IMPLEMENT
+- done: explicitly state prior blockers as must-fix constraints
+- done: harden retry memory so infra/runtime failures do not pollute future retries
 
 ### Worker Grounding Improvements
 
@@ -375,13 +397,11 @@ Conclusion:
 
 ## Recommended Priority Order
 
-1. Merge prep restore
-2. Retry-context injection
-3. Prior-art scan requirement
-4. Wiring verification checks
-5. Richer remediation prompts
-6. Package-aware API verification
-7. Faster no-change fail-fast behavior
+1. Prior-art scan requirement
+2. Wiring verification checks
+3. Richer remediation prompts
+4. Package-aware API verification
+5. Faster no-change fail-fast behavior
 
 ## Tick-Off Checklist
 
@@ -393,15 +413,17 @@ Conclusion:
 
 ### Retry Memory
 
-- [ ] Extend worker result JSON with structured retry lessons derived from `feedbackHistory`
-- [ ] Persist lessons into scheduler run records
-- [ ] Generate a retry-context file from prior runs in `Run-Task`
-- [ ] Pass retry-context into the worker as a dedicated input file
-- [ ] Inject retry-context into DISCOVER
-- [ ] Inject retry-context into INVESTIGATE
-- [ ] Inject retry-context into FIX_PLAN
-- [ ] Inject retry-context into IMPLEMENT for attempt 1 of a retry
-- [ ] Add tests proving review denials are visible on the next retry
+- [x] Extend worker result JSON with structured retry lessons derived from `feedbackHistory`
+- [x] Persist lessons into scheduler run records
+- [x] Generate a retry-context file from prior runs in `Run-Task`
+- [x] Pass retry-context into the worker as a dedicated input file
+- [x] Inject retry-context into DISCOVER
+- [x] Inject retry-context into INVESTIGATE
+- [x] Inject retry-context into FIX_PLAN
+- [x] Inject retry-context into IMPLEMENT for attempt 1 of a retry
+- [x] Add tests proving review denials are visible on the next retry
+- [x] Exclude infra/runtime-only failures from retry memory
+- [x] Persist stable run-level retry lesson metadata instead of ambiguous local attempt labels
 
 ### Prior-Art Scan
 
