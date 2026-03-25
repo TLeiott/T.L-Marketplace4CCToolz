@@ -45,6 +45,7 @@ The following items from this document are now implemented on `DEV`:
 - merge preparation restore before build: solved
 - retry-context injection across attempts: solved
 - retry-context hardening so only semantic blockers carry forward: solved
+- worker prior-art grounding for reuse-heavy and cross-file tasks: solved
 
 What this means in practice:
 
@@ -52,10 +53,13 @@ What this means in practice:
 - retries now receive structured retry context compiled from prior semantic failures
 - prior review denials and other actionable blockers are injected into DISCOVER, INVESTIGATE, FIX_PLAN, IMPLEMENT, and remediation prompts
 - infra/runtime noise is excluded from retry memory so future retries do not get polluted by non-semantic failures
+- reuse-heavy and cross-file tasks are now forced through INVESTIGATE before planning
+- INVESTIGATE must now produce concrete reference evidence, findings, and a reuse strategy when prior-art grounding is required
+- FIX_PLAN must now include a reuse/reference pattern with concrete reference file paths
 
 Highest open item after these fixes:
 
-- prior-art scan requirement for reuse-heavy and cross-file tasks
+- deterministic wiring checks for `EventCallback` bindings and JS interop chains
 
 ## High-Level Recommendation
 
@@ -100,9 +104,17 @@ Assessment:
 
 ### 2. Workers Do Not Reliably Reuse Existing Code
 
-Status: validated structurally
+Status: fixed on `DEV`
 
-The current worker prompt flow does not require a prior-art analysis before planning.
+The original worker prompt flow did not require a prior-art analysis before planning.
+
+That gap is now addressed on `DEV` with:
+
+- worker briefs injected into DISCOVER and INVESTIGATE
+- a conditional prior-art requirement for reuse-heavy and cross-file tasks
+- INVESTIGATE required to output concrete reference files, findings, and a reuse strategy
+- FIX_PLAN required to include a reuse/reference pattern with concrete reference file paths
+- a failure path when a prior-art-required task lacks concrete grounding
 
 Observed prompt characteristics:
 
@@ -127,8 +139,8 @@ Relevant code:
 
 Assessment:
 
-- the feedback about the worker inventing parallel logic instead of reusing named converters is exactly the kind of miss this prompt design allows
-- this is likely the main cause of failures on end-to-end feature work
+- the feedback about the worker inventing parallel logic instead of reusing named converters was exactly the kind of miss this prompt design allowed
+- this worker-side gap now appears addressed on `DEV`; the next highest open deterministic gap is wiring verification
 
 ### 3. Unbound `EventCallback` Wiring Gaps
 
@@ -367,9 +379,9 @@ Conclusion:
 
 ### Worker Grounding Improvements
 
-- add a required prior-art scan step for reuse-heavy or cross-file tasks
-- require the worker to cite existing implementation references before planning
-- require plan output to mention what existing path is being reused and how
+- done: add a required prior-art scan step for reuse-heavy or cross-file tasks
+- done: require the worker to cite existing implementation references before planning
+- done: require plan output to mention what existing path is being reused and how
 
 ### Deterministic Semantic Checks
 
@@ -427,10 +439,10 @@ Conclusion:
 
 ### Prior-Art Scan
 
-- [ ] Add a worker rule that tasks mentioning reuse, existing functionality, or named methods must perform a prior-art scan
-- [ ] Require INVESTIGATE to output existing reference files or search hits when reuse is implied
-- [ ] Require FIX_PLAN to include a "reuse/reference pattern" note
-- [ ] Add a failure mode when the worker plans a reuse-heavy task without concrete reference paths
+- [x] Add a worker rule that tasks mentioning reuse, existing functionality, or named methods must perform a prior-art scan
+- [x] Require INVESTIGATE to output existing reference files or search hits when reuse is implied
+- [x] Require FIX_PLAN to include a "reuse/reference pattern" note
+- [x] Add a failure mode when the worker plans a reuse-heavy task without concrete reference paths
 
 ### Wiring Checks
 
@@ -463,10 +475,10 @@ Conclusion:
 
 ### Worker Brief Injection
 
-- [ ] Pass `completedTaskBriefs` or a worker-focused subset into the worker, not only the scheduler-agent
-- [ ] Inject those briefs into DISCOVER
-- [ ] Inject those briefs into INVESTIGATE
-- [ ] Evaluate whether failed-task briefs should be included separately from accepted-task briefs
+- [x] Pass `completedTaskBriefs` or a worker-focused subset into the worker, not only the scheduler-agent
+- [x] Inject those briefs into DISCOVER
+- [x] Inject those briefs into INVESTIGATE
+- [x] Evaluate whether failed-task briefs should be included separately from accepted-task briefs
 
 ## Closing Assessment
 

@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$ResultFile,
     [string]$PlannerContextFile = "",
     [string]$RetryContextFile = "",
+    [string]$BriefsFile = "",
     [string]$TaskName = "develop-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
     [string]$SchedulerTaskId = "",
     [string]$CommandType = "",
@@ -47,6 +48,8 @@ $CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS = 900
 $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS = 1200
 $CONST_RETRY_CONTEXT_IMPLEMENT_MAX_CHARS = 1600
 $CONST_RETRY_CONTEXT_REMEDIATE_MAX_CHARS = 1400
+$CONST_WORKER_BRIEFS_DISCOVER_MAX_CHARS = 1100
+$CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS = 1400
 
 $ErrorActionPreference = "Stop"
 $originalDir = Get-Location
@@ -121,6 +124,11 @@ $directionCheckVerdict = [ordered]@{
     warningOnly = $false
 }
 $directionCheckGuardrail = ""
+$priorArtRequirement = [ordered]@{
+    required = $false
+    reasons = @()
+    triggerKind = ""
+}
 $retryContextState = [ordered]@{
     loaded = $false
     path = ""
@@ -135,6 +143,13 @@ $retryContextState = [ordered]@{
     }
     priorChangedFiles = @()
     retryLessons = @()
+}
+$workerBriefsState = [ordered]@{
+    loaded = $false
+    path = ""
+    taskId = ""
+    briefCount = 0
+    briefs = @()
 }
 $discoverVerdict = [ordered]@{
     route = "UNCERTAIN"
@@ -151,6 +166,10 @@ $investigationVerdict = [ordered]@{
     testability = "UNKNOWN"
     nextPhase = "FIX_PLAN"
     summary = ""
+    priorArtRequired = $false
+    referenceFiles = @()
+    referenceFindings = ""
+    reuseStrategy = ""
 }
 
 Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
@@ -387,6 +406,130 @@ function Get-RetryContextPromptSection {
     $block = Format-RetryContextPromptBlock -RetryContext $RetryContext -Mode $Mode -MaxChars $MaxChars
     if (-not $block) { return "" }
     return "RETRY CONTEXT:`n$block`n"
+}
+
+function Get-WorkerBriefsState {
+    param(
+        [string]$BriefsFile,
+        [string]$ExpectedTaskId = ""
+    )
+
+    $emptyState = [ordered]@{
+        loaded = $false
+        path = [string]$BriefsFile
+        taskId = ""
+        briefCount = 0
+        briefs = @()
+    }
+
+    if (-not $BriefsFile) {
+        return [pscustomobject]$emptyState
+    }
+
+    $payload = Read-JsonFileBestEffort -Path $BriefsFile
+    if (-not $payload) {
+        return [pscustomobject]$emptyState
+    }
+    if ($null -ne $payload.version -and [int]$payload.version -ne 1) {
+        return [pscustomobject]$emptyState
+    }
+    if ($ExpectedTaskId -and [string]$payload.taskId -ne [string]$ExpectedTaskId) {
+        return [pscustomobject]$emptyState
+    }
+
+    $briefs = @()
+    foreach ($brief in @($payload.briefs)) {
+        if (-not $brief) { continue }
+        $discoveries = @($brief.discoveries | Where-Object { $_ } | Select-Object -Unique -First 2)
+        $filesChanged = @(Get-NormalizedPathSet -Paths $brief.filesChanged | Select-Object -First 6)
+        $hasSignal =
+            [string]$brief.taskSummary -or
+            [string]$brief.whatWasBuilt -or
+            $discoveries.Count -gt 0 -or
+            $filesChanged.Count -gt 0 -or
+            [string]$brief.conflictHints
+        if (-not $hasSignal) { continue }
+
+        $briefs += [pscustomobject]@{
+            taskId = [string]$brief.taskId
+            waveNumber = if ($null -ne $brief.waveNumber) { [int]$brief.waveNumber } else { 0 }
+            status = [string]$brief.status
+            finalCategory = [string]$brief.finalCategory
+            taskSummary = [string]$brief.taskSummary
+            whatWasBuilt = [string]$brief.whatWasBuilt
+            discoveries = @($discoveries)
+            filesChanged = @($filesChanged)
+            conflictHints = [string]$brief.conflictHints
+        }
+    }
+
+    if (@($briefs).Count -eq 0) {
+        return [pscustomobject]$emptyState
+    }
+
+    return [pscustomobject]@{
+        loaded = $true
+        path = [string]$BriefsFile
+        taskId = [string]$payload.taskId
+        briefCount = if ($null -ne $payload.briefCount) { [int]$payload.briefCount } else { @($briefs).Count }
+        briefs = @($briefs)
+    }
+}
+
+function Format-WorkerBriefsPromptBlock {
+    param(
+        $WorkerBriefs,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS
+    )
+
+    if (-not $WorkerBriefs -or -not $WorkerBriefs.loaded) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("COMPLETED TASK BRIEFS: $(@($WorkerBriefs.briefs).Count)")
+    foreach ($brief in @($WorkerBriefs.briefs | Select-Object -First 4)) {
+        $segments = [System.Collections.ArrayList]::new()
+        $label = if ($brief.taskId) { ("[{0}]" -f [string]$brief.taskId) } else { "[brief]" }
+        if ($brief.taskSummary) {
+            [void]$segments.Add("$label Task: $(Clip-Text -Text ([string]$brief.taskSummary) -MaxChars 130 -Marker 'Task trimmed')")
+        }
+        if ($brief.whatWasBuilt) {
+            [void]$segments.Add("Built: $(Clip-Text -Text ([string]$brief.whatWasBuilt) -MaxChars 140 -Marker 'Built trimmed')")
+        }
+        if (@($brief.discoveries).Count -gt 0) {
+            [void]$segments.Add("Discoveries: $(Clip-Text -Text ((@($brief.discoveries) -join '; ')) -MaxChars 140 -Marker 'Discoveries trimmed')")
+        }
+        if (@($brief.filesChanged).Count -gt 0) {
+            [void]$segments.Add("Files: $((@($brief.filesChanged) | Select-Object -First 3) -join ', ')")
+        }
+        if ($brief.conflictHints) {
+            [void]$segments.Add("Conflict hint: $(Clip-Text -Text ([string]$brief.conflictHints) -MaxChars 120 -Marker 'Conflict trimmed')")
+        }
+        if ($segments.Count -gt 0) {
+            [void]$lines.Add("- " + (($segments | Where-Object { $_ }) -join " | "))
+        }
+    }
+
+    $modeRule = switch ($Mode.ToUpperInvariant()) {
+        "DISCOVER" { "Use these as hints for existing nearby implementations before routing the task." }
+        "INVESTIGATE" { "If this task looks reuse-heavy or cross-file, identify concrete matching reference paths before proposing a change path." }
+        default { "Use these as examples of existing proven paths in the codebase." }
+    }
+    [void]$lines.Add("BRIEF RULE: $modeRule")
+
+    return Clip-Text -Text (($lines | Where-Object { $_ }) -join "`n") -MaxChars $MaxChars -Marker "Worker briefs trimmed"
+}
+
+function Get-WorkerBriefsPromptSection {
+    param(
+        $WorkerBriefs,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS
+    )
+
+    $block = Format-WorkerBriefsPromptBlock -WorkerBriefs $WorkerBriefs -Mode $Mode -MaxChars $MaxChars
+    if (-not $block) { return "" }
+    return "WORKER BRIEFS:`n$block`n"
 }
 
 function Normalize-RepoRelativePath {
@@ -1161,6 +1304,261 @@ function Format-ScopedContext {
     return ($parts -join "`n`n").Trim()
 }
 
+function Get-TaskCodeReferenceHints {
+    param([string]$TaskText)
+
+    $references = [System.Collections.ArrayList]::new()
+    if (-not $TaskText) { return @($references) }
+
+    foreach ($match in [regex]::Matches($TaskText, '\b[A-Z][A-Za-z0-9_]+\.[A-Za-z0-9_]+\b')) {
+        [void]$references.Add($match.Value.Trim())
+    }
+    foreach ($match in [regex]::Matches($TaskText, '`([^`]+)`')) {
+        $value = $match.Groups[1].Value.Trim()
+        if ($value -match '[A-Z]' -or $value -match '\.') {
+            [void]$references.Add($value)
+        }
+    }
+
+    return @($references | Where-Object { $_ } | Select-Object -Unique -First 6)
+}
+
+function Test-PriorArtReuseText {
+    param([string]$Text)
+
+    if (-not $Text) { return $false }
+    $value = [string]$Text
+    $patterns = @(
+        '\b(re-?use|already implemented|same as|follow existing|use current|align with|mirror|wire into existing|hook into existing|extend(?: the)? existing)\b',
+        '\b(existing|current)\s+(implementation|functionality|path|flow|logic|behavior|service|handler|callback|converter|call chain)\b',
+        '\bnamed\s+(method|member|service|handler|converter|callback)\b',
+        '\bparallel path\b'
+    )
+
+    foreach ($pattern in $patterns) {
+        if ($value -match ("(?i)" + $pattern)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-PriorArtRequirement {
+    param(
+        [string]$TaskText,
+        [string]$TaskClass = "",
+        [string[]]$Targets = @(),
+        $RetryContext = $null
+    )
+
+    $reasons = [System.Collections.ArrayList]::new()
+    $triggerKind = ""
+    $taskTextValue = [string]$TaskText
+
+    if (Test-PriorArtReuseText -Text $taskTextValue) {
+        [void]$reasons.Add("Task text explicitly asks for reuse or an existing implementation path.")
+        $triggerKind = "reuse_text"
+    }
+
+    $namedReferences = @(Get-TaskCodeReferenceHints -TaskText $taskTextValue)
+    if ($namedReferences.Count -gt 0) {
+        [void]$reasons.Add("Task text names an existing code reference: $($namedReferences[0]).")
+        if (-not $triggerKind) { $triggerKind = "named_reference" }
+    }
+
+    $concreteTargets = @($Targets | Where-Object { $_ -and $_ -match '\.(razor|cs|js|ts|xaml)\b' } | Select-Object -Unique)
+    $targetExtensions = @($concreteTargets | ForEach-Object {
+        if ($_ -match '\.(razor|cs|js|ts|xaml)\b') { $Matches[1].ToLowerInvariant() }
+    } | Select-Object -Unique)
+    $hasCrossLayerTargets =
+        (($targetExtensions -contains 'cs') -and (@($targetExtensions | Where-Object { $_ -in @('razor', 'js', 'ts', 'xaml') }).Count -gt 0)) -or
+        (($targetExtensions -contains 'razor') -and (@($targetExtensions | Where-Object { $_ -in @('js', 'ts') }).Count -gt 0))
+    if ($hasCrossLayerTargets) {
+        [void]$reasons.Add("Targets span multiple code layers or file types.")
+        if (-not $triggerKind) { $triggerKind = "cross_layer" }
+    } elseif ($TaskClass -ne "DIRECT_EDIT" -and $concreteTargets.Count -gt 1) {
+        [void]$reasons.Add("Multiple concrete implementation targets suggest cross-file work.")
+        if (-not $triggerKind) { $triggerKind = "cross_file" }
+    }
+
+    $retryText = ""
+    if ($RetryContext -and $RetryContext.loaded) {
+        $retryParts = [System.Collections.ArrayList]::new()
+        if ($RetryContext.latestFailure.feedback) { [void]$retryParts.Add([string]$RetryContext.latestFailure.feedback) }
+        foreach ($lesson in @($RetryContext.retryLessons | Select-Object -First 3)) {
+            if ($lesson.feedbackExcerpt) { [void]$retryParts.Add([string]$lesson.feedbackExcerpt) }
+        }
+        $retryText = ($retryParts -join " ")
+    }
+    if (Test-PriorArtReuseText -Text $retryText) {
+        [void]$reasons.Add("Retry memory already points to an existing path that should be reused.")
+        if (-not $triggerKind) { $triggerKind = "retry_memory" }
+    }
+
+    return [ordered]@{
+        required = ($reasons.Count -gt 0)
+        reasons = @($reasons | Select-Object -Unique | Select-Object -First 4)
+        triggerKind = $triggerKind
+        namedReferences = @($namedReferences)
+    }
+}
+
+function Get-PriorArtRequirementPromptSection {
+    param(
+        $Requirement,
+        [string]$Mode = "INVESTIGATE"
+    )
+
+    if (-not $Requirement -or -not $Requirement.required) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("PRIOR-ART REQUIREMENT:")
+    [void]$lines.Add("- Required: YES")
+    if ($Requirement.triggerKind) {
+        [void]$lines.Add("- Trigger: $([string]$Requirement.triggerKind)")
+    }
+    foreach ($reason in @($Requirement.reasons)) {
+        [void]$lines.Add("- Reason: $reason")
+    }
+
+    switch ($Mode.ToUpperInvariant()) {
+        "DISCOVER" {
+            [void]$lines.Add("- Route this through investigation if you need to confirm an existing implementation path first.")
+        }
+        "FIX_PLAN" {
+            [void]$lines.Add("- The plan must cite the concrete reference files that will be reused or mirrored.")
+        }
+        "IMPLEMENT" {
+            [void]$lines.Add("- Do not invent a parallel implementation when the validated reference path already exists.")
+        }
+        default {
+            [void]$lines.Add("- Find the closest existing implementation, handler, service, converter, or call chain before proposing the change path.")
+            [void]$lines.Add("- If nothing matches, say so explicitly and provide the concrete file paths or file-qualified search hits you checked.")
+        }
+    }
+
+    return ($lines -join "`n").Trim()
+}
+
+function Get-InvestigationPriorArtOutputBlock {
+    param([bool]$Required = $false)
+
+    if (-not $Required) { return "" }
+
+    return @"
+PRIOR_ART_REQUIRED: YES | NO
+REFERENCE_FILES:
+- <concrete relative path OR file-qualified search hit>
+REFERENCE_FINDINGS:
+<short summary of the matching existing implementation or file-qualified search evidence>
+REUSE_STRATEGY:
+<how the existing path should be reused or extended>
+"@
+}
+
+function Get-PlanPriorArtOutputBlock {
+    param([bool]$Required = $false)
+
+    if (-not $Required) { return "" }
+
+    return @"
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- <concrete relative path>
+Reuse Path:
+One sentence describing which existing path is being reused or extended.
+
+"@
+}
+
+function Get-PriorArtReferenceFiles {
+    param(
+        [string[]]$Entries = @(),
+        [string]$Mode = "INVESTIGATE"
+    )
+
+    $validated = [System.Collections.ArrayList]::new()
+    foreach ($entry in @($Entries | Where-Object { $_ })) {
+        $value = ([string]$entry).Trim()
+        if (-not $value -or $value -match '^<') { continue }
+        if ($value -match '^(?i)\s*(rg|ripgrep|git grep|select-string)\b') { continue }
+
+        $match = [regex]::Match($value, '^(?<path>[\w\-.\\/]+\.(razor|cs|css|js|ts|xaml|csproj))(?:[:#].*)?$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $match.Success) { continue }
+
+        $path = Normalize-RepoRelativePath -Path $match.Groups['path'].Value
+        if ($path) {
+            [void]$validated.Add($path)
+        }
+    }
+
+    return @($validated | Select-Object -Unique)
+}
+
+function Get-InvestigationPriorArtValidation {
+    param(
+        $InvestigationVerdict,
+        [bool]$PriorArtRequired = $false
+    )
+
+    $issues = [System.Collections.ArrayList]::new()
+    $referenceFiles = @()
+    $referenceFindings = ""
+    $reuseStrategy = ""
+
+    if ($InvestigationVerdict) {
+        $referenceFiles = @(Get-PriorArtReferenceFiles -Entries $InvestigationVerdict.referenceFiles -Mode "INVESTIGATE")
+        $referenceFindings = [string]$InvestigationVerdict.referenceFindings
+        $reuseStrategy = [string]$InvestigationVerdict.reuseStrategy
+    }
+
+    if ($PriorArtRequired) {
+        if (-not $InvestigationVerdict -or -not $InvestigationVerdict.priorArtRequired) {
+            [void]$issues.Add("Investigation must declare PRIOR_ART_REQUIRED: YES.")
+        }
+        if (@($referenceFiles).Count -eq 0) {
+            [void]$issues.Add("Investigation must cite at least one concrete reference file or file-qualified search hit.")
+        }
+        if ([string]::IsNullOrWhiteSpace($referenceFindings)) {
+            [void]$issues.Add("Investigation must summarize the matching reference findings.")
+        }
+        if ([string]::IsNullOrWhiteSpace($reuseStrategy)) {
+            [void]$issues.Add("Investigation must describe the reuse strategy.")
+        }
+    }
+
+    return [ordered]@{
+        valid = ($issues.Count -eq 0)
+        issues = @($issues)
+        referenceFiles = @($referenceFiles)
+        referenceFindings = $referenceFindings
+        reuseStrategy = $reuseStrategy
+    }
+}
+
+function Get-ValidatedPriorArtPromptSection {
+    param($InvestigationVerdict)
+
+    if (-not $InvestigationVerdict -or -not $InvestigationVerdict.priorArtRequired) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    [void]$lines.Add("VALIDATED PRIOR-ART:")
+    [void]$lines.Add("- Required: YES")
+    if (@($InvestigationVerdict.referenceFiles).Count -gt 0) {
+        [void]$lines.Add("REFERENCE FILES:`n$(Format-BulletList -Items @($InvestigationVerdict.referenceFiles) -MaxItems 6 -EmptyText '- None')")
+    }
+    if ($InvestigationVerdict.referenceFindings) {
+        [void]$lines.Add("REFERENCE FINDINGS:`n$([string]$InvestigationVerdict.referenceFindings)")
+    }
+    if ($InvestigationVerdict.reuseStrategy) {
+        [void]$lines.Add("REUSE STRATEGY:`n$([string]$InvestigationVerdict.reuseStrategy)")
+    }
+
+    return Clip-Text -Text (($lines | Where-Object { $_ }) -join "`n") -MaxChars 900 -Marker "Prior-art trimmed"
+}
+
 function Get-NoChangeAssessment {
     param(
         [string]$Output,
@@ -1633,6 +2031,7 @@ function Write-DebugManifest {
         resultFile = $ResultFile
         plannerContextFile = $PlannerContextFile
         retryContextFile = $RetryContextFile
+        briefsFile = $BriefsFile
         repoRoot = $repoRoot
         artifactRunDir = $artifactRunDir
         debugDir = $debugRunDir
@@ -1650,6 +2049,8 @@ function Write-DebugManifest {
         retryContextLoaded = [bool]$retryContextState.loaded
         retryLessonCount = @($retryContextState.retryLessons).Count
         retryLatestFailureCategory = [string]$retryContextState.latestFailure.finalCategory
+        workerBriefsLoaded = [bool]$workerBriefsState.loaded
+        workerBriefCount = @($workerBriefsState.briefs).Count
     }
     Save-DebugJson -Name "manifest.json" -Object $manifest | Out-Null
 }
@@ -1685,6 +2086,10 @@ function Write-SchedulerSnapshot {
         retryContextLoaded = [bool]$retryContextState.loaded
         retryLessonCount = @($retryContextState.retryLessons).Count
         retryLatestFailureCategory = [string]$retryContextState.latestFailure.finalCategory
+        workerBriefsLoaded = [bool]$workerBriefsState.loaded
+        workerBriefCount = @($workerBriefsState.briefs).Count
+        priorArtRequired = [bool]$priorArtRequirement.required
+        priorArtTriggerKind = [string]$priorArtRequirement.triggerKind
         finalStatus = $finalStatus
         finalCategory = $finalCategory
         artifacts = [ordered]@{
@@ -2369,6 +2774,7 @@ function Write-ResultJson {
             debugDir = $debugRunDir
             plannerContext = $PlannerContextFile
             retryContext = $RetryContextFile
+            briefs = $BriefsFile
         }
         planVersion = $planVersion
         investigationRequired = $investigationRequired
@@ -2387,6 +2793,11 @@ function Write-ResultJson {
         pipelineProfile = $pipelineProfile
         directionCheck = if ($directionCheck) { $directionCheck } else { [ordered]@{} }
         retryLessons = @($retryLessons)
+        workerBriefsLoaded = [bool]$workerBriefsState.loaded
+        workerBriefCount = @($workerBriefsState.briefs).Count
+        priorArtRequired = [bool]$priorArtRequirement.required
+        priorArtTriggerKind = [string]$priorArtRequirement.triggerKind
+        priorArtReferenceFiles = @($investigationVerdict.referenceFiles)
         metrics = $metricsSummary
     } | ConvertTo-Json -Depth 8
 
@@ -2673,10 +3084,16 @@ function Test-InvestigationRequired {
 }
 
 function Get-PlanValidation {
-    param([string]$Plan)
+    param(
+        [string]$Plan,
+        [bool]$PriorArtRequired = $false
+    )
+
     $issues = [System.Collections.ArrayList]::new()
     $targets = [System.Collections.ArrayList]::new()
     $investigationFlag = $false
+    $referenceFiles = [System.Collections.ArrayList]::new()
+    $reusePath = ""
 
     if ($Plan -match "Freigabe bereit|approval pending|plan ready for approval") {
         [void]$issues.Add("Plan contains UI or approval text.")
@@ -2706,11 +3123,44 @@ function Get-PlanValidation {
         $investigationFlag = $true
     }
 
+    if ($PriorArtRequired) {
+        if ($Plan -notmatch '(?im)^##\s*Reuse\s*/\s*Reference Pattern\s*$') {
+            [void]$issues.Add("Section ## Reuse / Reference Pattern is missing.")
+        } else {
+            $reuseSectionMatch = [regex]::Match($Plan, '(?ims)^\s*##\s*Reuse\s*/\s*Reference Pattern\s*$\s*(?<body>.*?)(?=^\s*##\s+|\z)')
+            $reuseSection = if ($reuseSectionMatch.Success) { [string]$reuseSectionMatch.Groups['body'].Value } else { "" }
+            if ($reuseSection -notmatch '(?im)^\s*Required\s*:\s*YES\s*$') {
+                [void]$issues.Add("Reuse/reference section must declare Required: YES.")
+            }
+
+            $referenceBlockMatch = [regex]::Match($reuseSection, '(?ims)^\s*Reference Files\s*:\s*(?<value>.*?)(?=^\s*Reuse Path\s*:|\z)')
+            $referenceBlock = if ($referenceBlockMatch.Success) { [string]$referenceBlockMatch.Groups['value'].Value } else { "" }
+            $parsedReferenceEntries = @()
+            foreach ($match in [regex]::Matches($referenceBlock, '(?im)^\s*-\s+(.+?)\s*$')) {
+                $parsedReferenceEntries += $match.Groups[1].Value.Trim()
+            }
+            foreach ($value in @(Get-PriorArtReferenceFiles -Entries $parsedReferenceEntries -Mode "FIX_PLAN")) {
+                [void]$referenceFiles.Add($value)
+            }
+            if ($referenceFiles.Count -eq 0) {
+                [void]$issues.Add("Reuse/reference section must name concrete reference file paths.")
+            }
+
+            $reusePathMatch = [regex]::Match($reuseSection, '(?ims)^\s*Reuse Path\s*:\s*(?<value>.*?)(?=^\s*[A-Za-z][A-Za-z /]+\s*:|\z)')
+            $reusePath = if ($reusePathMatch.Success) { [string]$reusePathMatch.Groups['value'].Value.Trim() } else { "" }
+            if (-not $reusePath) {
+                [void]$issues.Add("Reuse/reference section must describe the reuse path.")
+            }
+        }
+    }
+
     return [ordered]@{
         valid = ($issues.Count -eq 0)
         issues = @($issues)
         targets = @($targets | Select-Object -Unique)
         investigationRequired = $investigationFlag
+        referenceFiles = @($referenceFiles | Select-Object -Unique)
+        reusePath = $reusePath
     }
 }
 
@@ -3017,6 +3467,10 @@ function Get-InvestigationVerdict {
             "FIX_PLAN"
         }
         summary = $Output.Trim()
+        priorArtRequired = ($Output -match '(?im)^PRIOR_ART_REQUIRED\s*:\s*YES\s*$')
+        referenceFiles = @(Get-BulletSectionValues -Text $Output -Header "REFERENCE_FILES")
+        referenceFindings = Get-ScalarSectionText -Text $Output -Header "REFERENCE_FINDINGS"
+        reuseStrategy = Get-ScalarSectionText -Text $Output -Header "REUSE_STRATEGY"
     }
 }
 
@@ -3192,6 +3646,7 @@ try {
     $currentRunAttemptNumber = if ($plannerContext -and $null -ne $plannerContext.attemptNumber) { [int]$plannerContext.attemptNumber } else { 0 }
     $currentLaunchSequence = if ($plannerContext -and $null -ne $plannerContext.launchSequence) { [int]$plannerContext.launchSequence } else { 0 }
     $retryContextState = Get-RetryContextState -RetryContextFile $RetryContextFile -ExpectedTaskId $SchedulerTaskId
+    $workerBriefsState = Get-WorkerBriefsState -BriefsFile $BriefsFile -ExpectedTaskId $SchedulerTaskId
     if ($plannerContext -and $plannerContext.plannerMetadata) {
         $plannerEffortClass = Get-NormalizedPlannerEffortClass -EffortClass ([string]$plannerContext.plannerMetadata.effortClass)
     } else {
@@ -3200,9 +3655,10 @@ try {
     $pipelineProfile = Get-PipelineProfile -PlannerEffortClass $plannerEffortClass
     $taskClass = Get-TaskClass -TaskText $taskPrompt
     $investigationRequired = Test-InvestigationRequired -TaskText $taskPrompt -TaskClass $taskClass
+    $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -RetryContext $retryContextState
     Save-Artifact -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Save-DebugText -Name "input-task.txt" -Content $taskPrompt | Out-Null
-    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired; plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile; plannerContextLoaded = [bool]$plannerContext; retryContextLoaded = [bool]$retryContextState.loaded; retryLessonCount = @($retryContextState.retryLessons).Count }
+    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired; plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile; plannerContextLoaded = [bool]$plannerContext; retryContextLoaded = [bool]$retryContextState.loaded; retryLessonCount = @($retryContextState.retryLessons).Count; workerBriefsLoaded = [bool]$workerBriefsState.loaded; workerBriefCount = @($workerBriefsState.briefs).Count; priorArtRequired = [bool]$priorArtRequirement.required }
     if ($PlannerContextFile -and -not $plannerContext) {
         Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context file could not be read. Falling back to default pipeline profile." -Category "PLANNER_CONTEXT_INVALID" -Data @{ plannerContextFile = $PlannerContextFile }
     } elseif ($plannerContext) {
@@ -3213,11 +3669,18 @@ try {
     } elseif ($retryContextState.loaded) {
         Add-TimelineEvent -Phase "VALIDATE" -Message "Retry context loaded for worker startup." -Category "RETRY_CONTEXT_LOADED" -Data @{ retryLessonCount = @($retryContextState.retryLessons).Count; latestFailureCategory = [string]$retryContextState.latestFailure.finalCategory }
     }
+    if ($BriefsFile -and -not $workerBriefsState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Worker briefs file could not be read. Continuing without completed-task grounding." -Category "WORKER_BRIEFS_INVALID" -Data @{ briefsFile = $BriefsFile }
+    } elseif ($workerBriefsState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Worker briefs loaded for worker startup." -Category "WORKER_BRIEFS_LOADED" -Data @{ briefCount = @($workerBriefsState.briefs).Count }
+    }
     $retryContextDiscoverBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "DISCOVER" -MaxChars $CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS
     $retryContextInvestigateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "INVESTIGATE" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
     $retryContextPlanBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "FIX_PLAN" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
     $retryContextImplementBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "IMPLEMENT" -MaxChars $CONST_RETRY_CONTEXT_IMPLEMENT_MAX_CHARS
     $retryContextRemediateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "REMEDIATE" -MaxChars $CONST_RETRY_CONTEXT_REMEDIATE_MAX_CHARS
+    $workerBriefsDiscoverBlock = Get-WorkerBriefsPromptSection -WorkerBriefs $workerBriefsState -Mode "DISCOVER" -MaxChars $CONST_WORKER_BRIEFS_DISCOVER_MAX_CHARS
+    $workerBriefsInvestigateBlock = Get-WorkerBriefsPromptSection -WorkerBriefs $workerBriefsState -Mode "INVESTIGATE" -MaxChars $CONST_WORKER_BRIEFS_INVESTIGATE_MAX_CHARS
     Write-SchedulerSnapshot
 
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
@@ -3288,6 +3751,7 @@ try {
         $discoverCritiqueBlock = if ($discoverCritique) { "`nCRITIQUE OF THE PREVIOUS DISCOVER RESULT:`n$discoverCritique`n" } else { "" }
         $discoverContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $planTargets
         $discoverTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $planTargets
+        $discoverPriorArtBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "DISCOVER"
         $discoverPrompt = @"
 Analyze the task read-only and decide the next pipeline step. Do NOT produce an implementation plan.
 Be concise. Maximum 10 lines. TARGET_HINTS may contain at most 3 entries. RATIONALE must be exactly 1-2 sentences.
@@ -3303,6 +3767,8 @@ $discoverTestProjectText
 
 CONTEXT:
 $discoverContext
+$workerBriefsDiscoverBlock
+$discoverPriorArtBlock
 $retryContextDiscoverBlock
 $discoverCritiqueBlock
 OUTPUT FORMAT:
@@ -3332,6 +3798,7 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
         if ($discoverVerdict.targetHints.Count -gt 0) {
             $planTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
         }
+        $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($planTargets + $discoverVerdict.targetHints) -RetryContext $retryContextState
         Add-TimelineEvent -Phase "DISCOVER" -Message "Discover routing determined." -Category $routeDecision -Data @{ testability = $testability; nextPhase = $discoverVerdict.nextPhase }
         Write-SchedulerSnapshot
         break
@@ -3346,9 +3813,13 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
     $investigationOutput = ""
     $investigationVerdict = [ordered]@{ result = "CHANGE_NEEDED"; targets = @(); testability = "UNKNOWN"; nextPhase = "FIX_PLAN"; summary = "" }
     $investigationHashes = [System.Collections.ArrayList]::new()
-    $needsInvestigation = ($discoverVerdict.nextPhase -ne "FIX_PLAN")
+    $priorArtValidation = $null
+    $needsInvestigation = ($discoverVerdict.nextPhase -ne "FIX_PLAN") -or $priorArtRequirement.required
     $investigationRequired = $needsInvestigation
     if ($needsInvestigation) {
+        if ($priorArtRequirement.required -and $discoverVerdict.nextPhase -eq "FIX_PLAN") {
+            Add-TimelineEvent -Phase "DISCOVER" -Message "Prior-art requirement forces investigation before planning." -Category "PRIOR_ART_REQUIRED" -Data @{ triggerKind = [string]$priorArtRequirement.triggerKind; reasons = @($priorArtRequirement.reasons) }
+        }
         for ($investigateAttempt = 1; $investigateAttempt -le $CONST_INVESTIGATION_ATTEMPTS; $investigateAttempt++) {
             $currentPhase = "INVESTIGATE"
             $attemptsByPhase.investigate = $investigateAttempt
@@ -3358,6 +3829,8 @@ NEXT_PHASE: FIX_PLAN | INVESTIGATE | REPRODUCE
             $investigationTargets = @($planTargets + $discoverVerdict.targetHints | Select-Object -Unique)
             $investigationContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $investigationTargets
             $investigationTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $investigationTargets
+            $investigationPriorArtBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "INVESTIGATE"
+            $investigationPriorArtOutputBlock = Get-InvestigationPriorArtOutputBlock -Required ([bool]$priorArtRequirement.required)
             $investigatePrompt = @"
 Investigate the task read-only and decide whether a code change is required. Also assess whether an automated bug reproduction through tests is worthwhile.
 Be concise. TARGET_FILES may contain at most 5 entries. ROOT_CAUSE and NEXT_ACTION may each use at most 2 sentences.
@@ -3376,6 +3849,8 @@ $investigationTestProjectText
 
 CONTEXT:
 $investigationContext
+$workerBriefsInvestigateBlock
+$investigationPriorArtBlock
 
 PRIOR FEEDBACK:
 $historyText
@@ -3392,6 +3867,7 @@ TESTABILITY_REASSESSMENT: YES | NO | UNKNOWN
 RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <concrete next change or rationale>
+$investigationPriorArtOutputBlock
 "@
             $investigateModel = Get-ModelForInvestigate -TaskClass $taskClass -Targets @($planTargets + $discoverVerdict.targetHints) -Attempt $investigateAttempt -PreviousOutput $investigationOutput
             $investigateResult = Invoke-ClaudeInvestigate -Prompt $investigatePrompt -Model $investigateModel -Attempt $investigateAttempt
@@ -3403,11 +3879,19 @@ NEXT_ACTION:
             $investigationOutput = $investigateResult.output.Trim()
             Save-Artifact -Name "investigation-v$investigateAttempt.txt" -Content $investigationOutput | Out-Null
             $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
+            $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($investigationTargets + $investigationVerdict.targets) -RetryContext $retryContextState
             $investigationConclusion = $investigationVerdict.result
             [void]$investigationHashes.Add((Get-TextHash -Text $investigationOutput))
             if ($investigationVerdict.testability -ne "UNKNOWN") {
                 $testability = $investigationVerdict.testability
             }
+            if ($priorArtRequirement.required) {
+                $investigationVerdict.priorArtRequired = $true
+            }
+            $priorArtValidation = Get-InvestigationPriorArtValidation -InvestigationVerdict $investigationVerdict -PriorArtRequired ([bool]$priorArtRequirement.required)
+            $investigationVerdict.referenceFiles = @($priorArtValidation.referenceFiles)
+            $investigationVerdict.referenceFindings = [string]$priorArtValidation.referenceFindings
+            $investigationVerdict.reuseStrategy = [string]$priorArtValidation.reuseStrategy
             Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation result: $($investigationVerdict.result)" -Category $investigationVerdict.result -Data @{ targets = $investigationVerdict.targets; nextPhase = $investigationVerdict.nextPhase }
             Write-SchedulerSnapshot
 
@@ -3417,6 +3901,14 @@ NEXT_ACTION:
                 $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
                 Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation was salvaged from actionable evidence." -Category "CHANGE_NEEDED_SALVAGED" -Data @{ targets = $investigationVerdict.targets }
                 Write-SchedulerSnapshot
+            }
+
+            if ($priorArtRequirement.required -and $investigationVerdict.result -eq "CHANGE_NEEDED" -and -not $priorArtValidation.valid) {
+                $priorArtIssuesText = ($priorArtValidation.issues -join " ")
+                Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "PRIOR_ART_INSUFFICIENT" -Feedback $priorArtIssuesText
+                Add-TimelineEvent -Phase "INVESTIGATE" -Message "Investigation lacked the required prior-art grounding." -Category "PRIOR_ART_INSUFFICIENT" -Data @{ triggerKind = [string]$priorArtRequirement.triggerKind; issues = @($priorArtValidation.issues) }
+                $investigationVerdict.result = "INCONCLUSIVE"
+                $investigationConclusion = "PRIOR_ART_INSUFFICIENT"
             }
 
             if ($investigationVerdict.result -eq "NO_CHANGE") {
@@ -3463,10 +3955,16 @@ REASON:
 
             Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "INVESTIGATION_INCONCLUSIVE" -Feedback $investigationOutput
             for ($repairAttempt = 1; $repairAttempt -le $CONST_REPAIR_ATTEMPTS; $repairAttempt++) {
-                $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons @("Your output was not specific enough for the pipeline to continue automatically.") -PreviousOutput $investigationOutput
+                $repairReasons = @("Your output was not specific enough for the pipeline to continue automatically.")
+                if ($priorArtRequirement.required -and $priorArtValidation -and @($priorArtValidation.issues).Count -gt 0) {
+                    $repairReasons += @($priorArtValidation.issues)
+                }
+                $repairBlock = Get-RepairBlock -FailureCode "INVESTIGATION_INCONCLUSIVE" -Reasons $repairReasons -PreviousOutput $investigationOutput
                 $repairTargets = @($planTargets + $discoverVerdict.targetHints + $investigationVerdict.targets | Select-Object -Unique)
                 $repairContext = Get-ScopedCodebaseContext -Inventory $codebaseInventory -TaskText $taskPrompt -Targets $repairTargets
                 $repairTestProjectText = Format-TestProjectsForPrompt -Projects $testProjects -TaskText $taskPrompt -Targets $repairTargets
+                $repairPriorArtBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "INVESTIGATE"
+                $repairPriorArtOutputBlock = Get-InvestigationPriorArtOutputBlock -Required ([bool]$priorArtRequirement.required)
                 $repairPrompt = @"
 $repairBlock
 
@@ -3483,6 +3981,8 @@ $repairTestProjectText
 
 CONTEXT:
 $repairContext
+$workerBriefsInvestigateBlock
+$repairPriorArtBlock
 
 OUTPUT FORMAT:
 RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
@@ -3494,6 +3994,7 @@ TESTABILITY_REASSESSMENT: YES | NO | UNKNOWN
 RECOMMENDED_NEXT_PHASE: FIX_PLAN | REPRODUCE
 NEXT_ACTION:
 <concrete next change or rationale>
+$repairPriorArtOutputBlock
 "@
                 $repairModel = Get-ModelForRepair -PhaseName "INVESTIGATE" -TaskClass $taskClass -InvestigationRequired $needsInvestigation -Targets $repairTargets -PreviousOutput $investigationOutput -TaskText $taskPrompt
                 $repairResult = Invoke-ClaudeRepair -PhaseName "INVESTIGATE" -Prompt $repairPrompt -Model $repairModel -Attempt (90 + $investigateAttempt * 10 + $repairAttempt)
@@ -3501,13 +4002,26 @@ NEXT_ACTION:
                 $investigationOutput = $repairResult.output.Trim()
                 Save-Artifact -Name "investigation-v$investigateAttempt-repair-$repairAttempt.txt" -Content $investigationOutput | Out-Null
                 $investigationVerdict = Get-InvestigationVerdict -Output $investigationOutput
+                $priorArtRequirement = Get-PriorArtRequirement -TaskText $taskPrompt -TaskClass $taskClass -Targets @($repairTargets + $investigationVerdict.targets) -RetryContext $retryContextState
                 if ($investigationVerdict.testability -ne "UNKNOWN") {
                     $testability = $investigationVerdict.testability
                 }
+                if ($priorArtRequirement.required) {
+                    $investigationVerdict.priorArtRequired = $true
+                }
+                $priorArtValidation = Get-InvestigationPriorArtValidation -InvestigationVerdict $investigationVerdict -PriorArtRequired ([bool]$priorArtRequirement.required)
+                $investigationVerdict.referenceFiles = @($priorArtValidation.referenceFiles)
+                $investigationVerdict.referenceFindings = [string]$priorArtValidation.referenceFindings
+                $investigationVerdict.reuseStrategy = [string]$priorArtValidation.reuseStrategy
                 if ($investigationVerdict.result -eq "INCONCLUSIVE" -and (Test-HasActionableSignal -Text $investigationOutput)) {
                     $investigationVerdict.result = "CHANGE_NEEDED"
                     $investigationConclusion = "CHANGE_NEEDED_SALVAGED"
                     $investigationVerdict.targets = @(Get-ActionableItems -Text $investigationOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' } | Select-Object -Unique)
+                }
+                if ($priorArtRequirement.required -and $investigationVerdict.result -eq "CHANGE_NEEDED" -and -not $priorArtValidation.valid) {
+                    Add-FeedbackEntry -Attempt $investigateAttempt -Source "INVESTIGATE" -Category "PRIOR_ART_INSUFFICIENT" -Feedback ($priorArtValidation.issues -join " ")
+                    $investigationVerdict.result = "INCONCLUSIVE"
+                    $investigationConclusion = "PRIOR_ART_INSUFFICIENT"
                 }
                 if ($investigationVerdict.result -eq "CHANGE_NEEDED") {
                     if ($investigationVerdict.targets.Count -gt 0) {
@@ -3716,6 +4230,9 @@ $($reproductionTests.rationale)
         } else {
             "No verified test reproduction is available."
         }
+        $validatedPriorArtBlock = Get-ValidatedPriorArtPromptSection -InvestigationVerdict $investigationVerdict
+        $priorArtPlanRequirementBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "FIX_PLAN"
+        $priorArtPlanOutputBlock = Get-PlanPriorArtOutputBlock -Required ([bool]$investigationVerdict.priorArtRequired)
         $planPrompt = @"
 Create the concrete fix plan now based on the evidence already collected. Do not plan speculatively anymore.
 Stay compact: at most 5 files or search areas and at most 4 ordered steps.
@@ -3743,6 +4260,8 @@ $reproductionBlock
 
 CONTEXT:
 $planContext
+$validatedPriorArtBlock
+$priorArtPlanRequirementBlock
 $retryContextPlanBlock
 $replanBlock
 RULES:
@@ -3772,6 +4291,7 @@ For each relevant file or search area:
 ## Constraints
 - <concrete risk>
 
+$priorArtPlanOutputBlock
 ## Reproduction Tests
 - <only when present: project/file/test/expectation>
 
@@ -3789,7 +4309,7 @@ Write ONLY the plan.
 
         $planOutput = $planResult.output.Trim()
         Save-Artifact -Name "fix-plan-v$planAttempt.txt" -Content $planOutput | Out-Null
-        $planValidation = Get-PlanValidation -Plan $planOutput
+        $planValidation = Get-PlanValidation -Plan $planOutput -PriorArtRequired ([bool]$investigationVerdict.priorArtRequired)
         Save-JsonArtifact -Name "fix-plan-v$planAttempt-validation.json" -Object $planValidation | Out-Null
         if ($planValidation.valid) {
             $candidatePlanTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
@@ -3850,6 +4370,9 @@ $reproductionBlock
 
 CONTEXT:
 $planContext
+$validatedPriorArtBlock
+$priorArtPlanRequirementBlock
+$retryContextPlanBlock
 
 OUTPUT FORMAT:
 ## Goal
@@ -3868,6 +4391,7 @@ For each relevant file or search area:
 ## Constraints
 - <concrete risk>
 
+$priorArtPlanOutputBlock
 ## Reproduction Tests
 - <only when present: project/file/test/expectation>
 
@@ -3880,7 +4404,7 @@ Write ONLY the plan.
 
             $planOutput = $repairResult.output.Trim()
             Save-Artifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt.txt" -Content $planOutput | Out-Null
-            $planValidation = Get-PlanValidation -Plan $planOutput
+            $planValidation = Get-PlanValidation -Plan $planOutput -PriorArtRequired ([bool]$investigationVerdict.priorArtRequired)
             Save-JsonArtifact -Name "fix-plan-v$planAttempt-repair-$repairAttempt-validation.json" -Object $planValidation | Out-Null
             if ($planValidation.valid) {
                 $candidateRepairedTargets = @($planTargets + $planValidation.targets | Select-Object -Unique)
@@ -3910,7 +4434,7 @@ Write ONLY the plan.
             break
         }
         $salvagedPlanTargets = Get-ActionableItems -Text $planOutput | Where-Object { $_ -match '\.(razor|cs|css|js|ts|xaml|csproj)\b|\*' }
-        if ($salvagedPlanTargets.Count -gt 0) {
+        if ($salvagedPlanTargets.Count -gt 0 -and -not $investigationVerdict.priorArtRequired) {
             $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
             $planValidation.valid = $true
             $lastPlanFailureReason = ""
@@ -3974,6 +4498,8 @@ $($reproductionTests.bugBehavior)
         }
         $implementPlan = Clip-Text -Text $planOutput -MaxChars 2600 -Marker "Fix plan trimmed"
         $taskClaimGuardrail = Get-TaskClaimGuardrail -TaskText $taskPrompt -ReproductionConfirmed $reproductionConfirmed
+        $validatedImplementPriorArtBlock = Get-ValidatedPriorArtPromptSection -InvestigationVerdict $investigationVerdict
+        $implementPriorArtRequirementBlock = Get-PriorArtRequirementPromptSection -Requirement $priorArtRequirement -Mode "IMPLEMENT"
         $implPrompt = @"
 Implement the change. Do not guess.
 Work in a focused way. Open only files relevant to the target. At the end, output only the required short result format.
@@ -3991,6 +4517,9 @@ $implementPlan
 
 INVESTIGATION:
 $investigationBlock
+
+$validatedImplementPriorArtBlock
+$implementPriorArtRequirementBlock
 
 REPRODUCTION:
 $reproductionBlock

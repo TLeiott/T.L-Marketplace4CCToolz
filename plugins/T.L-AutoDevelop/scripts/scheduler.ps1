@@ -889,6 +889,12 @@ function Get-TaskArtifactPointers {
         ""
     }
 
+    $briefsFilePath = if ($Task.latestRun.artifacts -and $Task.latestRun.artifacts.briefs) {
+        [string]$Task.latestRun.artifacts.briefs
+    } else {
+        ""
+    }
+
     return [pscustomobject]@{
         runDir = $runDir
         schedulerSnapshotPath = $schedulerSnapshotPath
@@ -898,6 +904,7 @@ function Get-TaskArtifactPointers {
         workerStderrPath = $workerStderrPath
         plannerContextPath = $plannerContextPath
         retryContextPath = $retryContextPath
+        briefsFilePath = $briefsFilePath
     }
 }
 
@@ -1613,6 +1620,66 @@ function Write-PlannerContextFile {
         plannerMetadata = if ($Task.plannerMetadata) { $Task.plannerMetadata } else { [pscustomobject]@{} }
     } | ConvertTo-Json -Depth 16
     [System.IO.File]::WriteAllText($Path, $payload, [System.Text.Encoding]::UTF8)
+}
+
+function Get-WorkerBriefEntries {
+    param($State)
+
+    return @(
+        @(Get-CompletedTaskBriefs -State $State) |
+            Where-Object {
+                [string]$_.status -in @("ACCEPTED", "NO_CHANGE")
+            } |
+            Select-Object -First 6
+    )
+}
+
+function Get-WorkerBriefsPayload {
+    param(
+        $State,
+        $Task
+    )
+
+    if (-not $State -or -not $Task) { return $null }
+
+    $entries = @(Get-WorkerBriefEntries -State $State)
+    if ($entries.Count -eq 0) { return $null }
+
+    $briefs = @($entries | ForEach-Object {
+        [ordered]@{
+            taskId = [string]$_.taskId
+            waveNumber = [int]$_.waveNumber
+            status = [string]$_.status
+            finalCategory = [string]$_.finalCategory
+            taskSummary = [string]$_.taskSummary
+            whatWasBuilt = [string]$_.whatWasBuilt
+            discoveries = @($_.discoveries)
+            filesChanged = @($_.filesChanged)
+            conflictHints = [string]$_.conflictHints
+        }
+    })
+
+    return [ordered]@{
+        version = 1
+        taskId = [string]$Task.taskId
+        briefCount = $briefs.Count
+        briefs = @($briefs)
+    }
+}
+
+function Write-WorkerBriefsFile {
+    param(
+        [string]$Path,
+        $State,
+        $Task
+    )
+
+    $payload = Get-WorkerBriefsPayload -State $State -Task $Task
+    if (-not $payload) { return $null }
+
+    Ensure-ParentDirectory -Path $Path
+    [System.IO.File]::WriteAllText($Path, ($payload | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+    return $payload
 }
 
 function Get-RetryLessonComparisonText {
@@ -3413,6 +3480,7 @@ function Get-EncodedWorkerLaunchCommand {
         [string]$ResultFile,
         [string]$PlannerContextFile,
         [string]$RetryContextFile,
+        [string]$BriefsFile,
         [string]$TaskName,
         [string]$SchedulerTaskId,
         [string]$CommandType,
@@ -3425,6 +3493,7 @@ function Get-EncodedWorkerLaunchCommand {
     $resultLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $ResultFile
     $plannerContextLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $PlannerContextFile
     $retryContextLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $RetryContextFile
+    $briefsLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $BriefsFile
     $taskNameLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $TaskName
     $taskIdLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SchedulerTaskId
     $commandTypeLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $CommandType
@@ -3432,7 +3501,7 @@ function Get-EncodedWorkerLaunchCommand {
 
     $commandText = @"
 `$ErrorActionPreference = 'Stop'
-& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -PlannerContextFile $plannerContextLiteral -RetryContextFile $retryContextLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
+& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -PlannerContextFile $plannerContextLiteral -RetryContextFile $retryContextLiteral -BriefsFile $briefsLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
 exit `$LASTEXITCODE
 "@
 
@@ -4211,8 +4280,11 @@ function Run-Task {
         $pipelineResultPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-result.json"
         $plannerContextPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-planner-context.json"
         $retryContextPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-retry-context.json"
+        $briefsFilePath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-worker-briefs.json"
         $retryContextPayload = Write-RetryContextFile -Path $retryContextPath -Task $task -AttemptNumber $attemptNumber
         $retryContextFileForLaunch = if ($retryContextPayload) { $retryContextPath } else { "" }
+        $briefsPayload = Write-WorkerBriefsFile -Path $briefsFilePath -State $state -Task $task
+        $briefsFileForLaunch = if ($briefsPayload) { $briefsFilePath } else { "" }
         $taskName = Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -LaunchSequence $launchSequence
         $runDir = Join-Path (Join-Path $context.repoRoot ".claude-develop-logs\runs") $taskName
         $artifactPointers = [pscustomobject]@{
@@ -4222,6 +4294,7 @@ function Run-Task {
             resultFile = $pipelineResultPath
             plannerContextFile = $plannerContextPath
             retryContextFile = $retryContextFileForLaunch
+            briefsFile = $briefsFileForLaunch
         }
         $task.latestRun = New-LatestRunRecord `
             -AttemptNumber $attemptNumber `
@@ -4239,6 +4312,7 @@ function Run-Task {
             schedulerSnapshot = $artifactPointers.schedulerSnapshotPath
             plannerContext = $artifactPointers.plannerContextFile
             retryContext = $artifactPointers.retryContextFile
+            briefs = $artifactPointers.briefsFile
             workerLauncher = $workerLauncher.command
             workerStdout = ""
             workerStderr = ""
@@ -4259,6 +4333,7 @@ function Run-Task {
         -ResultFile $pipelineResultPath `
         -PlannerContextFile $plannerContextPath `
         -RetryContextFile ([string]$artifactPointers.retryContextFile) `
+        -BriefsFile ([string]$artifactPointers.briefsFile) `
         -TaskName ([string]$task.latestRun.taskName) `
         -SchedulerTaskId ([string]$task.taskId) `
         -CommandType ([string]$task.sourceCommand) `

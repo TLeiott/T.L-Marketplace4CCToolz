@@ -1412,12 +1412,13 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     $resultFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json'
     $plannerContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json'
     $retryContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json'
+    $briefsFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\worker briefs.json'
     $taskName = 'develop-task-a1'
     $taskId = 'task-spaces'
     $commandType = 'develop'
 
     $encoded = Invoke-SchedulerHelperFunctions -FunctionNames @("ConvertTo-PowerShellSingleQuotedLiteral", "Get-EncodedWorkerLaunchCommand") -ScriptBlock {
-        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -PlannerContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json' -RetryContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
+        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -PlannerContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json' -RetryContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json' -BriefsFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\worker briefs.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
     }
 
     $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(([string]$encoded).Trim()))
@@ -1429,6 +1430,7 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     Assert-True ($decoded -match [regex]::Escape($resultFile)) "Encoded worker launch must preserve the full spaced result path."
     Assert-True ($decoded -match [regex]::Escape($plannerContextFile)) "Encoded worker launch must preserve the planner context file path."
     Assert-True ($decoded -match [regex]::Escape($retryContextFile)) "Encoded worker launch must preserve the retry context file path."
+    Assert-True ($decoded -match [regex]::Escape($briefsFile)) "Encoded worker launch must preserve the worker briefs file path."
     Assert-True ($decoded -notmatch '-File\s+C:\\Users\\Example') "Encoded worker launch must not rely on a raw -File argument that can split at spaces."
 }
 
@@ -1509,6 +1511,407 @@ function Test-MissingPlannerContextFallsBackToComplexProfile {
     Assert-True ($parsed.contextLoaded -eq $false) "Missing planner context should not load successfully."
     Assert-True ([string]$parsed.plannerEffortClass -eq "UNKNOWN") "Missing planner context should fall back to UNKNOWN effort."
     Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
+}
+
+function Test-WriteWorkerBriefsFilePersistsAcceptedCompletedBriefs {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Get-Tasks",
+        "Normalize-StringArray",
+        "Clip-DiscoveryBriefText",
+        "Get-DiscoveryBriefConflictHint",
+        "Get-TaskDiscoveryBrief",
+        "Get-DiscoveryBriefPriority",
+        "Get-CompletedTaskBriefs",
+        "Get-WorkerBriefEntries",
+        "Get-WorkerBriefsPayload",
+        "Ensure-Directory",
+        "Ensure-ParentDirectory",
+        "Write-WorkerBriefsFile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("worker-briefs-" + [guid]::NewGuid().ToString("N") + ".json")
+        $state = [pscustomobject]@{
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "accepted-brief"
+                    submissionOrder = 2
+                    waveNumber = 2
+                    state = "merged"
+                    taskText = "Reuse the existing converter in OrderService."
+                    plannerMetadata = [pscustomobject]@{ likelyAreas = @("Services") }
+                    plannerFeedback = [pscustomobject]@{ classification = "broad" }
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "ACCEPTED"
+                        finalCategory = "ACCEPTED"
+                        summary = "Reused the existing converter path in OrderService."
+                        feedback = ""
+                        investigationConclusion = "OrderService already shared the same conversion path."
+                        actualFiles = @("src\\Services\\OrderService.cs", "tests\\OrderServiceTests.cs")
+                        completedAt = "2026-03-25T10:00:00.0000000Z"
+                    }
+                }
+                [pscustomobject]@{
+                    taskId = "failed-brief"
+                    submissionOrder = 1
+                    waveNumber = 1
+                    state = "completed_failed_terminal"
+                    taskText = "Broken attempt"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = [pscustomobject]@{
+                        finalStatus = "FAILED"
+                        finalCategory = "PREFLIGHT_FAILED"
+                        summary = "Failed"
+                        feedback = "Do not use this brief."
+                        investigationConclusion = ""
+                        actualFiles = @("src\\Ignore.cs")
+                        completedAt = "2026-03-25T09:00:00.0000000Z"
+                    }
+                }
+            )
+        }
+        $task = [pscustomobject]@{ taskId = "task-current" }
+        $payload = Write-WorkerBriefsFile -Path $path -State $state -Task $task
+        try {
+            [pscustomobject]@{
+                hasPayload = [bool]$payload
+                raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            } | ConvertTo-Json -Depth 16
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    $json = $parsed.raw | ConvertFrom-Json
+    Assert-True ($parsed.hasPayload -eq $true) "Worker briefs should be written when accepted completed-task briefs exist."
+    Assert-True ([string]$json.taskId -eq "task-current") "Worker briefs payload should preserve the current task id."
+    Assert-True ([int]$json.briefCount -eq 1) "Worker briefs should exclude failed-terminal completed tasks."
+    Assert-True ([string]$json.briefs[0].taskId -eq "accepted-brief") "Worker briefs should preserve accepted completed-task brief content."
+}
+
+function Test-WorkerBriefsRoundTripLoadsWorkerState {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-WorkerBriefsState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("worker-briefs-state-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-briefs","briefCount":1,"briefs":[{"taskId":"accepted-brief","waveNumber":2,"status":"ACCEPTED","finalCategory":"ACCEPTED","taskSummary":"Reuse the existing converter in OrderService.","whatWasBuilt":"Reused the existing converter path in OrderService.","discoveries":["OrderService already shared the same conversion path."],"filesChanged":[".\\src\\Services\\OrderService.cs"],"conflictHints":"Touches Services."}]}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-WorkerBriefsState -BriefsFile $path -ExpectedTaskId "task-briefs") | ConvertTo-Json -Depth 16
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $true) "Valid worker briefs files should load successfully."
+    Assert-True ([int]$parsed.briefCount -eq 1) "Worker briefs should preserve the brief count."
+    Assert-True ([string]$parsed.briefs[0].taskId -eq "accepted-brief") "Worker briefs should preserve brief task ids."
+    Assert-True (@($parsed.briefs[0].filesChanged) -contains "src\Services\OrderService.cs") "Worker briefs should normalize changed-file paths."
+}
+
+function Test-FormatWorkerBriefsPromptBlockIncludesDiscoveries {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Clip-Text",
+        "Format-WorkerBriefsPromptBlock"
+    ) -ScriptBlock {
+        $briefs = [pscustomobject]@{
+            loaded = $true
+            briefs = @(
+                [pscustomobject]@{
+                    taskId = "accepted-brief"
+                    taskSummary = "Reuse the existing converter in OrderService."
+                    whatWasBuilt = "Reused the existing converter path in OrderService."
+                    discoveries = @("OrderService already shared the same conversion path.")
+                    filesChanged = @("src\Services\OrderService.cs")
+                    conflictHints = "Touches Services."
+                }
+            )
+        }
+
+        Format-WorkerBriefsPromptBlock -WorkerBriefs $briefs -Mode "INVESTIGATE" -MaxChars 1200
+    }
+
+    Assert-True ([string]$output -match "accepted-brief") "Worker briefs prompt blocks should include the source task id."
+    Assert-True ([string]$output -match "Discoveries") "Worker briefs prompt blocks should include compact discovery summaries."
+    Assert-True ([string]$output -match "BRIEF RULE") "Worker briefs prompt blocks should include the mode-specific grounding rule."
+}
+
+function Test-InvestigationPriorArtOutputBlockUsesFileQualifiedSearchHitContract {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-InvestigationPriorArtOutputBlock"
+    ) -ScriptBlock {
+        Get-InvestigationPriorArtOutputBlock -Required $true
+    }
+
+    Assert-True ([string]$output -match "file-qualified search hit") "Investigation prior-art contract should allow file-qualified search hits."
+    Assert-True ([string]$output -match "REUSE_STRATEGY") "Investigation prior-art contract should require a reuse strategy."
+}
+
+function Test-PlanPriorArtOutputBlockRequiresConcreteRelativePath {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-PlanPriorArtOutputBlock"
+    ) -ScriptBlock {
+        Get-PlanPriorArtOutputBlock -Required $true
+    }
+
+    Assert-True ([string]$output -match "<concrete relative path>") "Plan prior-art contract should require concrete relative paths."
+    Assert-True ([string]$output -notmatch "search pattern") "Plan prior-art contract should not advertise search patterns."
+}
+
+function Test-PriorArtRequirementDetectsReuseAndCrossLayerSignals {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Test-PriorArtReuseText",
+        "Get-TaskCodeReferenceHints",
+        "Get-PriorArtRequirement"
+    ) -ScriptBlock {
+        (Get-PriorArtRequirement -TaskText "Reuse the existing OrderConverter and align SaveDialogInterop.InvokeSave with the current handler." -TaskClass "INVESTIGATIVE" -Targets @("Components\\Editor.razor", "Services\\OrderService.cs")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.required -eq $true) "Reuse-heavy cross-layer tasks should require prior-art grounding."
+    Assert-True ([string]$parsed.triggerKind -eq "reuse_text") "Explicit reuse wording should trigger the prior-art requirement."
+    Assert-True (@($parsed.namedReferences).Count -gt 0) "Named code references should be captured for prior-art grounding."
+}
+
+function Test-PriorArtRequirementSkipsSimpleDirectEdit {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Test-PriorArtReuseText",
+        "Get-TaskCodeReferenceHints",
+        "Get-PriorArtRequirement"
+    ) -ScriptBlock {
+        (Get-PriorArtRequirement -TaskText "Rename the banner title text on the settings page." -TaskClass "DIRECT_EDIT" -Targets @("Pages\\Settings.razor")) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.required -eq $false) "Simple direct-edit tasks should not be forced through prior-art grounding."
+}
+
+function Test-PriorArtRequirementIgnoresGenericRoleNouns {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Test-PriorArtReuseText",
+        "Get-TaskCodeReferenceHints",
+        "Get-PriorArtRequirement"
+    ) -ScriptBlock {
+        [pscustomobject]@{
+            callback = Get-PriorArtRequirement -TaskText "Add a callback so the new wizard can notify completion." -TaskClass "DIRECT_EDIT" -Targets @("Pages\\Wizard.razor")
+            converter = Get-PriorArtRequirement -TaskText "Create a new converter for CSV import." -TaskClass "DIRECT_EDIT" -Targets @("Converters\\CsvImportConverter.cs")
+        } | ConvertTo-Json -Depth 10
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.callback.required -eq $false) "Generic callback wording must not force prior-art grounding."
+    Assert-True ($parsed.converter.required -eq $false) "Generic converter wording must not force prior-art grounding."
+}
+
+function Test-InvestigationVerdictParsesPriorArtFields {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-SectionLines",
+        "Get-BulletSectionValues",
+        "Get-ScalarSectionText",
+        "Get-InvestigationVerdict"
+    ) -ScriptBlock {
+        @"
+RESULT: CHANGE_NEEDED
+TARGET_FILES:
+- Components\Editor.razor
+ROOT_CAUSE:
+The current callback path already exists in the editor service.
+TESTABILITY_REASSESSMENT: YES
+RECOMMENDED_NEXT_PHASE: FIX_PLAN
+NEXT_ACTION:
+Reuse the existing callback path.
+PRIOR_ART_REQUIRED: YES
+REFERENCE_FILES:
+- Services\EditorService.cs
+- Components\Shared\EditorCallbacks.razor
+REFERENCE_FINDINGS:
+EditorService already owns the callback registration.
+REUSE_STRATEGY:
+Bind the existing callback path instead of introducing a parallel implementation.
+"@ | ForEach-Object {
+            (Get-InvestigationVerdict -Output $_) | ConvertTo-Json -Depth 12
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.priorArtRequired -eq $true) "Investigation verdicts should preserve the prior-art-required marker."
+    Assert-True (@($parsed.referenceFiles).Count -eq 2) "Investigation verdicts should parse concrete reference files."
+    Assert-True ([string]$parsed.reuseStrategy -match "existing callback path") "Investigation verdicts should preserve the reuse strategy."
+}
+
+function Test-InvestigationPriorArtValidationRequiresAllFields {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-InvestigationPriorArtValidation"
+    ) -ScriptBlock {
+        $verdict = [pscustomobject]@{
+            priorArtRequired = $true
+            referenceFiles = @("Services\\EditorService.cs")
+            referenceFindings = ""
+            reuseStrategy = ""
+        }
+
+        (Get-InvestigationPriorArtValidation -PriorArtRequired $true -InvestigationVerdict $verdict) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Prior-art validation should reject investigations that omit findings and reuse strategy."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reference findings") "Prior-art validation should report missing findings."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reuse strategy") "Prior-art validation should report missing reuse strategy."
+}
+
+function Test-InvestigationPriorArtValidationAcceptsFileQualifiedSearchHits {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-InvestigationPriorArtValidation"
+    ) -ScriptBlock {
+        $verdict = [pscustomobject]@{
+            priorArtRequired = $true
+            referenceFiles = @("Services\\EditorService.cs:42 callback registration")
+            referenceFindings = "EditorService already owns the callback registration."
+            reuseStrategy = "Reuse the existing callback registration path."
+        }
+
+        (Get-InvestigationPriorArtValidation -PriorArtRequired $true -InvestigationVerdict $verdict) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "File-qualified search hits should satisfy investigation prior-art validation."
+    Assert-True (@($parsed.referenceFiles) -contains "Services\\EditorService.cs") "File-qualified search hits should normalize to concrete reference files."
+}
+
+function Test-InvestigationPriorArtValidationRejectsRawSearchCommands {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-InvestigationPriorArtValidation"
+    ) -ScriptBlock {
+        $verdict = [pscustomobject]@{
+            priorArtRequired = $true
+            referenceFiles = @('rg "OrderConverter" src')
+            referenceFindings = "Search output looked relevant."
+            reuseStrategy = "Reuse the converter path."
+        }
+
+        (Get-InvestigationPriorArtValidation -PriorArtRequired $true -InvestigationVerdict $verdict) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Raw search commands should not satisfy investigation prior-art validation."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reference file") "Investigation prior-art validation should explain that concrete reference evidence is missing."
+}
+
+function Test-PlanValidationRequiresReuseSectionWhenPriorArtRequired {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Fix the editor callback.
+
+## Files
+- Path: Components\Editor.razor
+- Action: MODIFY
+- Changes: Wire the callback.
+
+## Order
+1. Update the component.
+2. Run the build.
+
+## Constraints
+- Keep the change focused.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Plans missing the reuse/reference section should fail validation when prior-art is required."
+    Assert-True ((@($parsed.issues) -join "`n") -match "Reuse / Reference Pattern") "Validation should explain that the reuse/reference section is missing."
+}
+
+function Test-PlanValidationAcceptsConcreteReuseSectionWhenPriorArtRequired {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Fix the editor callback.
+
+## Files
+- Path: Components\Editor.razor
+- Action: MODIFY
+- Changes: Wire the callback.
+
+## Order
+1. Update the component.
+2. Run the build.
+
+## Constraints
+- Keep the change focused.
+
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- Services\EditorService.cs
+- Components\Shared\EditorCallbacks.razor
+Reuse Path:
+Reuse the existing callback registration path from EditorService.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "Concrete reuse/reference sections should satisfy prior-art plan validation."
+    Assert-True (@($parsed.referenceFiles).Count -eq 2) "Plan validation should preserve parsed reference files separately from implementation targets."
+}
+
+function Test-PlanValidationRejectsSearchPatternReferenceWhenPriorArtRequired {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Fix the editor callback.
+
+## Files
+- Path: Components\Editor.razor
+- Action: MODIFY
+- Changes: Wire the callback.
+
+## Order
+1. Update the component.
+2. Run the build.
+
+## Constraints
+- Keep the change focused.
+
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- rg ""EditorService"" Services
+Reuse Path:
+Reuse the existing callback registration path from EditorService.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Search-pattern-only references should not satisfy plan prior-art validation."
+    Assert-True ((@($parsed.issues) -join "`n") -match "reference file paths") "Plan validation should explain that concrete reference file paths are required."
 }
 
 function Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons {
@@ -1843,6 +2246,7 @@ function Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts {
         $resultPath = Join-Path $repo.tasksDir "retry-context-reconcile-result.json"
         $plannerContextPath = Join-Path $repo.root "planner-context.json"
         $retryContextPath = Join-Path $repo.root "retry-context.json"
+        $briefsFilePath = Join-Path $repo.root "worker-briefs.json"
         New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
         [System.IO.File]::WriteAllText($resultPath, (@{
             status = "FAILED"
@@ -1872,6 +2276,7 @@ function Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts {
         $latestRun.artifacts = [pscustomobject]@{
             plannerContext = $plannerContextPath
             retryContext = $retryContextPath
+            briefs = $briefsFilePath
         }
 
         Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
@@ -1918,6 +2323,7 @@ function Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts {
         Assert-True ([string]$task.runs[0].retryLessons[0].category -eq "REVIEW_DENIED_MAJOR") "Persisted retry lessons should preserve the original blocker category."
         Assert-True ([string]$task.progress.artifactPointers.plannerContextPath -eq $plannerContextPath) "Task progress should expose the preserved planner context path."
         Assert-True ([string]$task.progress.artifactPointers.retryContextPath -eq $retryContextPath) "Task progress should expose the preserved retry context path."
+        Assert-True ([string]$task.progress.artifactPointers.briefsFilePath -eq $briefsFilePath) "Task progress should expose the preserved worker briefs path."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -6246,6 +6652,21 @@ Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-WritePlannerContextFilePersistsEffortClass
 Test-PlannerContextLowEffortSelectsSimpleProfile
 Test-MissingPlannerContextFallsBackToComplexProfile
+Test-WriteWorkerBriefsFilePersistsAcceptedCompletedBriefs
+Test-WorkerBriefsRoundTripLoadsWorkerState
+Test-FormatWorkerBriefsPromptBlockIncludesDiscoveries
+Test-InvestigationPriorArtOutputBlockUsesFileQualifiedSearchHitContract
+Test-PlanPriorArtOutputBlockRequiresConcreteRelativePath
+Test-PriorArtRequirementDetectsReuseAndCrossLayerSignals
+Test-PriorArtRequirementSkipsSimpleDirectEdit
+Test-PriorArtRequirementIgnoresGenericRoleNouns
+Test-InvestigationVerdictParsesPriorArtFields
+Test-InvestigationPriorArtValidationRequiresAllFields
+Test-InvestigationPriorArtValidationAcceptsFileQualifiedSearchHits
+Test-InvestigationPriorArtValidationRejectsRawSearchCommands
+Test-PlanValidationRequiresReuseSectionWhenPriorArtRequired
+Test-PlanValidationAcceptsConcreteReuseSectionWhenPriorArtRequired
+Test-PlanValidationRejectsSearchPatternReferenceWhenPriorArtRequired
 Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons
 Test-RetryContextRoundTripLoadsWorkerState
 Test-WrongTaskRetryContextFallsBackGracefully
