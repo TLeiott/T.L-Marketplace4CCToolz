@@ -135,12 +135,12 @@ Run the usage gate in `probe` mode with `-ThresholdPercent 90`.
 Use this initial probe only to:
 - detect fatal gate errors
 - show the current 5h status to the user
-- confirm whether statusline/cache data is currently available
+- confirm whether a fresh usage state can be retrieved
 
 Interpret the initial probe strictly:
 - `processStatus == "fatal"`: stop and show the error.
 - `ok == true`: continue to queue planning.
-- `ok == false` or the script is unavailable: continue, but remember that the later launch decision will need an explicit fallback question.
+- `ok == false` or the script is unavailable: continue to queue planning, but do not treat the gate as launchable until a later fresh probe succeeds.
 
 Important:
 - Do not treat this initial probe as sufficient for the rest of the session.
@@ -237,7 +237,7 @@ Launch-gate procedure:
    - `projectedUsage = currentUsage + estimatedWaveCost`
 5. Interpret the result:
    - fatal gate error -> stop
-   - unavailable gate -> ask the user whether this launch set may ignore the 5h limit
+   - unavailable gate -> stop and report that the 5h budget could not be verified for this launch set
    - available gate and `projectedUsage < 90` -> launch
    - available gate and `projectedUsage >= 90` -> ask the user whether this launch set may overrun the 5h budget
 6. If the user declines, leave the tasks queued and do not start them.

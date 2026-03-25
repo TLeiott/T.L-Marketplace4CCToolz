@@ -1,15 +1,18 @@
-# claude-usage-gate.ps1 -- Probe or wait on local Claude 5h usage state for batch launch gating
+# claude-usage-gate.ps1 -- Probe or wait on Claude usage state for batch launch gating
 param(
     [ValidateSet('probe', 'wait')][string]$Mode = 'probe',
     [int]$ThresholdPercent = 90,
     [string]$ClaudeHome = '',
-    [string]$SettingsPath = '',
     [string]$UsageCachePath = '',
-    [string]$StatusLineCommandOverride = '',
-    [switch]$SkipStatusLineCommand,
     [int]$PollSeconds = 60,
     [int]$FastPollSeconds = 10,
-    [int]$FastWindowSeconds = 60
+    [int]$FastWindowSeconds = 60,
+    [int]$RequestTimeoutSeconds = 15,
+    [string]$CredentialsPath = '',
+    [string]$UsageEndpoint = 'https://api.anthropic.com/api/oauth/usage',
+    [string]$MockUsageJson = '',
+    [string]$MockErrorKind = '',
+    [string]$MockUsageSequencePath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,432 +40,351 @@ function Normalize-Percent {
     }
 }
 
-function Get-ResolvedPathOrEmpty {
-    param([string]$Path)
-    if (-not $Path) { return '' }
-    try {
-        return (Resolve-Path -LiteralPath $Path).Path
-    } catch {
-        return ''
-    }
-}
-
 function Get-EffectiveClaudeHome {
     if ($ClaudeHome) { return $ClaudeHome }
     return (Join-Path $env:USERPROFILE '.claude')
 }
 
-function Get-EffectiveSettingsPath {
-    param([string]$BaseClaudeHome)
-    if ($SettingsPath) { return $SettingsPath }
-    return (Join-Path $BaseClaudeHome 'settings.json')
-}
-
 function Get-EffectiveUsageCachePath {
     param([string]$BaseClaudeHome)
     if ($UsageCachePath) { return $UsageCachePath }
-    return (Join-Path $BaseClaudeHome '.usage-cache.json')
+    return (Join-Path $BaseClaudeHome 'tl-autodev-usage-cache.json')
 }
 
-function Strip-AnsiText {
-    param([string]$Text)
-    if (-not $Text) { return '' }
-    $clean = [regex]::Replace($Text, "\x1B\[[0-?]*[ -/]*[@-~]", '')
-    $clean = $clean -replace "`r", ''
-    return $clean.Trim()
+function Get-EffectiveCredentialsPath {
+    param([string]$BaseClaudeHome)
+    if ($CredentialsPath) { return $CredentialsPath }
+    return (Join-Path $BaseClaudeHome '.credentials.json')
 }
 
-function Convert-TtlToResetAt {
-    param([string]$Ttl)
-    if (-not $Ttl) { return $null }
-    if ($Ttl -notmatch '^(?<value>\d+)(?<unit>[mhd])$') { return $null }
-    $value = [int]$Matches['value']
-    $unit = $Matches['unit']
-    $base = Get-Date
-    switch ($unit) {
-        'm' { return $base.AddMinutes($value) }
-        'h' { return $base.AddHours($value) }
-        'd' { return $base.AddDays($value) }
+function Convert-ToIsoStringOrNull {
+    param($Value)
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.ToString('o')
     }
+
+    if ($Value -is [DateTime]) {
+        return ([DateTimeOffset]$Value).ToString('o')
+    }
+
+    try {
+        return ([DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)).ToString('o')
+    } catch {
+        return $null
+    }
+}
+
+function Convert-ToDateTimeOffsetOrNull {
+    param($Value)
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+
+    if ($Value -is [DateTimeOffset]) {
+        return $Value
+    }
+
+    if ($Value -is [DateTime]) {
+        return [DateTimeOffset]$Value
+    }
+
+    if ($Value -is [long] -or $Value -is [int] -or $Value -is [double] -or $Value -is [decimal]) {
+        try {
+            return [DateTimeOffset]::FromUnixTimeSeconds([long]$Value)
+        } catch {
+            return $null
+        }
+    }
+
+    $text = [string]$Value
+    if (-not $text) { return $null }
+
+    try {
+        return [DateTimeOffset]::Parse($text, [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        try {
+            if ($text -match '^\d+$') {
+                return [DateTimeOffset]::FromUnixTimeSeconds([long]$text)
+            }
+        } catch {
+        }
+    }
+
     return $null
 }
 
-function Invoke-CommandText {
-    param(
-        [string]$CommandText,
-        [string]$InputText
-    )
-    if (-not $CommandText) {
-        return [ordered]@{
-            success = $false
-            exitCode = -1
-            output = ''
-            error = 'No command was provided.'
-        }
-    }
-
-    try {
-        $output = $InputText | & cmd.exe /d /s /c $CommandText 2>&1 | Out-String
-        return [ordered]@{
-            success = ($LASTEXITCODE -eq 0)
-            exitCode = $LASTEXITCODE
-            output = $output.TrimEnd()
-            error = ''
-        }
-    } catch {
-        return [ordered]@{
-            success = $false
-            exitCode = -1
-            output = ''
-            error = $_.Exception.Message
-        }
-    }
-}
-
-function Get-PathCandidatesFromCommandText {
-    param([string]$CommandText)
-    $paths = New-OrderedList
-    if (-not $CommandText) { return @($paths) }
-
-    $matches = [regex]::Matches($CommandText, '(?i)(?<path>[A-Z]:\\[^"\r\n]+)')
-    foreach ($match in $matches) {
-        $candidate = $match.Groups['path'].Value.Trim()
-        if (-not $candidate) { continue }
-        $candidate = $candidate.Trim('"')
-        if ($paths -notcontains $candidate) {
-            [void]$paths.Add($candidate)
-        }
-    }
-
-    return @($paths)
-}
-
-function Expand-CommandText {
-    param([string]$CommandText)
-    if (-not $CommandText) { return '' }
-
-    $expanded = [Environment]::ExpandEnvironmentVariables($CommandText)
-    $homeValue = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
-    if ($homeValue) {
-        $expanded = $expanded.Replace('$HOME', $homeValue)
-        $expanded = $expanded.Replace('${HOME}', $homeValue)
-        $expanded = $expanded.Replace('$env:HOME', $homeValue)
-        $expanded = $expanded.Replace('$Env:HOME', $homeValue)
-    }
-    if ($env:USERPROFILE) {
-        $expanded = $expanded.Replace('$env:USERPROFILE', $env:USERPROFILE)
-        $expanded = $expanded.Replace('$Env:USERPROFILE', $env:USERPROFILE)
-        $expanded = $expanded.Replace('${env:USERPROFILE}', $env:USERPROFILE)
-        $expanded = $expanded.Replace('${Env:USERPROFILE}', $env:USERPROFILE)
-    }
-
-    return $expanded
-}
-
-function Get-StatusLineCommandInfo {
-    param([string]$BaseClaudeHome)
-
-    $errors = New-OrderedList
-    $effectiveSettingsPath = Get-EffectiveSettingsPath -BaseClaudeHome $BaseClaudeHome
-    $resolvedClaudeHome = Get-ResolvedPathOrEmpty -Path $BaseClaudeHome
-    $defaultStatusLinePath = Join-Path $BaseClaudeHome 'statusline.ps1'
-    $resolvedDefaultStatusLinePath = Get-ResolvedPathOrEmpty -Path $defaultStatusLinePath
-
-    function New-CommandInfoResult {
-        param(
-            [string]$Command = '',
-            [string]$ResolvedPath = '',
-            [string]$CommandSource = ''
-        )
-        return [ordered]@{
-            command = $Command
-            resolvedPath = $ResolvedPath
-            commandSource = $CommandSource
-            errors = @($errors)
-        }
-    }
-
-    function Get-DefaultCommandText {
-        param([string]$StatusLinePath)
-        if (-not $StatusLinePath) { return '' }
-        return "pwsh.exe -NoProfile -ExecutionPolicy Bypass -File `"$StatusLinePath`""
-    }
-
-    function Try-BuildTrustedCommand {
-        param(
-            [string]$CommandText,
-            [string]$CommandSource
-        )
-
-        if (-not $CommandText) { return $null }
-        $expandedCommandText = Expand-CommandText -CommandText $CommandText
-        $insideClaudeHome = $false
-        $resolvedTargetPath = ''
-
-        foreach ($candidate in (Get-PathCandidatesFromCommandText -CommandText $expandedCommandText)) {
-            $resolvedCandidate = Get-ResolvedPathOrEmpty -Path $candidate
-            if (-not $resolvedCandidate) { continue }
-            if ($resolvedClaudeHome -and $resolvedCandidate.StartsWith($resolvedClaudeHome, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $insideClaudeHome = $true
-                $resolvedTargetPath = $resolvedCandidate
-                break
-            }
-        }
-
-        if (-not $insideClaudeHome) { return $null }
-        return [ordered]@{
-            command = $expandedCommandText
-            resolvedPath = $resolvedTargetPath
-            commandSource = $CommandSource
-        }
-    }
-
-    if ($StatusLineCommandOverride) {
-        $overrideResult = Try-BuildTrustedCommand -CommandText $StatusLineCommandOverride -CommandSource 'override'
-        if ($overrideResult) {
-            return New-CommandInfoResult -Command $overrideResult.command -ResolvedPath $overrideResult.resolvedPath -CommandSource $overrideResult.commandSource
-        }
-        Add-UniqueError -Errors $errors -Message 'StatusLineCommandOverride does not safely resolve into the main Claude directory.'
-        return New-CommandInfoResult
-    }
-
-    if (-not (Test-Path -LiteralPath $effectiveSettingsPath)) {
-        Add-UniqueError -Errors $errors -Message "settings.json was not found: $effectiveSettingsPath"
-        if ($resolvedDefaultStatusLinePath) {
-            return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
-        }
-        return New-CommandInfoResult
-    }
-
-    try {
-        $settings = Get-Content -LiteralPath $effectiveSettingsPath -Raw | ConvertFrom-Json
-    } catch {
-        Add-UniqueError -Errors $errors -Message "settings.json could not be read: $($_.Exception.Message)"
-        if ($resolvedDefaultStatusLinePath) {
-            return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
-        }
-        return New-CommandInfoResult
-    }
-
-    if ($settings.statusLine.type -ne 'command') {
-        Add-UniqueError -Errors $errors -Message 'statusLine.type is not "command".'
-        if ($resolvedDefaultStatusLinePath) {
-            return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
-        }
-        return New-CommandInfoResult
-    }
-
-    $commandText = [string]$settings.statusLine.command
-    if (-not $commandText) {
-        Add-UniqueError -Errors $errors -Message 'statusLine.command ist leer.'
-        if ($resolvedDefaultStatusLinePath) {
-            return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
-        }
-        return New-CommandInfoResult
-    }
-
-    $trustedCommand = Try-BuildTrustedCommand -CommandText $commandText -CommandSource 'settings'
-    if ($trustedCommand) {
-        return New-CommandInfoResult -Command $trustedCommand.command -ResolvedPath $trustedCommand.resolvedPath -CommandSource $trustedCommand.commandSource
-    }
-
-    Add-UniqueError -Errors $errors -Message 'statusLine.command does not safely resolve to a file inside the main Claude directory.'
-    if ($resolvedDefaultStatusLinePath) {
-        return New-CommandInfoResult -Command (Get-DefaultCommandText -StatusLinePath $resolvedDefaultStatusLinePath) -ResolvedPath $resolvedDefaultStatusLinePath -CommandSource 'default-script'
-    }
-    return New-CommandInfoResult
-}
-
-function Get-MockStatusLinePayload {
-    $cwd = (Get-Location).Path
-    return ([ordered]@{
-        model = [ordered]@{
-            display_name = 'Batch Scheduler'
-            id = 'claude-sonnet-4-6'
-        }
-        context_window = [ordered]@{
-            used_percentage = 0
-            remaining_percentage = 100
-            context_window_size = 1000000
-            exceeds_200k_tokens = $false
-            current_usage = 0
-        }
-        cost = [ordered]@{
-            total_cost_usd = 0
-            total_lines_added = 0
-            total_lines_removed = 0
-            total_duration_ms = 0
-        }
-        workspace = [ordered]@{
-            current_dir = $cwd
-            original_cwd = $cwd
-            added_dirs = @()
-        }
-    } | ConvertTo-Json -Depth 6 -Compress)
-}
-
 function Get-UsageCacheState {
-    param([string]$BaseClaudeHome)
+    param([string]$CachePath)
 
     $errors = New-OrderedList
-    $effectiveCachePath = Get-EffectiveUsageCachePath -BaseClaudeHome $BaseClaudeHome
-    if (-not (Test-Path -LiteralPath $effectiveCachePath)) {
-        Add-UniqueError -Errors $errors -Message "Usage cache was not found: $effectiveCachePath"
+    if (-not (Test-Path -LiteralPath $CachePath)) {
         return [ordered]@{
+            exists = $false
             available = $false
+            cachePath = $CachePath
+            fetchedAt = $null
             fiveHourUtilization = $null
             fiveHourResetAt = $null
             sevenDayUtilization = $null
+            lastError = ''
             errors = @($errors)
         }
     }
 
     try {
-        $cache = Get-Content -LiteralPath $effectiveCachePath -Raw | ConvertFrom-Json
+        $cache = Get-Content -LiteralPath $CachePath -Raw | ConvertFrom-Json
     } catch {
         Add-UniqueError -Errors $errors -Message "Usage cache could not be read: $($_.Exception.Message)"
         return [ordered]@{
+            exists = $true
             available = $false
+            cachePath = $CachePath
+            fetchedAt = $null
             fiveHourUtilization = $null
             fiveHourResetAt = $null
             sevenDayUtilization = $null
+            lastError = ''
             errors = @($errors)
         }
     }
 
-    $fiveHourResetAt = $null
-    if ($cache.five_hour.resets_at) {
-        try {
-            $fiveHourResetAt = [DateTimeOffset]::Parse([string]$cache.five_hour.resets_at)
-        } catch {
-            Add-UniqueError -Errors $errors -Message 'five_hour.resets_at could not be parsed.'
-        }
-    }
+    $fetchedAt = Convert-ToIsoStringOrNull -Value $cache.fetchedAt
+    $fiveHourResetAt = Convert-ToIsoStringOrNull -Value $cache.fiveHourResetAt
+    $lastError = if ($cache.lastError) { [string]$cache.lastError } else { '' }
 
     return [ordered]@{
-        available = ($null -ne $cache.five_hour)
-        fiveHourUtilization = Normalize-Percent -Value $cache.five_hour.utilization
+        exists = $true
+        available = ($null -ne $cache.fiveHourUtilization)
+        cachePath = $CachePath
+        fetchedAt = $fetchedAt
+        fiveHourUtilization = Normalize-Percent -Value $cache.fiveHourUtilization
         fiveHourResetAt = $fiveHourResetAt
-        sevenDayUtilization = Normalize-Percent -Value $cache.seven_day.utilization
+        sevenDayUtilization = Normalize-Percent -Value $cache.sevenDayUtilization
+        lastError = $lastError
         errors = @($errors)
     }
 }
 
-function Get-StatusLineState {
+function Save-UsageCache {
     param(
-        [string]$BaseClaudeHome,
-        $CacheState
+        [string]$CachePath,
+        $State
+    )
+
+    $parent = Split-Path -Path $CachePath -Parent
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $cacheObject = [ordered]@{
+        fetchedAt = $State.checkedAt
+        source = 'oauth'
+        fiveHourUtilization = $State.fiveHourUtilization
+        fiveHourResetAt = $State.fiveHourResetAt
+        sevenDayUtilization = $State.sevenDayUtilization
+        thresholdPercent = $State.thresholdPercent
+        shouldBlock = $State.shouldBlock
+        lastError = ''
+    }
+
+    $cacheJson = $cacheObject | ConvertTo-Json -Depth 6
+    $tempPath = "$CachePath.tmp-$([guid]::NewGuid().ToString('N'))"
+    $backupPath = "$CachePath.bak-$([guid]::NewGuid().ToString('N'))"
+
+    try {
+        [System.IO.File]::WriteAllText($tempPath, $cacheJson, [System.Text.Encoding]::UTF8)
+        if (Test-Path -LiteralPath $CachePath) {
+            [System.IO.File]::Replace($tempPath, $CachePath, $backupPath, $false)
+        } else {
+            [System.IO.File]::Move($tempPath, $CachePath)
+        }
+    } finally {
+        Remove-Item -LiteralPath $tempPath -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $backupPath -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-MockUsageFromSequence {
+    param([string]$Path)
+    if (-not $Path) { return $null }
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Mock usage sequence was not found: $Path" }
+
+    $raw = Get-Content -LiteralPath $Path -Raw
+    $parsed = $raw | ConvertFrom-Json
+    if ($parsed -is [System.Array]) {
+        $items = @($parsed)
+    } else {
+        $items = @($parsed)
+    }
+
+    if ($items.Count -eq 0) {
+        throw 'Mock usage sequence is empty.'
+    }
+
+    $current = $items[0]
+    $remaining = if ($items.Count -gt 1) { @($items | Select-Object -Skip 1) } else { @($current) }
+    [System.IO.File]::WriteAllText($Path, ($remaining | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+    return $current
+}
+
+function Get-ErrorCategory {
+    param($Exception)
+
+    if ($null -eq $Exception) { return 'unavailable_timeout' }
+
+    $message = [string]$Exception.Message
+    if ($message -match '(?i)timed?\s*out|timeout|operationtimedout|taskcanceled|request canceled') {
+        return 'unavailable_timeout'
+    }
+
+    if ($Exception.PSObject.Properties.Name -contains 'Response') {
+        $response = $Exception.Response
+        if ($response -and $response.StatusCode) {
+            $statusCode = [int]$response.StatusCode
+            if ($statusCode -eq 401 -or $statusCode -eq 403) { return 'unavailable_auth' }
+            if ($statusCode -eq 408 -or $statusCode -eq 429 -or $statusCode -ge 500) { return 'unavailable_timeout' }
+            return 'unavailable_parse'
+        }
+    }
+
+    if ($message -match '(?i)401|403|unauthorized|forbidden|authentication|access token|bearer') {
+        return 'unavailable_auth'
+    }
+
+    return 'unavailable_parse'
+}
+
+function New-UnavailableState {
+    param(
+        [string]$Status,
+        [int]$Threshold,
+        [string]$CachePath,
+        $LastSuccessfulFetchAt,
+        [string]$Message,
+        [object[]]$AdditionalErrors = @(),
+        $CachedState = $null
     )
 
     $errors = New-OrderedList
-    if ($SkipStatusLineCommand) {
-        Add-UniqueError -Errors $errors -Message 'The statusline command was skipped via parameter.'
-        return [ordered]@{
-            available = $false
-            rawStatusline = ''
-            cleanStatusline = ''
-            fiveHourUtilization = $null
-            fiveHourResetAt = $null
-            sevenDayUtilization = $null
-            command = ''
-            resolvedPath = ''
-            commandSource = ''
-            errors = @($errors)
-        }
+    foreach ($errorText in @($AdditionalErrors)) {
+        Add-UniqueError -Errors $errors -Message ([string]$errorText)
     }
-
-    $commandInfo = Get-StatusLineCommandInfo -BaseClaudeHome $BaseClaudeHome
-    foreach ($errorText in $commandInfo.errors) {
-        Add-UniqueError -Errors $errors -Message $errorText
+    if ($Message) {
+        Add-UniqueError -Errors $errors -Message $Message
     }
-
-    if (-not $commandInfo.command) {
-        return [ordered]@{
-            available = $false
-            rawStatusline = ''
-            cleanStatusline = ''
-            fiveHourUtilization = $null
-            fiveHourResetAt = $null
-            sevenDayUtilization = $null
-            command = ''
-            resolvedPath = ''
-            commandSource = ''
-            errors = @($errors)
-        }
-    }
-
-    $invokeResult = Invoke-CommandText -CommandText $commandInfo.command -InputText (Get-MockStatusLinePayload)
-    if (-not $invokeResult.success) {
-        $errorText = if ($invokeResult.error) { $invokeResult.error } else { "ExitCode=$($invokeResult.exitCode)" }
-        Add-UniqueError -Errors $errors -Message "Statusline command failed: $errorText"
-        return [ordered]@{
-            available = $false
-            rawStatusline = $invokeResult.output
-            cleanStatusline = (Strip-AnsiText -Text $invokeResult.output)
-            fiveHourUtilization = $null
-            fiveHourResetAt = $null
-            sevenDayUtilization = $null
-            command = $commandInfo.command
-            resolvedPath = $commandInfo.resolvedPath
-            commandSource = $commandInfo.commandSource
-            errors = @($errors)
-        }
-    }
-
-    $cleanText = Strip-AnsiText -Text $invokeResult.output
-    $segmentMatch = [regex]::Match($cleanText, '(?is)\b5h\b(?<segment>.*?)(?:\|\s*7d\b|$)')
-    if (-not $segmentMatch.Success) {
-        Add-UniqueError -Errors $errors -Message 'The 5h segment was not found in the statusline output.'
-        return [ordered]@{
-            available = $false
-            rawStatusline = $invokeResult.output
-            cleanStatusline = $cleanText
-            fiveHourUtilization = $null
-            fiveHourResetAt = $null
-            sevenDayUtilization = $null
-            command = $commandInfo.command
-            resolvedPath = $commandInfo.resolvedPath
-            commandSource = $commandInfo.commandSource
-            errors = @($errors)
-        }
-    }
-
-    $segmentText = $segmentMatch.Groups['segment'].Value
-    $percentMatch = [regex]::Match($segmentText, '(?is)(?<percent>\d{1,3}(?:[.,]\d+)?)%')
-    if (-not $percentMatch.Success) {
-        Add-UniqueError -Errors $errors -Message 'The 5h percentage value was not found in the statusline output.'
-        return [ordered]@{
-            available = $false
-            rawStatusline = $invokeResult.output
-            cleanStatusline = $cleanText
-            fiveHourUtilization = $null
-            fiveHourResetAt = $null
-            sevenDayUtilization = $null
-            command = $commandInfo.command
-            resolvedPath = $commandInfo.resolvedPath
-            commandSource = $commandInfo.commandSource
-            errors = @($errors)
-        }
-    }
-
-    $fiveHourPercent = Normalize-Percent -Value ($percentMatch.Groups['percent'].Value -replace ',', '.')
-    $ttlMatch = [regex]::Match($segmentText, '(?is)%\s*(?<ttl>\d+[mhd])\b')
-    $ttlResetAt = if ($ttlMatch.Success) { Convert-TtlToResetAt -Ttl $ttlMatch.Groups['ttl'].Value } else { $null }
-    $effectiveResetAt = if ($CacheState.available -and $CacheState.fiveHourResetAt) { $CacheState.fiveHourResetAt } else { $ttlResetAt }
-    $effectiveSevenDay = if ($CacheState.available) { $CacheState.sevenDayUtilization } else { $null }
 
     return [ordered]@{
-        available = ($null -ne $fiveHourPercent)
-        rawStatusline = $invokeResult.output
-        cleanStatusline = $cleanText
-        fiveHourUtilization = $fiveHourPercent
-        fiveHourResetAt = $effectiveResetAt
-        sevenDayUtilization = $effectiveSevenDay
-        command = $commandInfo.command
-        resolvedPath = $commandInfo.resolvedPath
-        commandSource = $commandInfo.commandSource
+        ok = $false
+        processStatus = $Status
+        checkedAt = (Get-Date).ToString('o')
+        thresholdPercent = $Threshold
+        fiveHourUtilization = if ($CachedState) { $CachedState.fiveHourUtilization } else { $null }
+        fiveHourResetAt = if ($CachedState) { $CachedState.fiveHourResetAt } else { $null }
+        sevenDayUtilization = if ($CachedState) { $CachedState.sevenDayUtilization } else { $null }
+        shouldBlock = $false
+        source = 'none'
+        fresh = $false
+        cachePath = $CachePath
+        lastSuccessfulFetchAt = $LastSuccessfulFetchAt
         errors = @($errors)
     }
+}
+
+function Get-UsageResponse {
+    param(
+        [string]$BaseClaudeHome,
+        [string]$CachePath
+    )
+
+    $cachedState = Get-UsageCacheState -CachePath $CachePath
+    $lastSuccessfulFetchAt = if ($cachedState.available) { $cachedState.fetchedAt } else { $null }
+
+    if ($MockErrorKind) {
+        $status = switch ($MockErrorKind.ToLowerInvariant()) {
+            'timeout' { 'unavailable_timeout' }
+            'auth' { 'unavailable_auth' }
+            'parse' { 'unavailable_parse' }
+            default { 'fatal' }
+        }
+        return (New-UnavailableState -Status $status -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message "Mock error requested: $MockErrorKind" -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+    }
+
+    if ($MockUsageSequencePath) {
+        try {
+            $usage = Get-MockUsageFromSequence -Path $MockUsageSequencePath
+        } catch {
+            return (New-UnavailableState -Status 'unavailable_parse' -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message $_.Exception.Message -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+        }
+    } elseif ($MockUsageJson) {
+        try {
+            $usage = $MockUsageJson | ConvertFrom-Json
+        } catch {
+            return (New-UnavailableState -Status 'unavailable_parse' -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message "Mock usage JSON could not be parsed: $($_.Exception.Message)" -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+        }
+    } else {
+        $effectiveCredentialsPath = Get-EffectiveCredentialsPath -BaseClaudeHome $BaseClaudeHome
+        if (-not (Test-Path -LiteralPath $effectiveCredentialsPath)) {
+            return (New-UnavailableState -Status 'unavailable_auth' -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message "Claude credentials were not found: $effectiveCredentialsPath" -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+        }
+
+        try {
+            $credentials = Get-Content -LiteralPath $effectiveCredentialsPath -Raw | ConvertFrom-Json
+        } catch {
+            return (New-UnavailableState -Status 'unavailable_parse' -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message "Claude credentials could not be read: $($_.Exception.Message)" -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+        }
+
+        $token = ''
+        if ($credentials.claudeAiOauth -and $credentials.claudeAiOauth.accessToken) {
+            $token = [string]$credentials.claudeAiOauth.accessToken
+        }
+        if (-not $token) {
+            return (New-UnavailableState -Status 'unavailable_auth' -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message 'Claude OAuth access token is missing.' -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+        }
+
+        $headers = @{
+            Authorization = "Bearer $token"
+            Accept = 'application/json'
+            'anthropic-beta' = 'oauth-2025-04-20'
+        }
+
+        try {
+            $usage = Invoke-RestMethod -Uri $UsageEndpoint -Headers $headers -Method Get -TimeoutSec $RequestTimeoutSeconds
+        } catch {
+            $status = Get-ErrorCategory -Exception $_.Exception
+            return (New-UnavailableState -Status $status -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message "Usage request failed: $($_.Exception.Message)" -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+        }
+    }
+
+    $fiveHourUtilization = Normalize-Percent -Value $usage.five_hour.utilization
+    $fiveHourResetAt = Convert-ToIsoStringOrNull -Value $usage.five_hour.resets_at
+    $sevenDayUtilization = Normalize-Percent -Value $usage.seven_day.utilization
+
+    if ($null -eq $fiveHourUtilization) {
+        return (New-UnavailableState -Status 'unavailable_parse' -Threshold $ThresholdPercent -CachePath $CachePath -LastSuccessfulFetchAt $lastSuccessfulFetchAt -Message 'Usage response did not include a valid five_hour.utilization value.' -AdditionalErrors $cachedState.errors -CachedState $cachedState)
+    }
+
+    $checkedAt = (Get-Date).ToString('o')
+    $shouldBlock = ($fiveHourUtilization -ge $ThresholdPercent)
+    $processStatus = if ($shouldBlock) { 'blocked' } else { 'ok' }
+
+    $state = [ordered]@{
+        ok = $true
+        processStatus = $processStatus
+        checkedAt = $checkedAt
+        thresholdPercent = $ThresholdPercent
+        fiveHourUtilization = $fiveHourUtilization
+        fiveHourResetAt = $fiveHourResetAt
+        sevenDayUtilization = $sevenDayUtilization
+        shouldBlock = $shouldBlock
+        source = 'oauth'
+        fresh = $true
+        cachePath = $CachePath
+        lastSuccessfulFetchAt = $checkedAt
+        errors = @()
+    }
+
+    Save-UsageCache -CachePath $CachePath -State $state
+    return $state
 }
 
 function Get-WaitSeconds {
@@ -477,70 +399,11 @@ function Get-WaitSeconds {
 
     if ($remaining -le 0) { return [Math]::Max(1, $FastPollSeconds) }
     if ($remaining -le $FastWindowSeconds) { return [Math]::Max(1, [Math]::Min($FastPollSeconds, $remaining)) }
-    return [Math]::Max(1, [Math]::Min($PollSeconds, $remaining))
-}
 
-function Get-GateState {
-    param([string]$BaseClaudeHome)
-
-    $errors = New-OrderedList
-    $cacheState = Get-UsageCacheState -BaseClaudeHome $BaseClaudeHome
-    foreach ($errorText in $cacheState.errors) {
-        Add-UniqueError -Errors $errors -Message $errorText
-    }
-
-    $statusState = Get-StatusLineState -BaseClaudeHome $BaseClaudeHome -CacheState $cacheState
-    foreach ($errorText in $statusState.errors) {
-        Add-UniqueError -Errors $errors -Message $errorText
-    }
-
-    $source = 'none'
-    $fiveHourUtilization = $null
-    $fiveHourResetAt = $null
-    $sevenDayUtilization = $null
-    $rawStatusline = ''
-    $statuslineCommand = ''
-    $statuslineResolvedPath = ''
-    $statuslineCommandSource = ''
-
-    if ($statusState.available) {
-        $source = 'statusline'
-        $fiveHourUtilization = $statusState.fiveHourUtilization
-        $fiveHourResetAt = $statusState.fiveHourResetAt
-        $sevenDayUtilization = $statusState.sevenDayUtilization
-        $rawStatusline = $statusState.cleanStatusline
-        $statuslineCommand = $statusState.command
-        $statuslineResolvedPath = $statusState.resolvedPath
-        $statuslineCommandSource = $statusState.commandSource
-    } elseif ($cacheState.available -and $null -ne $cacheState.fiveHourUtilization) {
-        $source = 'cache'
-        $fiveHourUtilization = $cacheState.fiveHourUtilization
-        $fiveHourResetAt = $cacheState.fiveHourResetAt
-        $sevenDayUtilization = $cacheState.sevenDayUtilization
-        $rawStatusline = ''
-        $statuslineCommand = $statusState.command
-        $statuslineResolvedPath = $statusState.resolvedPath
-        $statuslineCommandSource = $statusState.commandSource
-    }
-
-    return [ordered]@{
-        ok = ($source -ne 'none' -and $null -ne $fiveHourUtilization)
-        processStatus = if ($source -ne 'none' -and $null -ne $fiveHourUtilization) { 'ok' } else { 'unavailable' }
-        checkedAt = (Get-Date).ToString('o')
-        source = $source
-        thresholdPercent = $ThresholdPercent
-        fiveHourUtilization = $fiveHourUtilization
-        fiveHourResetAt = if ($fiveHourResetAt) { $fiveHourResetAt.ToString('o') } else { $null }
-        sevenDayUtilization = $sevenDayUtilization
-        shouldBlock = ($source -ne 'none' -and $null -ne $fiveHourUtilization -and $fiveHourUtilization -ge $ThresholdPercent)
-        rawStatusline = $rawStatusline
-        statuslineCommand = $statuslineCommand
-        statuslineResolvedPath = $statuslineResolvedPath
-        statuslineCommandSource = $statuslineCommandSource
-        statuslineErrors = @($statusState.errors)
-        cacheErrors = @($cacheState.errors)
-        errors = @($errors)
-    }
+    $coarseSleep = $remaining - $FastWindowSeconds
+    $maxSleepSeconds = 2147483
+    if ($coarseSleep -gt $maxSleepSeconds) { return $maxSleepSeconds }
+    return [Math]::Max(1, [int]$coarseSleep)
 }
 
 function Write-JsonResult {
@@ -552,8 +415,10 @@ function Write-JsonResult {
 
 try {
     $baseClaudeHome = Get-EffectiveClaudeHome
+    $effectiveCachePath = Get-EffectiveUsageCachePath -BaseClaudeHome $baseClaudeHome
+
     if ($Mode -eq 'probe') {
-        $probeResult = Get-GateState -BaseClaudeHome $baseClaudeHome
+        $probeResult = Get-UsageResponse -BaseClaudeHome $baseClaudeHome -CachePath $effectiveCachePath
         Write-JsonResult -Object $probeResult
         exit 0
     }
@@ -561,14 +426,14 @@ try {
     $history = New-OrderedList
     $waitedSeconds = 0
     while ($true) {
-        $state = Get-GateState -BaseClaudeHome $baseClaudeHome
+        $state = Get-UsageResponse -BaseClaudeHome $baseClaudeHome -CachePath $effectiveCachePath
         [void]$history.Add([ordered]@{
             checkedAt = $state.checkedAt
-            source = $state.source
+            processStatus = $state.processStatus
             fiveHourUtilization = $state.fiveHourUtilization
             fiveHourResetAt = $state.fiveHourResetAt
             shouldBlock = $state.shouldBlock
-            processStatus = $state.processStatus
+            fresh = $state.fresh
             errors = @($state.errors)
         })
 
@@ -588,13 +453,33 @@ try {
             exit 0
         }
 
-        $resetAt = $null
-        if ($state.fiveHourResetAt) {
-            try {
-                $resetAt = [DateTimeOffset]::Parse([string]$state.fiveHourResetAt)
-            } catch {
-                $resetAt = $null
-            }
+        if (-not $state.fiveHourResetAt) {
+            $state.ok = $false
+            $state.processStatus = 'unavailable_parse'
+            $state.fresh = $false
+            $state.source = 'none'
+            $state.lastSuccessfulFetchAt = $state.checkedAt
+            $state.errors = @('Blocked usage did not include a usable fiveHourResetAt value.')
+            $state.mode = $Mode
+            $state.waitedSeconds = $waitedSeconds
+            $state.history = @($history)
+            Write-JsonResult -Object $state
+            exit 0
+        }
+
+        $resetAt = Convert-ToDateTimeOffsetOrNull -Value $state.fiveHourResetAt
+        if ($null -eq $resetAt) {
+            $state.ok = $false
+            $state.processStatus = 'unavailable_parse'
+            $state.fresh = $false
+            $state.source = 'none'
+            $state.lastSuccessfulFetchAt = $state.checkedAt
+            $state.errors = @('Blocked usage reset time could not be parsed.')
+            $state.mode = $Mode
+            $state.waitedSeconds = $waitedSeconds
+            $state.history = @($history)
+            Write-JsonResult -Object $state
+            exit 0
         }
 
         $sleepSeconds = Get-WaitSeconds -ResetAt $resetAt
@@ -602,24 +487,20 @@ try {
         $waitedSeconds += $sleepSeconds
     }
 } catch {
-    $fatalErrors = @($_.Exception.Message)
     $fatalResult = [ordered]@{
         ok = $false
         processStatus = 'fatal'
         checkedAt = (Get-Date).ToString('o')
-        source = 'none'
         thresholdPercent = $ThresholdPercent
         fiveHourUtilization = $null
         fiveHourResetAt = $null
         sevenDayUtilization = $null
         shouldBlock = $false
-        rawStatusline = ''
-        statuslineCommand = ''
-        statuslineResolvedPath = ''
-        statuslineCommandSource = ''
-        statuslineErrors = @()
-        cacheErrors = @()
-        errors = $fatalErrors
+        source = 'none'
+        fresh = $false
+        cachePath = Get-EffectiveUsageCachePath -BaseClaudeHome (Get-EffectiveClaudeHome)
+        lastSuccessfulFetchAt = $null
+        errors = @($_.Exception.Message)
         mode = $Mode
         waitedSeconds = 0
         history = @()

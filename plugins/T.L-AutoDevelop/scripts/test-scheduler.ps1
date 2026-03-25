@@ -140,6 +140,46 @@ function Invoke-PreflightJson {
     }
 }
 
+function Invoke-UsageGateJson {
+    param(
+        [string]$ClaudeHome,
+        [string]$Mode = "probe",
+        [int]$ThresholdPercent = 90,
+        [string]$MockUsageJson = "",
+        [string]$MockErrorKind = "",
+        [string]$MockUsageSequencePath = "",
+        [int]$PollSeconds = 1,
+        [int]$FastPollSeconds = 1,
+        [int]$FastWindowSeconds = 1
+    )
+
+    $gatePath = Join-Path $PSScriptRoot "claude-usage-gate.ps1"
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $gatePath,
+        "-Mode", $Mode,
+        "-ClaudeHome", $ClaudeHome,
+        "-ThresholdPercent", $ThresholdPercent.ToString(),
+        "-PollSeconds", $PollSeconds.ToString(),
+        "-FastPollSeconds", $FastPollSeconds.ToString(),
+        "-FastWindowSeconds", $FastWindowSeconds.ToString()
+    )
+
+    if ($MockUsageJson) {
+        $arguments += @("-MockUsageJson", $MockUsageJson)
+    }
+    if ($MockErrorKind) {
+        $arguments += @("-MockErrorKind", $MockErrorKind)
+    }
+    if ($MockUsageSequencePath) {
+        $arguments += @("-MockUsageSequencePath", $MockUsageSequencePath)
+    }
+
+    $raw = & powershell.exe @arguments
+    return ($raw | Out-String | ConvertFrom-Json)
+}
+
 function New-TestLatestRun {
     param(
         [int]$AttemptNumber = 0,
@@ -3514,6 +3554,130 @@ function Test-UsageProjectionAndPlannerFeedback {
         Assert-True ([int]$snapshot.usageProjection.fullQueueEstimatedMinutes -ge 0) "Snapshot should expose queue usage projection."
     } finally {
         Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-UsageGateWritesAutodevCacheOnFreshSuccess {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $result = Invoke-UsageGateJson -ClaudeHome $root -MockUsageJson '{"five_hour":{"utilization":42.5,"resets_at":"2026-03-25T18:00:00Z"},"seven_day":{"utilization":22.0,"resets_at":"2026-03-30T18:00:00Z"}}'
+        $cachePath = Join-Path $root "tl-autodev-usage-cache.json"
+
+        Assert-True ($result.ok -eq $true) "Fresh success should mark the usage gate as available."
+        Assert-True ([string]$result.processStatus -eq "ok") "Fresh success below threshold should return ok."
+        Assert-True ([string]$result.source -eq "oauth") "Fresh success should report oauth as the source."
+        Assert-True ($result.fresh -eq $true) "Fresh success should be marked as fresh."
+        Assert-True (Test-Path -LiteralPath $cachePath) "Fresh success should create the autodev usage cache."
+
+        $cache = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+        Assert-True ([double]$cache.fiveHourUtilization -eq 42.5) "Cache should persist the fetched five-hour utilization."
+        Assert-True ([string]$cache.source -eq "oauth") "Cache should record oauth as the source."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateBlocksWhenThresholdIsExceeded {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $result = Invoke-UsageGateJson -ClaudeHome $root -ThresholdPercent 90 -MockUsageJson '{"five_hour":{"utilization":94.0,"resets_at":"2026-03-25T18:00:00Z"},"seven_day":{"utilization":35.0,"resets_at":"2026-03-30T18:00:00Z"}}'
+
+        Assert-True ($result.ok -eq $true) "Blocked usage should still count as a fresh verified state."
+        Assert-True ([string]$result.processStatus -eq "blocked") "Threshold breaches should return blocked."
+        Assert-True ($result.shouldBlock -eq $true) "Threshold breaches should set shouldBlock."
+        Assert-True ([string]$result.fiveHourResetAt -eq "2026-03-25T18:00:00.0000000+00:00") "The reset time should be normalized and preserved."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateNeverTrustsStaleCacheForLaunchDecisions {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $cachePath = Join-Path $root "tl-autodev-usage-cache.json"
+        Write-TestFile -Path $cachePath -Content @"
+{
+  "fetchedAt": "2026-03-25T14:00:00Z",
+  "source": "oauth",
+  "fiveHourUtilization": 12.0,
+  "fiveHourResetAt": "2026-03-25T18:00:00Z",
+  "sevenDayUtilization": 8.0,
+  "thresholdPercent": 90,
+  "shouldBlock": false,
+  "lastError": ""
+}
+"@
+
+        $result = Invoke-UsageGateJson -ClaudeHome $root -MockErrorKind "timeout"
+
+        Assert-True ($result.ok -eq $false) "Timeouts must not authorize a launch from stale cache."
+        Assert-True ([string]$result.processStatus -eq "unavailable_timeout") "Timeouts should classify as unavailable_timeout."
+        Assert-True ([string]$result.source -eq "none") "Stale cache should not become the active source."
+        Assert-True ([double]$result.fiveHourUtilization -eq 12.0) "Stale cache may still be returned as informational context."
+        Assert-True ([string]$result.lastSuccessfulFetchAt -eq "2026-03-25T14:00:00.0000000+00:00") "Timeouts should surface the last successful fetch time from cache."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateWaitModeSleepsUntilUsageOpens {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $sequencePath = Join-Path $root "usage-sequence.json"
+        Write-TestFile -Path $sequencePath -Content @"
+[
+  {
+    "five_hour": {
+      "utilization": 95.0,
+      "resets_at": "2000-01-01T00:00:00Z"
+    },
+    "seven_day": {
+      "utilization": 20.0,
+      "resets_at": "2026-03-30T18:00:00Z"
+    }
+  },
+  {
+    "five_hour": {
+      "utilization": 45.0,
+      "resets_at": "2026-03-25T19:00:00Z"
+    },
+    "seven_day": {
+      "utilization": 20.0,
+      "resets_at": "2026-03-30T18:00:00Z"
+    }
+  }
+]
+"@
+
+        $result = Invoke-UsageGateJson -ClaudeHome $root -Mode "wait" -MockUsageSequencePath $sequencePath -PollSeconds 1 -FastPollSeconds 1 -FastWindowSeconds 1
+
+        Assert-True ($result.ok -eq $true) "Wait mode should end once usage opens."
+        Assert-True ([string]$result.processStatus -eq "ok") "Wait mode should finish with ok when the follow-up probe opens."
+        Assert-True ($result.waitedSeconds -ge 1) "Wait mode should record time spent waiting."
+        Assert-True (@($result.history).Count -ge 2) "Wait mode should record both the blocked and the open probe."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedState {
+    $root = Join-Path $env:TEMP ("autodev-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $blockedResult = Invoke-UsageGateJson -ClaudeHome $root -MockUsageJson '{"five_hour":{"utilization":95.0,"resets_at":"2000-01-01T00:00:00Z"},"seven_day":{"utilization":20.0,"resets_at":"2026-03-30T18:00:00Z"}}'
+        Assert-True ([string]$blockedResult.processStatus -eq "blocked") "The setup probe should confirm a blocked state."
+
+        $waitResult = Invoke-UsageGateJson -ClaudeHome $root -Mode "wait" -MockErrorKind "timeout" -PollSeconds 1 -FastPollSeconds 1 -FastWindowSeconds 1
+
+        Assert-True ($waitResult.ok -eq $false) "Wait mode should not mask a failed refresh after a blocked state."
+        Assert-True ([string]$waitResult.processStatus -eq "unavailable_timeout") "A failed refresh after waiting should surface as unavailable_timeout."
+        Assert-True (@($waitResult.history).Count -ge 1) "Wait mode should record the failed refresh attempt in history."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -7070,6 +7234,11 @@ Test-SnapshotSurfacesMissingPromptFileIntegrityError
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
+Test-UsageGateWritesAutodevCacheOnFreshSuccess
+Test-UsageGateBlocksWhenThresholdIsExceeded
+Test-UsageGateNeverTrustsStaleCacheForLaunchDecisions
+Test-UsageGateWaitModeSleepsUntilUsageOpens
+Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedState
 Test-UsageProjectionAndPlannerFeedback
 Test-TaskDiscoveryBriefUsesCompactCompletedTaskData
 Test-CompletedTaskBriefsAreOrderedAndCapped

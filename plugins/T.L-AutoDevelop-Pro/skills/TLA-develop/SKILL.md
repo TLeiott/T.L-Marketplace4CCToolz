@@ -121,7 +121,7 @@ Run the usage gate in `probe` mode with `-ThresholdPercent 90`.
 Use this initial probe only to:
 - detect fatal gate errors
 - show the current 5h status to the user
-- confirm whether statusline/cache data is currently available
+- confirm whether a fresh usage state can be retrieved
 
 Interpret the initial probe strictly:
 - fatal gate error -> stop
@@ -134,16 +134,17 @@ Important:
 
 Autonomous wait rules:
 - If a later launch-gate probe is blocked and `fiveHourResetAt` is available, call the usage gate in `wait` mode with the same threshold and let it wait until the gate opens.
-- If a later launch-gate probe is unavailable or has no usable reset time, sleep for 5 hours, then run `probe` again.
-- If the post-fallback probe is still unavailable, stop and report that the autonomous gate state could not be determined after the 5-hour fallback.
-- If the post-fallback probe is still blocked but now provides a usable reset time, switch to the normal `wait` path.
-- Do not create an unbounded 5-hour sleep loop.
+- If a later launch-gate probe is unavailable, sleep for 1 hour, then run `probe` again.
+- Repeat that 1-hour unavailable retry cycle at most 10 times.
+- If the post-retry probe is still unavailable after 10 attempts, stop and report that the autonomous gate state could not be determined.
+- If a later probe is still blocked but now provides a usable reset time, switch to the normal `wait` path.
+- Do not create an unbounded wait loop.
 
 User-facing reporting:
 - tell the user when TLA pauses because of the 5h budget
 - include the current `fiveHourUtilization`
 - include `fiveHourResetAt` when available
-- say whether TLA is using gate-script `wait` or the conservative 5-hour fallback
+- say whether TLA is using gate-script `wait` or the conservative 1-hour retry loop
 - when it resumes, report how long it waited and the final utilization that allowed launch
 - when a launch set is blocked by projected cost, also report:
   - number of pipes about to start
@@ -192,8 +193,9 @@ Launch-gate procedure:
 4. If the gate result is fatal, stop.
 5. If the gate result is unavailable:
    - do not ask the user
-   - use the 5-hour fallback wait
+   - sleep for 1 hour
    - then re-run `probe`
+   - repeat for at most 10 attempts
    - if the probe is still unavailable, stop and report that the autonomous gate state could not be determined
 6. Let `currentUsage = fiveHourUtilization` from the fresh available probe result.
 7. Compute the largest ordered prefix of `candidateTaskIds` that fits under the projected threshold using:
@@ -204,10 +206,11 @@ Launch-gate procedure:
    - if the full candidate set fits, launch it
    - if only a non-empty prefix fits, launch that fitting prefix and leave the remaining startable tasks queued
    - if no prefix fits, do not ask the user; wait, then re-probe, then recompute the fitting prefix
-9. If `fiveHourResetAt` is available, use gate `wait` for the no-fit case. If it is not available, use the 5-hour fallback once and then re-probe.
-10. After any wait completes, recompute the fitting prefix from the fresh probe result.
-11. If no prefix fits even after the wait/re-probe cycle, stop and report that no task in the current launch set fits the projected 5h budget right now.
-12. Never launch a queued wave based only on an old probe.
+9. If `fiveHourResetAt` is available, use gate `wait` for the no-fit case. If it is not available, stop and report that blocked usage did not include a usable reset time.
+10. If gate `wait` returns unavailable instead of a fresh open result, switch to the normal 1-hour unavailable retry policy.
+11. After a successful wait completes, recompute the fitting prefix from the fresh probe result.
+12. If no prefix fits even after the wait/re-probe cycle, stop and report that no task in the current launch set fits the projected 5h budget right now.
+13. Never launch a queued wave based only on an old probe.
 
 For each task in the allowed fitting launch set, launch:
 
