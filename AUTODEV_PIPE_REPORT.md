@@ -947,8 +947,9 @@ The earlier report positions the documented system around the `4.2.1` line.
 
 That is now outdated.
 
-The current shipped interactive plugin line is:
-- `T.L-AutoDevelop v4.2.5`
+The current shipped plugin lines are:
+- `T.L-AutoDevelop v4.2.17`
+- `T.L-AutoDevelop-Pro v4.2.10`
 
 The delta from the report body to the current implementation therefore includes:
 - queue wait mode
@@ -959,9 +960,84 @@ The delta from the report body to the current implementation therefore includes:
 - tighter environment retry accounting
 - late success/no-change recovery logic
 
+### 25.10 Additional Changes Since The Documentation Commit `a543b6e`
+
+`AUTODEV_PIPE_REPORT.md` was last updated in commit `a543b6e` on `2026-03-19`.
+
+The implementation moved again after that point. The important additions since that documentation commit are:
+
+#### Planning and implementation guardrails became stricter
+
+The worker pipe now contains more explicit protection against "plausible but wrong" implementation plans.
+
+Since `a543b6e`, the current system added:
+- planner effort wiring and discovery briefs
+- implementation-scope validation against the actual changed files
+- repaired fix-plan direction checks
+- prior-art grounding for reuse-heavy tasks
+
+Practically, that means current AutoDevelop is more opinionated about:
+- whether a plan is drifting
+- whether a repaired plan may continue
+- whether changed files still fit the approved implementation scope
+- whether reuse-heavy tasks must cite concrete existing patterns before implementation continues
+
+This is a meaningful maturity step because the pipe is no longer just validating code after implementation.
+It is now also validating whether the implementation direction remains justified while the worker is still deciding what to do.
+
+#### Retry memory and merge preparation were hardened further
+
+The current branch strengthened two queue/runtime areas that the older report only partially reflects:
+- retry context memory now preserves semantically relevant lessons more explicitly
+- merge preparation now runs restore before build and reports restore-related failures more cleanly
+
+That changes the practical pipe behavior in two useful ways:
+- repeated retries are less likely to forget the real blocker
+- merge preparation is less likely to fail for reasons that should have been caught by a restore pass first
+
+#### Preflight is stricter about callback wiring evidence
+
+Preflight gained a stronger Blazor/UI-specific validation pass for EventCallback introduction and binding evidence.
+
+The current preflight behavior now warns when:
+- a component introduces a callback
+- existing parent usages are found
+- none of those usages bind the new callback
+
+This reduces one of the more annoying "pipe said green, UI still broken" classes of regression.
+
+#### The usage gate now owns its own usage retrieval
+
+The older report described a statusline/cache-based usage gate.
+
+That is no longer the current design.
+
+The current implementation now:
+- reads Claude OAuth credentials directly
+- calls the usage endpoint itself
+- writes an AutoDevelop-owned cache file
+- treats stale cache as informational only
+- keeps autonomous blocked-state waiting only for confirmed usage data with a reset time
+
+That is operationally important because the gate is no longer documented correctly if it is described as a statusline parser.
+The current gate should be understood as an AutoDevelop-owned provider with stricter launch-safety semantics.
+
+#### Test coverage expanded materially
+
+The test suite gained large additional coverage around:
+- planning guardrails
+- prior-art requirements
+- retry context memory
+- merge preparation ordering
+- usage-gate behavior and wait semantics
+- stricter preflight wiring checks
+
+That matters for interpretation of the current system because the branch is not only "more features".
+It is also substantially more specified by regression tests than the older report text suggests.
+
 ## 26. What the Current System Should Now Be Understood As
 
-If sections 22 to 24 gave the right mental model for the earlier `4.2.1`-era system, the current `4.2.5` system is best understood as:
+If sections 22 to 24 gave the right mental model for the earlier `4.2.1`-era system, the current `4.2.17` / `4.2.10` system is best understood as:
 
 `mature worker pipe`
 `+ durable queue scheduler`
@@ -969,6 +1045,9 @@ If sections 22 to 24 gave the right mental model for the earlier `4.2.1`-era sys
 `+ explicit prepare/hygiene reconciliation`
 `+ stronger launch identity and startup validation`
 `+ hardened result publication and reconciliation`
+`+ planning-direction and implementation-scope guardrails`
+`+ prior-art-aware task grounding`
+`+ autodev-owned usage-gate safety`
 
 That is a meaningful maturity increase.
 
@@ -983,6 +1062,9 @@ It is also now explicitly about:
 - reconciliation-safe cleanup
 - resilient worker-result handoff
 - avoiding stale environment-failure residue after recovery
+- stopping drifted implementations before they broaden silently
+- grounding reuse-heavy work in existing reference patterns
+- refusing worker launches when the usage state cannot be verified safely
 
 ## 27. Current Short Operational Summary
 
