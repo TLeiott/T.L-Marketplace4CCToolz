@@ -351,13 +351,77 @@ exit 0
         "compile-fail" {
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-Write-Output "error CS1002: ; expected"
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
+Write-Output 'error CS1002: ; expected'
 exit 1
+'@
+        }
+        "restore-fail" {
+@'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'error NU1101: Unable to find package ModelContextProtocol.'
+    exit 1
+}
+Write-Output 'Build succeeded.'
+exit 0
+'@
+        }
+        "lock-then-restore-fail" {
+@'
+param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+$sequenceFile = $env:AUTODEV_TEST_DOTNET_SEQUENCE_FILE
+$sequence = 0
+if ($sequenceFile -and (Test-Path -LiteralPath $sequenceFile)) {
+    $sequence = [int](Get-Content -LiteralPath $sequenceFile -Raw)
+}
+$sequence++
+if ($sequenceFile) {
+    Set-Content -LiteralPath $sequenceFile -Value $sequence -Encoding UTF8
+}
+if ($sequence -eq 1) {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
+if ($sequence -eq 2) {
+    Write-Output "error MSB3027: Could not copy `"bin\Debug\net8.0\Hmd.Docs.dll`" because it is being used by another process."
+    Write-Output "error MSB3021: Access to the path `"bin\Debug\net8.0\Hmd.Docs.dll`" is denied."
+    exit 1
+}
+if ($sequence -eq 3) {
+    Write-Output 'error NU1101: Unable to find package ModelContextProtocol.'
+    exit 1
+}
+Write-Output 'Build succeeded.'
+exit 0
 '@
         }
         "success" {
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
 Write-Output 'Build succeeded.'
 exit 0
 '@
@@ -365,6 +429,14 @@ exit 0
         default {
 @'
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
+$commandLine = ($Args -join ' ')
+if ($env:AUTODEV_TEST_DOTNET_LOG) {
+    Add-Content -LiteralPath $env:AUTODEV_TEST_DOTNET_LOG -Value $commandLine -Encoding UTF8
+}
+if ($Args.Count -gt 0 -and $Args[0] -eq 'restore') {
+    Write-Output 'Restore succeeded.'
+    exit 0
+}
 $countFile = $env:AUTODEV_TEST_DOTNET_COUNT_FILE
 $count = 0
 if ($countFile -and (Test-Path -LiteralPath $countFile)) {
@@ -2787,6 +2859,165 @@ function Test-TlaMergeLockRemediation {
     }
 }
 
+function Test-TlaMergeLockRemediationUsesRestoreFailureReason {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "lock-then-restore-fail"
+        $dotnetSequenceFile = Join-Path $repo.root "dotnet-sequence.txt"
+        $taskkillLog = Join-Path $repo.root "taskkill-restore.log"
+        $dotnetLog = Join-Path $repo.root "dotnet-restore.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "tla-merge-restore-fail"
+                    sourceCommand = "TLA-develop"
+                    sourceInputType = "inline"
+                    taskText = "merge autonomously but fail on rerun restore"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "tla-merge-restore-fail.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "tla-merge-restore-fail" -ResultFile (Join-Path $repo.tasksDir "tla-merge-restore-fail-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/tla-merge-restore-fail"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_DOTNET_SEQUENCE_FILE = $dotnetSequenceFile
+            AUTODEV_TEST_TASKKILL_LOG = $taskkillLog
+            AUTODEV_TEST_DOTNET_LOG = $dotnetLog
+            AUTODEV_TEST_PROCESS_CANDIDATES = (@(
+                @{ id = 1111; processName = "devenv" },
+                @{ id = 2222; processName = "iisexpress" }
+            ) | ConvertTo-Json -Depth 8 -Compress)
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $false) "TLA prepare-merge should still fail when the rerun restore fails after lock remediation."
+        Assert-True ($prepareResult.lockRemediationAttempted -eq $true) "TLA prepare-merge should record the remediation attempt before the rerun restore fails."
+        Assert-True ([string]$prepareResult.task.state -eq "merge_retry_scheduled") "Rerun restore failure should stay on the merge retry path."
+        Assert-True ([string]$prepareResult.reason -match '^Restore failed after autonomous lock remediation\.') "Post-remediation restore failures should surface a restore-specific reason."
+        Assert-True ([string]$prepareResult.reason -notmatch '^Build failed after autonomous lock remediation\.') "Post-remediation restore failures must not be mislabeled as build failures."
+
+        $taskkillEntries = if (Test-Path -LiteralPath $taskkillLog) { @(Get-Content -LiteralPath $taskkillLog) } else { @() }
+        Assert-True ($taskkillEntries.Count -eq 2) "Lock remediation should still terminate the mocked processes before the rerun restore fails."
+
+        $dotnetEntries = if (Test-Path -LiteralPath $dotnetLog) { @(Get-Content -LiteralPath $dotnetLog) } else { @() }
+        $normalizedDotnetEntries = @($dotnetEntries | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF).Trim() })
+        Assert-True ($normalizedDotnetEntries.Count -eq 3) "Lock remediation rerun should execute restore, build, then restore."
+        Assert-True ($normalizedDotnetEntries[0] -match '^restore\b') "The first merge attempt should start with restore."
+        Assert-True ($normalizedDotnetEntries[1] -match '^build\b') "The initial failure should come from build before remediation."
+        Assert-True ($normalizedDotnetEntries[2] -match '^restore\b') "The rerun after remediation should restart with restore."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PrepareMergeRunsRestoreBeforeBuild {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "success"
+        $dotnetLog = Join-Path $repo.root "dotnet.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "merge-restore-order"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "run restore before build"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "merge-restore-order.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "merge-restore-order" -ResultFile (Join-Path $repo.tasksDir "merge-restore-order-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/merge-restore-order"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_DOTNET_LOG = $dotnetLog
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $true) "Prepare-merge should succeed when restore and build both succeed."
+
+        $dotnetEntries = if (Test-Path -LiteralPath $dotnetLog) { @(Get-Content -LiteralPath $dotnetLog) } else { @() }
+        $normalizedDotnetEntries = @($dotnetEntries | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF).Trim() })
+        Assert-True ($normalizedDotnetEntries.Count -eq 2) "Prepare-merge should invoke dotnet exactly twice on success."
+        Assert-True ($normalizedDotnetEntries[0] -match '^restore\b') "Prepare-merge must run dotnet restore before build."
+        Assert-True ($normalizedDotnetEntries[1] -match '^build\b') "Prepare-merge must run dotnet build after restore."
+        Assert-True ($normalizedDotnetEntries[1] -match '--no-restore') "Prepare-merge build should keep --no-restore after the explicit restore step."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-CircuitBreakerBlocksStarts {
     $repo = New-TestRepo
     try {
@@ -4251,6 +4482,85 @@ function Test-MergeBuildFailurePreservesBranch {
     }
 }
 
+function Test-MergeRestoreFailurePreservesBranch {
+    $repo = New-TestRepo
+    try {
+        $mockCommands = New-MockCommandSet -Root $repo.root -DotnetBehavior "restore-fail"
+        $gitLog = Join-Path $repo.root "git-restore.log"
+        $dotnetLog = Join-Path $repo.root "dotnet-restore.log"
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "merge-restore-retry"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "preserve branch on restore fail"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "merge-restore-retry.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = "pending"
+                    state = "pending_merge"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -TaskName "merge-restore-retry" -ResultFile (Join-Path $repo.tasksDir "merge-restore-retry-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+        $savedState = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $savedState.tasks[0].latestRun.branchName = "auto/merge-restore-retry"
+        Write-StateFile -StateFile $repo.stateFile -State $savedState
+
+        $envVars = @{
+            AUTODEV_GIT_COMMAND = $mockCommands.git
+            AUTODEV_DOTNET_COMMAND = $mockCommands.dotnet
+            AUTODEV_TASKKILL_COMMAND = $mockCommands.taskkill
+            AUTODEV_TEST_REPO_ROOT = $repo.root
+            AUTODEV_TEST_GIT_LOG = $gitLog
+            AUTODEV_TEST_DOTNET_LOG = $dotnetLog
+        }
+
+        $prepareResult = Invoke-WithEnvironment -Variables $envVars -ScriptBlock {
+            Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "prepare-merge"
+        }
+
+        Assert-True ($prepareResult.prepared -eq $false) "Restore failure should fail merge preparation."
+        Assert-True ([string]$prepareResult.task.state -eq "merge_retry_scheduled") "Restore failures during prepare-merge should preserve accepted work as merge_retry_scheduled."
+        Assert-True ([string]$prepareResult.task.branchName -eq "auto/merge-restore-retry") "Merge-stage retry must preserve the accepted branch after restore failure."
+        Assert-True ([int]$prepareResult.task.mergeAttemptsUsed -eq 1) "Restore failure should consume merge retry budget."
+        Assert-True ([string]$prepareResult.reason -match 'NU1101|Restore failed') "Restore failure reason should be surfaced."
+
+        $gitEntries = if (Test-Path -LiteralPath $gitLog) { @(Get-Content -LiteralPath $gitLog) } else { @() }
+        Assert-True (@($gitEntries | Where-Object { $_ -match 'branch\s+-D' }).Count -eq 0) "Branch should not be deleted on merge-stage restore failure."
+
+        $dotnetEntries = if (Test-Path -LiteralPath $dotnetLog) { @(Get-Content -LiteralPath $dotnetLog) } else { @() }
+        $normalizedDotnetEntries = @($dotnetEntries | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF).Trim() })
+        Assert-True ($normalizedDotnetEntries.Count -eq 1) "Prepare-merge should stop after restore failure."
+        Assert-True ($normalizedDotnetEntries[0] -match '^restore\b') "Restore failure should happen before any build invocation."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-AdminEditTask {
     $repo = New-TestRepo
     try {
@@ -5563,6 +5873,7 @@ Test-ManualOverridePersistsAcrossSnapshots
 Test-SharedFileWithoutConflictDoesNotRequeue
 Test-RealMergeConflictStillRetries
 Test-ExternalMergeReconciliation
+Test-PrepareMergeRunsRestoreBeforeBuild
 Test-SnapshotIncludesStructuredProgress
 Test-MalformedProgressArtifactsDoNotBreakSnapshot
 Test-ProgressMilestonesTranslateToEnglish
@@ -5570,6 +5881,8 @@ Test-QueueStallDetectedWhenWorkRemainsButNothingCanRun
 Test-QueueStallDoesNotTriggerWhileWaitingForUserMergeDecision
 Test-QueueStallDoesNotTriggerWhileCircuitBreakerIsOpen
 Test-TlaMergeLockRemediation
+Test-TlaMergeLockRemediationUsesRestoreFailureReason
+Test-MergeRestoreFailurePreservesBranch
 Test-MergeBuildFailurePreservesBranch
 Test-AdminEditTask
 Test-RunHistoryCapturesLaunchSequence

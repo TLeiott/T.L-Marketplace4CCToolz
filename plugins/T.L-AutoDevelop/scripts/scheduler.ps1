@@ -2672,6 +2672,18 @@ function Invoke-MergeBuildAttempt {
         }
     }
 
+    $restoreCommand = Invoke-NativeCommand -Command "dotnet" -Arguments @("restore", $SolutionPath) -WorkingDirectory $RepoRoot
+    if ($restoreCommand.exitCode -ne 0) {
+        Undo-MergeAttempt -RepoRoot $RepoRoot
+        return [pscustomobject]@{
+            success = $false
+            phase = "restore"
+            output = [string]$restoreCommand.output
+            reason = if ($restoreCommand.output) { [string]$restoreCommand.output } else { "Restore failed after merge preparation." }
+            lockInfo = (Get-LockFailureInfo -BuildOutput "")
+        }
+    }
+
     $buildCommand = Invoke-NativeCommand -Command "dotnet" -Arguments @("build", $SolutionPath, "--no-restore") -WorkingDirectory $RepoRoot
     if ($buildCommand.exitCode -ne 0) {
         $lockInfo = Get-LockFailureInfo -BuildOutput ([string]$buildCommand.output)
@@ -4275,7 +4287,12 @@ function Prepare-Merge {
     }
 
     if ((-not $mergeResult.success) -and $lockRemediationAttempted) {
-        $mergeResult.reason = "Build failed after autonomous lock remediation. $([string]$mergeAttempt.reason)".Trim()
+        $postRemediationReason = switch ([string]$mergeAttempt.phase) {
+            "restore" { "Restore failed after autonomous lock remediation." }
+            "build" { "Build failed after autonomous lock remediation." }
+            default { "Merge preparation failed after autonomous lock remediation." }
+        }
+        $mergeResult.reason = "$postRemediationReason $([string]$mergeAttempt.reason)".Trim()
     }
 
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
