@@ -139,11 +139,15 @@ $retryContextState = [ordered]@{
         finalCategory = ""
         summary = ""
         feedback = ""
+        validationIssues = @()
+        failurePhase = ""
+        readOnlyPhaseConfusion = $false
         investigationConclusion = ""
     }
     priorChangedFiles = @()
     retryLessons = @()
 }
+$resultValidationIssues = @()
 $workerBriefsState = [ordered]@{
     loaded = $false
     path = ""
@@ -282,6 +286,9 @@ function Get-RetryContextState {
             finalCategory = ""
             summary = ""
             feedback = ""
+            validationIssues = @()
+            failurePhase = ""
+            readOnlyPhaseConfusion = $false
             investigationConclusion = ""
         }
         priorChangedFiles = @()
@@ -308,6 +315,9 @@ function Get-RetryContextState {
         finalCategory = if ($context.latestFailure) { [string]$context.latestFailure.finalCategory } else { "" }
         summary = if ($context.latestFailure) { [string]$context.latestFailure.summary } else { "" }
         feedback = if ($context.latestFailure) { [string]$context.latestFailure.feedback } else { "" }
+        validationIssues = if ($context.latestFailure) { @($context.latestFailure.validationIssues | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique) } else { @() }
+        failurePhase = if ($context.latestFailure) { [string]$context.latestFailure.failurePhase } else { "" }
+        readOnlyPhaseConfusion = if ($context.latestFailure) { [bool]$context.latestFailure.readOnlyPhaseConfusion } else { $false }
         investigationConclusion = if ($context.latestFailure) { [string]$context.latestFailure.investigationConclusion } else { "" }
     }
 
@@ -329,6 +339,9 @@ function Get-RetryContextState {
         $latestFailure.finalCategory -or
         $latestFailure.summary -or
         $latestFailure.feedback -or
+        $latestFailure.validationIssues.Count -gt 0 -or
+        $latestFailure.failurePhase -or
+        $latestFailure.readOnlyPhaseConfusion -or
         $latestFailure.investigationConclusion -or
         $priorChangedFiles.Count -gt 0 -or
         $retryLessons.Count -gt 0
@@ -368,6 +381,15 @@ function Format-RetryContextPromptBlock {
     }
     if ($RetryContext.latestFailure.feedback) {
         [void]$lines.Add("LATEST FAILURE FEEDBACK: $([string]$RetryContext.latestFailure.feedback)")
+    }
+    if (@($RetryContext.latestFailure.validationIssues).Count -gt 0) {
+        [void]$lines.Add("LATEST FAILURE VALIDATION ISSUES:`n$(Format-BulletList -Items @($RetryContext.latestFailure.validationIssues) -MaxItems 8 -EmptyText '- None')")
+    }
+    if ($RetryContext.latestFailure.failurePhase) {
+        [void]$lines.Add("LATEST FAILURE PHASE: $([string]$RetryContext.latestFailure.failurePhase)")
+    }
+    if ($RetryContext.latestFailure.readOnlyPhaseConfusion) {
+        [void]$lines.Add("LATEST FAILURE READ-ONLY PHASE CONFUSION: YES")
     }
     if ($RetryContext.latestFailure.investigationConclusion) {
         [void]$lines.Add("LATEST INVESTIGATION CONCLUSION: $([string]$RetryContext.latestFailure.investigationConclusion)")
@@ -1386,6 +1408,9 @@ function Get-PriorArtRequirement {
     if ($RetryContext -and $RetryContext.loaded) {
         $retryParts = [System.Collections.ArrayList]::new()
         if ($RetryContext.latestFailure.feedback) { [void]$retryParts.Add([string]$RetryContext.latestFailure.feedback) }
+        foreach ($issue in @($RetryContext.latestFailure.validationIssues | Select-Object -First 6)) {
+            if ($issue) { [void]$retryParts.Add([string]$issue) }
+        }
         foreach ($lesson in @($RetryContext.retryLessons | Select-Object -First 3)) {
             if ($lesson.feedbackExcerpt) { [void]$retryParts.Add([string]$lesson.feedbackExcerpt) }
         }
@@ -2824,7 +2849,8 @@ function Write-ResultJson {
         [bool]$targetedVerificationPassed = $false,
         [string]$plannerEffortClass = "UNKNOWN",
         [string]$pipelineProfile = "COMPLEX",
-        $directionCheck = $null
+        $directionCheck = $null,
+        [string[]]$validationIssues = @()
     )
     $metricsSummary = Get-PhaseMetricsSummary
     $retryLessons = @(Get-RetryLessonsFromFeedbackHistory -History $feedbackHistory -RunAttemptNumber $currentRunAttemptNumber)
@@ -2844,6 +2870,7 @@ function Write-ResultJson {
         taskName = $TaskName
         severity = $severity
         summary = $summary
+        validationIssues = @($validationIssues)
         attempts = Get-TotalAttempts
         attemptsByPhase = $attemptsByPhase
         artifacts = [ordered]@{
@@ -3699,16 +3726,16 @@ try {
     Write-Host "[VALIDATE] Checking git status..."
     $r = Invoke-NativeCommand git @("rev-parse", "--is-inside-work-tree")
     if ($r.output -ne "true") {
-        Write-ResultJson -status "ERROR" -finalCategory "VALIDATION_ERROR" -summary "No git repository was found." -error "No git repository was found." -phase "VALIDATE"
+        Write-ResultJson -status "ERROR" -finalCategory "VALIDATION_ERROR" -summary "No git repository was found." -error "No git repository was found." -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
     $r = Invoke-NativeCommand git @("status", "--porcelain")
     if ($r.output) {
-        Write-ResultJson -status "ERROR" -finalCategory "DIRTY_WORKTREE" -summary "The working tree is not clean." -error "The working tree is not clean.`nDirty files:`n$($r.output)" -phase "VALIDATE"
+        Write-ResultJson -status "ERROR" -finalCategory "DIRTY_WORKTREE" -summary "The working tree is not clean." -error "The working tree is not clean.`nDirty files:`n$($r.output)" -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
     if (-not (Test-Path $SolutionPath)) {
-        Write-ResultJson -status "ERROR" -finalCategory "MISSING_SOLUTION" -summary "The solution was not found." -error "Solution not found: $SolutionPath" -phase "VALIDATE"
+        Write-ResultJson -status "ERROR" -finalCategory "MISSING_SOLUTION" -summary "The solution was not found." -error "Solution not found: $SolutionPath" -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
 
@@ -3770,7 +3797,7 @@ try {
     Write-Host "[WORKTREE] Erstelle $branchName..."
     $r = Invoke-NativeCommand git @("worktree", "add", $worktreePath, "-b", $branchName)
     if ($r.exitCode -ne 0) {
-        Write-ResultJson -status "ERROR" -finalCategory "WORKTREE_ERROR" -summary "The worktree could not be created." -error $r.output -phase "WORKTREE"
+        Write-ResultJson -status "ERROR" -finalCategory "WORKTREE_ERROR" -summary "The worktree could not be created." -error $r.output -phase "WORKTREE" -validationIssues $resultValidationIssues
         exit 1
     }
 
@@ -4529,6 +4556,7 @@ Write ONLY the plan.
                 if ($directionCheckResult.accepted) {
                     $planTargets = @($directionCheckResult.planTargets)
                     $planReadyForImplementation = $true
+                    $resultValidationIssues = @()
                     Write-SchedulerSnapshot
                     break
                 }
@@ -4547,6 +4575,7 @@ Write ONLY the plan.
             $planTargets = @($planTargets + $salvagedPlanTargets | Select-Object -Unique)
             $planValidation.valid = $true
             $lastPlanFailureReason = ""
+            $resultValidationIssues = @()
             Add-TimelineEvent -Phase "FIX_PLAN_VALIDATE" -Message "Fix-Plan via Salvage fortgesetzt." -Category "FIX_PLAN_SALVAGED" -Data @{ targets = $planTargets }
             $planReadyForImplementation = $true
             Write-SchedulerSnapshot
@@ -4561,6 +4590,7 @@ Write ONLY the plan.
         $finalCategory = [string]$fixPlanFailureOutcome.finalCategory
         $finalSummary = [string]$fixPlanFailureOutcome.finalSummary
         $finalFeedback = if ($planOutput) { $planOutput } else { Format-FeedbackHistory -History $feedbackHistory -MaxChars 1200 }
+        $resultValidationIssues = @($planValidation.issues | Select-Object -Unique)
         $terminalFailureCode = [string]$fixPlanFailureOutcome.terminalFailureCode
         throw [System.Exception]::new($terminalFailureCode)
     }
@@ -5098,12 +5128,12 @@ SUMMARY:
         Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     } else {
         Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force") | Out-Null
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
         $worktreePath = $null
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     }
 } catch {
     Set-Location $originalDir -ErrorAction SilentlyContinue
@@ -5119,7 +5149,7 @@ SUMMARY:
             Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
             $worktreePath = $null
         }
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch "" -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase $currentPhase -investigationConclusion $investigationConclusion -noChangeReason $lastNoChangeReason -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     } else {
         Write-Host "[ERROR] $errMsg"
         $finalStatus = "ERROR"
@@ -5127,7 +5157,7 @@ SUMMARY:
         $finalSummary = "Unexpected error in phase $currentPhase."
         $finalFeedback = $errMsg
         Write-TimelineArtifact
-        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict
+        Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -error "Unexpected error in phase $currentPhase`: $errMsg" -feedback $finalFeedback -phase $currentPhase -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     }
 } finally {
     Set-Location $originalDir -ErrorAction SilentlyContinue

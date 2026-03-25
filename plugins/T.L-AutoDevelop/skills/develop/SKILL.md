@@ -108,6 +108,8 @@ For each new task create:
 
 The prompt file must exist on disk before `register-tasks` is called.
 The scheduler now rejects registrations with a missing, empty, or unreadable `promptFile`.
+Write prompt markdown and registration JSON with explicit UTF-8 encoding.
+Do not rely on PowerShell here-strings for JSON escaping; prefer object -> `ConvertTo-Json` -> UTF-8 file writes so arbitrary Unicode task text survives intact.
 
 Each task prompt file must contain:
 
@@ -152,7 +154,7 @@ Important:
 Call:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode snapshot-queue -SolutionPath "<solution>"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode snapshot-queue -View Compact -SolutionPath "<solution>"
 ```
 
 Read the returned JSON and keep:
@@ -183,6 +185,8 @@ Then snapshot the queue again so the full active queue now includes:
 - any `manual_debug_needed` tasks
 - pending-merge tasks
 - the newly registered tasks
+
+Use compact snapshots for routine orchestration reads. Only fall back to the full snapshot view when you need detailed run history or deep debug data.
 
 ## 9. Plan Waves with `scheduler-agent`
 

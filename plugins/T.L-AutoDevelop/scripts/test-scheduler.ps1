@@ -261,6 +261,7 @@ function Invoke-SchedulerJson {
         [string]$Mode,
         [string]$TasksFile = "",
         [string]$PlanFile = "",
+        [string]$View = "",
         [string]$TaskId = "",
         [int]$WaitTimeoutSeconds = 0,
         [int]$IdlePollSeconds = 0
@@ -275,6 +276,7 @@ function Invoke-SchedulerJson {
     )
     if ($TasksFile) { $arguments += @("-TasksFile", $TasksFile) }
     if ($PlanFile) { $arguments += @("-PlanFile", $PlanFile) }
+    if ($View) { $arguments += @("-View", $View) }
     if ($TaskId) { $arguments += @("-TaskId", $TaskId) }
     if ($WaitTimeoutSeconds -gt 0) { $arguments += @("-WaitTimeoutSeconds", [string]$WaitTimeoutSeconds) }
     if ($IdlePollSeconds -gt 0) { $arguments += @("-IdlePollSeconds", [string]$IdlePollSeconds) }
@@ -821,8 +823,8 @@ function Test-EnvironmentFailureRefundsAttempts {
         Assert-True ([int]$task.attemptsUsed -eq 0) "Environment failures should refund the consumed task attempt."
         Assert-True ([int]$task.environmentRepairAttemptsUsed -eq 1) "Environment repair budget should be consumed."
         Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "WORKTREE_INVALID") "Environment failure category should be preserved."
-        Assert-True ([int]$task.waveNumber -eq 0) "Environment retries should detach from their original wave."
-        Assert-True (@($task.blockedBy).Count -eq 0) "Environment retries should clear stale dependency blockers."
+        Assert-True ([int]$task.waveNumber -eq 1) "Environment retries should preserve the last planned wave by default."
+        Assert-True (@($task.blockedBy).Count -eq 0) "Environment retries should still clear stale dependency blockers when none were planned."
         Assert-True ([string]$task.progress.detail -match "worktree missing") "Environment retries should surface the summary, not only the category."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -1148,6 +1150,237 @@ function Test-PreflightMissingSolutionIsEnvironmentFailure {
         Assert-True ($result.passed -eq $false) "Missing solution path should fail preflight."
         Assert-True ($result.environmentFailure -eq $true) "Missing solution path should be marked as environment failure."
         Assert-True ([string]$result.environmentCategory -eq "SOLUTION_PATH_MISSING") "Preflight should classify missing solution paths explicitly."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RetryRestoresLastPlannedWavePlacement {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Restore-RetryWavePlacement",
+        "Get-RetryableResult"
+    ) -ScriptBlock {
+        $task = [pscustomobject]@{
+            attemptsUsed = 1
+            maxAttempts = 3
+            state = "running"
+            retryScheduled = $false
+            waitingUserTest = $false
+            waveNumber = 1
+            blockedBy = @()
+            declaredDependencies = @("task-a")
+            lastPlannedWaveNumber = 3
+            lastPlannedBlockedBy = @("task-a")
+            mergeState = ""
+            merge = [pscustomobject]@{
+                state = ""
+                reason = ""
+                branchName = ""
+            }
+            manualDebugReason = ""
+            attemptsRemaining = 2
+        }
+
+        Get-RetryableResult -Task $task -Reason "FIX_PLAN_INSUFFICIENT"
+        [pscustomobject]@{
+            state = [string]$task.state
+            waveNumber = [int]$task.waveNumber
+            blockedBy = @($task.blockedBy)
+            retryScheduled = [bool]$task.retryScheduled
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    Assert-True ([string]$parsed.state -eq "retry_scheduled") "Retry scheduling should still transition the task into retry_scheduled."
+    Assert-True ([int]$parsed.waveNumber -eq 3) "Retry scheduling should restore the last planned wave when it is still usable."
+    Assert-True (@($parsed.blockedBy) -contains "task-a") "Retry scheduling should restore the last planned blockers."
+    Assert-True ($parsed.retryScheduled -eq $true) "Retry scheduling should keep the retryScheduled marker."
+}
+
+function Test-RetryFallsBackWhenPreservedPlacementIsStale {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Is-TerminalState",
+        "Get-Tasks",
+        "Restore-RetryWavePlacement",
+        "Get-RetryableResult"
+    ) -ScriptBlock {
+        $task = [pscustomobject]@{
+            taskId = "task-stale"
+            attemptsUsed = 1
+            maxAttempts = 3
+            state = "running"
+            retryScheduled = $false
+            waitingUserTest = $false
+            waveNumber = 1
+            blockedBy = @()
+            declaredDependencies = @("task-missing")
+            lastPlannedWaveNumber = 5
+            lastPlannedBlockedBy = @("task-missing")
+            mergeState = ""
+            merge = [pscustomobject]@{
+                state = ""
+                reason = ""
+                branchName = ""
+            }
+            manualDebugReason = ""
+            attemptsRemaining = 2
+        }
+        $state = [pscustomobject]@{
+            tasks = @(
+                $task,
+                [pscustomobject]@{
+                    taskId = "task-other"
+                    state = "queued"
+                    waveNumber = 2
+                }
+            )
+        }
+
+        Get-RetryableResult -Task $task -Reason "FIX_PLAN_INSUFFICIENT" -State $state
+        [pscustomobject]@{
+            state = [string]$task.state
+            waveNumber = [int]$task.waveNumber
+            blockedBy = @($task.blockedBy)
+            retryScheduled = [bool]$task.retryScheduled
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    Assert-True ([string]$parsed.state -eq "retry_scheduled") "Retry scheduling should still keep the task retryable when stale placement is rejected."
+    Assert-True ([int]$parsed.waveNumber -eq 0) "Retry scheduling should clear the restored wave when the preserved placement is stale."
+    Assert-True (@($parsed.blockedBy).Count -eq 0) "Retry scheduling should clear stale blockers when preserved placement can no longer be trusted."
+    Assert-True ($parsed.retryScheduled -eq $true) "Retry scheduling should keep retryScheduled true after stale placement fallback."
+}
+
+function Test-SnapshotCompactViewExcludesRunHistory {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "compact-view-result.json"
+        $state = [ordered]@{
+            repoRoot = $repo.root
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = (Get-Date).ToString("o")
+            circuitBreaker = [ordered]@{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [ordered]@{
+                    taskId = "task-compact"
+                    taskToken = "task-compact"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "compact snapshot"
+                    promptFile = $repo.promptFile
+                    solutionPath = $repo.solution
+                    resultFile = $resultPath
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 2
+                    blockedBy = @()
+                    lastPlannedWaveNumber = 2
+                    lastPlannedBlockedBy = @()
+                    lastPlanSignature = "wave=2;blockedBy="
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    usageCostClass = "MEDIUM"
+                    usageEstimateMinutes = 20
+                    usageEstimateSource = "heuristic"
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{ likelyFiles = @("src/File.cs") }
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "compact-view" -ResultFile $resultPath)
+                    runs = @(
+                        [pscustomobject]@{
+                            attemptNumber = 1
+                            launchSequence = 1
+                            taskName = "compact-view"
+                            finalStatus = "FAILED"
+                            finalCategory = "FIX_PLAN_INSUFFICIENT"
+                            summary = "summary"
+                            feedback = "feedback"
+                            validationIssues = @("Plan does not name any concrete file or search targets.")
+                            failurePhase = "FINALIZE"
+                            readOnlyPhaseConfusion = $false
+                            noChangeReason = ""
+                            investigationConclusion = ""
+                            reproductionConfirmed = $false
+                            retryLessons = @()
+                            actualFiles = @()
+                            branchName = ""
+                            resultFile = $resultPath
+                            completedAt = (Get-Date).ToString("o")
+                            artifacts = $null
+                        }
+                    )
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        }
+        Write-StateFile -StateFile $repo.stateFile -State $state
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue" -View "Compact"
+        $task = @($snapshot.tasks)[0]
+        Assert-True ([string]$snapshot.view -eq "Compact") "Compact snapshots should advertise their selected view."
+        Assert-True ($null -eq $task.runs) "Compact snapshots should omit verbose run history."
+        Assert-True (-not [string]::IsNullOrWhiteSpace([string]$task.summary)) "Compact snapshots should still carry task summary fields."
+        Assert-True ([string]$task.state -eq "queued") "Compact snapshots should preserve task state."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RegisterTasksPreservesUnicodeTaskText {
+    $repo = New-TestRepo
+    try {
+        $promptFile = Join-Path $repo.root "unicode-task.md"
+        $taskText = 'Fix unicode handling — keep “smart quotes”, café, and Grüß Gott intact.'
+        [System.IO.File]::WriteAllText($promptFile, "## Task`n$taskText`n`n## Solution`n$($repo.solution)", [System.Text.Encoding]::UTF8)
+
+        $tasksFile = Join-Path $repo.root "unicode-tasks.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            [ordered]@{
+                taskId = "unicode-task"
+                taskText = $taskText
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                promptFile = $promptFile
+                resultFile = (Join-Path $repo.tasksDir "unicode-result.json")
+                solutionPath = $repo.solution
+                allowNuget = $false
+            }
+        ) | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        $null = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "register-tasks" -TasksFile $tasksFile
+        $state = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
+        $task = @($state.tasks | Where-Object { [string]$_.taskId -eq "unicode-task" })[0]
+
+        Assert-True ([string]$task.taskText -eq $taskText) "Task registration should preserve arbitrary Unicode task text exactly."
+        Assert-True ((Get-Content -LiteralPath $promptFile -Raw) -match [regex]::Escape($taskText)) "Prompt files should preserve arbitrary Unicode task text exactly."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -2660,6 +2893,40 @@ function Test-RetryContextPromptBlockIncludesPriorDenialText {
     Assert-True ([string]$output -notmatch "- Attempt 1 \[") "Retry prompt blocks should not expose ambiguous phase attempt labels."
 }
 
+function Test-RetryContextPromptBlockIncludesValidationIssues {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Format-BulletList",
+        "Clip-Text",
+        "Format-RetryContextPromptBlock"
+    ) -ScriptBlock {
+        $retryContext = [pscustomobject]@{
+            loaded = $true
+            attemptNumber = 2
+            latestFailure = [pscustomobject]@{
+                finalStatus = "FAILED"
+                finalCategory = "FIX_PLAN_PHASE_CONFUSION"
+                summary = "plan failed"
+                feedback = "Please approve the file edit above."
+                validationIssues = @(
+                    "Output contains approval or permission chatter that is invalid in this read-only phase.",
+                    "Plan does not name any concrete file or search targets."
+                )
+                failurePhase = "FINALIZE"
+                readOnlyPhaseConfusion = $true
+                investigationConclusion = ""
+            }
+            priorChangedFiles = @()
+            retryLessons = @()
+        }
+
+        Format-RetryContextPromptBlock -RetryContext $retryContext -Mode "FIX_PLAN" -MaxChars 1200
+    }
+
+    Assert-True ([string]$output -match "LATEST FAILURE VALIDATION ISSUES") "Retry prompt blocks should expose structured validation issues."
+    Assert-True ([string]$output -match "read-only phase") "Retry prompt blocks should carry the concrete validation issue text."
+    Assert-True ([string]$output -match "LATEST FAILURE READ-ONLY PHASE CONFUSION: YES") "Retry prompt blocks should preserve phase-confusion markers."
+}
+
 function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
     $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
         "Normalize-StringArray",
@@ -2670,6 +2937,7 @@ function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
         "Is-EnvironmentFailureCategory",
         "Clip-DiscoveryBriefText",
         "Get-RetryLessonComparisonText",
+        "Get-ValidationIssuesFromResult",
         "Is-RetryContextSemanticCategory",
         "Get-RetryContextRelevantRuns",
         "Get-FallbackRetryLesson",
@@ -2687,6 +2955,9 @@ function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
                     finalCategory = "REVIEW_DENIED_MAJOR"
                     summary = "The reviewer rejected the first attempt."
                     feedback = "REVIEW DENIED (MAJOR): Reuse the existing converter instead of adding a parallel path."
+                    validationIssues = @("Reuse/reference section must name concrete reference file paths.")
+                    failurePhase = "FINALIZE"
+                    readOnlyPhaseConfusion = $false
                     investigationConclusion = "CHANGE_NEEDED"
                     retryLessons = @(
                         [pscustomobject]@{
@@ -2757,6 +3028,8 @@ function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
     Assert-True ([string]$payload.retryLessons[0].category -eq "REVIEW_DENIED_MAJOR") "Retry context should preserve prior review-denial lessons."
     Assert-True (@($payload.priorChangedFiles) -contains "src\Feature.cs") "Retry context should carry prior changed files from relevant runs."
     Assert-True (-not (@($payload.priorChangedFiles) -contains "src\Ignore.cs")) "Retry context should exclude already-satisfied runs from prior changed files."
+    Assert-True (@($payload.latestFailure.validationIssues) -contains "Reuse/reference section must name concrete reference file paths.") "Retry context should persist structured validation issues for the latest semantic failure."
+    Assert-True ([string]$payload.latestFailure.failurePhase -eq "FINALIZE") "Retry context should preserve the latest failure phase."
     Assert-True ([string]$json.retryLessons[0].feedbackExcerpt -match "converter") "Retry context JSON should persist the prior denial text."
 }
 
@@ -2770,6 +3043,7 @@ function Test-WriteRetryContextFileSkipsInfraOnlyHistory {
         "Is-EnvironmentFailureCategory",
         "Clip-DiscoveryBriefText",
         "Get-RetryLessonComparisonText",
+        "Get-ValidationIssuesFromResult",
         "Is-RetryContextSemanticCategory",
         "Get-RetryContextRelevantRuns",
         "Get-FallbackRetryLesson",
@@ -7389,6 +7663,8 @@ Test-ReconcileAcceptedResultClearsEnvironmentFailureCategory
 Test-EnvironmentRepairBudgetFallsBackToNormalRetryAtLimit
 Test-ReadJsonFileBestEffortRetriesMalformedJson
 Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
+Test-RetryRestoresLastPlannedWavePlacement
+Test-RetryFallsBackWhenPreservedPlacementIsStale
 Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
 Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames
 Test-PreflightMissingSolutionIsEnvironmentFailure
@@ -7436,6 +7712,7 @@ Test-WrongTaskRetryContextFallsBackGracefully
 Test-EmptyRetryContextPayloadFallsBackGracefully
 Test-MissingRetryContextFallsBackGracefully
 Test-RetryContextPromptBlockIncludesPriorDenialText
+Test-RetryContextPromptBlockIncludesValidationIssues
 Test-WriteRetryContextFilePersistsRelevantPriorFailures
 Test-WriteRetryContextFileSkipsInfraOnlyHistory
 Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts
@@ -7461,9 +7738,11 @@ Test-ImplementationScopeCheckReportsUnmatchedWildcardTargets
 Test-ImplementationScopeCheckSupportsMixedExactAndWildcardTargets
 Test-RegistrationRejectsMissingPromptFile
 Test-SnapshotSurfacesMissingPromptFileIntegrityError
+Test-SnapshotCompactViewExcludesRunHistory
 Test-BlockedByNormalization
 Test-DeclaredDependencyValidation
 Test-DeclaredDependencyBlocksStartUntilSatisfied
+Test-RegisterTasksPreservesUnicodeTaskText
 Test-UsageGateWritesAutodevCacheOnFreshSuccess
 Test-UsageGateBlocksWhenThresholdIsExceeded
 Test-UsageGateNeverTrustsStaleCacheForLaunchDecisions
