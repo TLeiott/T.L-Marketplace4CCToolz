@@ -3,6 +3,7 @@ param()
 $ErrorActionPreference = "Stop"
 
 $script:SchedulerPath = Join-Path $PSScriptRoot "scheduler.ps1"
+$script:PreflightPath = Join-Path $PSScriptRoot "preflight.ps1"
 
 function Assert-True {
     param(
@@ -39,6 +40,103 @@ function New-TestRepo {
         stateFile = Join-Path $root ".claude-develop-logs\scheduler\state.json"
         tasksDir = Join-Path $root ".claude-develop-logs\scheduler\tasks"
         resultsDir = Join-Path $root ".claude-develop-logs\scheduler\results"
+    }
+}
+
+function Write-TestFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.Encoding]::UTF8)
+}
+
+function New-TestBlazorRepo {
+    $root = Join-Path $env:TEMP ("autodev-preflight-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    Push-Location $root
+    try {
+        git init | Out-Null
+        git config user.email "autodev-tests@example.com"
+        git config user.name "AutoDevelop Tests"
+
+        $projectPath = Join-Path $root "TestApp.csproj"
+        Write-TestFile -Path $projectPath -Content @"
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" Version="10.0.2" />
+  </ItemGroup>
+</Project>
+"@
+        Write-TestFile -Path (Join-Path $root "_Imports.razor") -Content @"
+@namespace TestApp
+@using Microsoft.AspNetCore.Components
+"@
+        Write-TestFile -Path (Join-Path $root "ChildWidget.razor") -Content @"
+<div>Child widget</div>
+"@
+        Write-TestFile -Path (Join-Path $root "ParentHost.razor") -Content @"
+<ChildWidget />
+"@
+        Write-TestFile -Path (Join-Path $root "InteropBridge.cs") -Content @"
+using System.Threading.Tasks;
+
+namespace TestApp;
+
+public static class InteropBridge
+{
+    public static Task BootAsync() => Task.CompletedTask;
+}
+"@
+        Write-TestFile -Path (Join-Path $root "wwwroot\app.js") -Content @"
+export function boot() {
+  return true;
+}
+"@
+        Write-TestFile -Path (Join-Path $root ".gitignore") -Content ".claude-develop-logs/"
+        $restore = & dotnet restore $projectPath 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to restore the Blazor test project: $restore"
+        }
+        git add . | Out-Null
+        git commit -m "init" | Out-Null
+    } finally {
+        Pop-Location
+    }
+
+    return [pscustomobject]@{
+        root = $root
+        solution = Join-Path $root "TestApp.csproj"
+        childComponent = Join-Path $root "ChildWidget.razor"
+        parentComponent = Join-Path $root "ParentHost.razor"
+        interopBridge = Join-Path $root "InteropBridge.cs"
+        scriptFile = Join-Path $root "wwwroot\app.js"
+    }
+}
+
+function Invoke-PreflightJson {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath
+    )
+    Push-Location $RepoRoot
+    try {
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:PreflightPath -SolutionPath $SolutionPath -SkipRun
+        return ($raw | Out-String | ConvertFrom-Json)
+    } finally {
+        Pop-Location
     }
 }
 
@@ -984,12 +1082,274 @@ function Test-PreflightMissingSolutionIsEnvironmentFailure {
     $repo = New-TestRepo
     try {
         $missingSolution = Join-Path $repo.root "Missing.slnx"
-        $scriptPath = 'D:\Repos\T.L-Marketplace\plugins\T.L-AutoDevelop\scripts\preflight.ps1'
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $scriptPath -SolutionPath $missingSolution
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:PreflightPath -SolutionPath $missingSolution
         $result = ($raw | Out-String | ConvertFrom-Json)
         Assert-True ($result.passed -eq $false) "Missing solution path should fail preflight."
         Assert-True ($result.environmentFailure -eq $true) "Missing solution path should be marked as environment failure."
         Assert-True ([string]$result.environmentCategory -eq "SOLUTION_PATH_MISSING") "Preflight should classify missing solution paths explicitly."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightWarnsOnUnboundEventCallback {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "EventCallback wiring warnings should not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 1) "Preflight should warn when a newly introduced EventCallback is unbound in existing parent usages."
+        Assert-True ([string]$wiringWarnings[0].message -match "OnSave") "EventCallback warning should identify the missing callback binding."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightAcceptsExplicitEventCallbackBinding {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+        Write-TestFile -Path $repo.parentComponent -Content @"
+<ChildWidget OnSave="HandleSave" />
+
+@code {
+    private Task HandleSave()
+    {
+        return Task.CompletedTask;
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Bound EventCallback changes should pass preflight."
+        Assert-True ($wiringWarnings.Count -eq 0) "Explicit parent callback bindings should satisfy the wiring check."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightAcceptsBindSyntaxForChangedCallback {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="NotifyChange">Update</button>
+
+@code {
+    [Parameter] public string Value { get; set; } = "";
+    [Parameter] public EventCallback<string> ValueChanged { get; set; }
+
+    private async Task NotifyChange()
+    {
+        await ValueChanged.InvokeAsync("next");
+    }
+}
+"@
+        Write-TestFile -Path $repo.parentComponent -Content @"
+<ChildWidget @bind-Value="CurrentValue" />
+
+@code {
+    private string CurrentValue { get; set; } = "seed";
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Component @bind wiring should pass preflight."
+        Assert-True ($wiringWarnings.Count -eq 0) "@bind-X should satisfy the XChanged EventCallback requirement."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightSkipsPageComponentsForEventCallbackWiring {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+@page "/child"
+
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Page components should not fail preflight for parent-binding checks."
+        Assert-True ($wiringWarnings.Count -eq 0) "Components with @page should be excluded from EventCallback parent-binding warnings."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightBlocksMissingStaticJsInvokableTarget {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot() {
+  return DotNet.invokeMethodAsync('TestApp', 'MissingMethod');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringBlockers = @($result.blockers | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $false) "Missing local static JS interop targets should fail preflight."
+        Assert-True ($wiringBlockers.Count -eq 1) "Preflight should block unresolved local static JS interop calls."
+        Assert-True ([string]$wiringBlockers[0].message -match "MissingMethod") "Static JS interop blocker should name the missing identifier."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightAcceptsAliasedStaticJsInvokableTarget {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.interopBridge -Content @"
+using System.Threading.Tasks;
+using Microsoft.JSInterop;
+
+namespace TestApp;
+
+public static class InteropBridge
+{
+    [JSInvokable("OpenDialog")]
+    public static Task OpenDialogAsync()
+    {
+        return Task.CompletedTask;
+    }
+}
+"@
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot() {
+  return DotNet.invokeMethodAsync('TestApp', 'OpenDialog');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringBlockers = @($result.blockers | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $true) "Matching aliased static JS interop targets should pass preflight."
+        Assert-True ($wiringBlockers.Count -eq 0) "[JSInvokable(\"Alias\")] should satisfy the static JS interop wiring check."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightWarnsOnMissingInstanceJsInvokableTarget {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot(dotNetHelper) {
+  return dotNetHelper.invokeMethodAsync('MissingMethod');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $true) "Missing instance JS interop targets should warn but not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 1) "Preflight should warn on unresolved instance JS interop calls."
+        Assert-True ([string]$wiringWarnings[0].message -match "MissingMethod") "Instance JS interop warning should name the missing identifier."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightIgnoresNonDotNetInvokeMethodPatterns {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.scriptFile -Content @"
+export async function boot(widget) {
+  return widget.invokeMethodAsync('MissingMethod');
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
+        Assert-True ($result.passed -eq $true) "Non-.NET JS invokeMethodAsync patterns should not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 0) "Arbitrary JS objects should not be treated as DotNetObjectReference helpers."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-PreflightDoesNotCrossWireDuplicateComponentNames {
+    $repo = New-TestBlazorRepo
+    try {
+        Write-TestFile -Path $repo.childComponent -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+        Write-TestFile -Path (Join-Path $repo.root "Admin\_Imports.razor") -Content @"
+@namespace TestApp.Admin
+@using Microsoft.AspNetCore.Components
+"@
+        Write-TestFile -Path (Join-Path $repo.root "Admin\ChildWidget.razor") -Content @"
+<button @onclick="TriggerSave">Save</button>
+
+@code {
+    [Parameter] public EventCallback OnSave { get; set; }
+
+    private async Task TriggerSave()
+    {
+        await OnSave.InvokeAsync();
+    }
+}
+"@
+        Write-TestFile -Path (Join-Path $repo.root "Admin\AdminHost.razor") -Content @"
+<TestApp.Admin.ChildWidget OnSave="HandleSave" />
+
+@code {
+    private Task HandleSave()
+    {
+        return Task.CompletedTask;
+    }
+}
+"@
+
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
+        Assert-True ($result.passed -eq $true) "Duplicate component names in other namespaces should not fail preflight."
+        Assert-True ($wiringWarnings.Count -eq 1) "Bindings for a different namespace-qualified component should not suppress the root component warning."
+        $warningPath = [string]$wiringWarnings[0].file
+        Assert-True (($warningPath -match '(^|[\\/])ChildWidget\.razor$') -and ($warningPath -notmatch '(^|[\\/])Admin[\\/]')) "The warning should remain attached to the changed root component."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -6643,6 +7003,15 @@ Test-EnvironmentRetryDoesNotBecomeDirectlyStartable
 Test-WorkerLaunchSequenceSeparatesIdentityFromAttempts
 Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames
 Test-PreflightMissingSolutionIsEnvironmentFailure
+Test-PreflightWarnsOnUnboundEventCallback
+Test-PreflightAcceptsExplicitEventCallbackBinding
+Test-PreflightAcceptsBindSyntaxForChangedCallback
+Test-PreflightSkipsPageComponentsForEventCallbackWiring
+Test-PreflightBlocksMissingStaticJsInvokableTarget
+Test-PreflightAcceptsAliasedStaticJsInvokableTarget
+Test-PreflightWarnsOnMissingInstanceJsInvokableTarget
+Test-PreflightIgnoresNonDotNetInvokeMethodPatterns
+Test-PreflightDoesNotCrossWireDuplicateComponentNames
 Test-InvestigationInconclusiveGetsOneNormalRetry
 Test-RepeatedInvestigationInconclusiveBecomesManualDebugNeeded
 Test-ManualDebugTaskResumesToQueuedOnPositiveReplan
