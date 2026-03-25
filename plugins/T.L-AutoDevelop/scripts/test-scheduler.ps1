@@ -1411,12 +1411,13 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     $solutionPath = 'D:\Repos\My Repo\My Solution.slnx'
     $resultFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json'
     $plannerContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json'
+    $retryContextFile = 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json'
     $taskName = 'develop-task-a1'
     $taskId = 'task-spaces'
     $commandType = 'develop'
 
     $encoded = Invoke-SchedulerHelperFunctions -FunctionNames @("ConvertTo-PowerShellSingleQuotedLiteral", "Get-EncodedWorkerLaunchCommand") -ScriptBlock {
-        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -PlannerContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
+        Get-EncodedWorkerLaunchCommand -ScriptPath 'C:\Users\Example User Name\.claude\plugins\cache\marketplace\scripts\auto-develop.ps1' -PromptFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\prompt file.md' -SolutionPath 'D:\Repos\My Repo\My Solution.slnx' -ResultFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\result file.json' -PlannerContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\planner context.json' -RetryContextFile 'C:\Users\Example User Name\AppData\Local\Temp\claude-develop\retry context.json' -TaskName 'develop-task-a1' -SchedulerTaskId 'task-spaces' -CommandType 'develop' -AllowNuget:$false
     }
 
     $decoded = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(([string]$encoded).Trim()))
@@ -1427,6 +1428,7 @@ function Test-EncodedWorkerLaunchCommandPreservesSpacedPaths {
     Assert-True ($decoded -match [regex]::Escape($solutionPath)) "Encoded worker launch must preserve the full spaced solution path."
     Assert-True ($decoded -match [regex]::Escape($resultFile)) "Encoded worker launch must preserve the full spaced result path."
     Assert-True ($decoded -match [regex]::Escape($plannerContextFile)) "Encoded worker launch must preserve the planner context file path."
+    Assert-True ($decoded -match [regex]::Escape($retryContextFile)) "Encoded worker launch must preserve the retry context file path."
     Assert-True ($decoded -notmatch '-File\s+C:\\Users\\Example') "Encoded worker launch must not rely on a raw -File argument that can split at spaces."
 }
 
@@ -1436,6 +1438,8 @@ function Test-WritePlannerContextFilePersistsEffortClass {
         $task = [pscustomobject]@{
             taskId = "task-planner"
             waveNumber = 3
+            attemptsUsed = 2
+            workerLaunchSequence = 5
             plannerMetadata = [pscustomobject]@{
                 effortClass = "LOW"
                 likelyFiles = @("src\App.cs")
@@ -1452,6 +1456,8 @@ function Test-WritePlannerContextFilePersistsEffortClass {
     $parsed = $raw | ConvertFrom-Json
     Assert-True ([string]$parsed.taskId -eq "task-planner") "Planner context file should persist the task id."
     Assert-True ([int]$parsed.waveNumber -eq 3) "Planner context file should persist the wave number."
+    Assert-True ([int]$parsed.attemptNumber -eq 2) "Planner context file should persist the current worker attempt number."
+    Assert-True ([int]$parsed.launchSequence -eq 5) "Planner context file should persist the current launch sequence."
     Assert-True ([string]$parsed.plannerMetadata.effortClass -eq "LOW") "Planner context file should persist plannerMetadata.effortClass."
 }
 
@@ -1503,6 +1509,418 @@ function Test-MissingPlannerContextFallsBackToComplexProfile {
     Assert-True ($parsed.contextLoaded -eq $false) "Missing planner context should not load successfully."
     Assert-True ([string]$parsed.plannerEffortClass -eq "UNKNOWN") "Missing planner context should fall back to UNKNOWN effort."
     Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
+}
+
+function Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Clip-Text",
+        "Get-RetryLessonComparisonText",
+        "Get-RetryLessonsFromFeedbackHistory"
+    ) -ScriptBlock {
+        $history = [System.Collections.ArrayList]::new()
+        [void]$history.Add([ordered]@{
+            attempt = 1
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Use the existing converter`nDo not add a parallel path."
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 1
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Use the existing converter."
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 2
+            source = "PREFLIGHT"
+            category = "PREFLIGHT_FAILED"
+            feedback = "Build failed with CS0103."
+        })
+
+        (Get-RetryLessonsFromFeedbackHistory -History $history -RunAttemptNumber 2) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = ConvertFrom-Json $output
+    $parsed = @($parsed)
+    Assert-True ($parsed.Count -eq 2) "Retry lesson extraction should deduplicate repeated lessons and keep the most recent distinct blockers."
+    Assert-True ([string]$parsed[0].category -eq "PREFLIGHT_FAILED") "Retry lessons should keep the most recent unique blocker first."
+    Assert-True ([string]$parsed[1].category -eq "REVIEW_DENIED_MAJOR") "Retry lessons should retain prior review-denial context."
+    Assert-True ([int]$parsed[0].runAttemptNumber -eq 2) "Retry lessons should persist the scheduler run attempt number."
+    Assert-True ([int]$parsed[0].phaseAttempt -eq 2) "Retry lessons should preserve the local phase attempt number separately."
+}
+
+function Test-RetryContextRoundTripLoadsWorkerState {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-retry","attemptNumber":2,"latestFailure":{"finalCategory":"REVIEW_DENIED_MAJOR","summary":"review denied"},"priorChangedFiles":[".\\src\\Feature.cs"],"retryLessons":[{"runAttemptNumber":1,"phaseAttempt":1,"source":"REVIEW","category":"REVIEW_DENIED_MAJOR","feedbackExcerpt":"Reuse the existing converter."}]}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-RetryContextState -RetryContextFile $path -ExpectedTaskId "task-retry") | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $true) "Valid retry context files should load successfully."
+    Assert-True ([int]$parsed.attemptNumber -eq 2) "Retry context should preserve the retry attempt number."
+    Assert-True ([string]$parsed.latestFailure.finalCategory -eq "REVIEW_DENIED_MAJOR") "Retry context should preserve the latest failure category."
+    Assert-True (@($parsed.priorChangedFiles) -contains "src\Feature.cs") "Retry context should normalize prior changed files."
+    Assert-True (@($parsed.retryLessons).Count -eq 1) "Retry context should preserve structured retry lessons."
+    Assert-True ([int]$parsed.retryLessons[0].runAttemptNumber -eq 1) "Retry context should preserve lesson run attempt numbers."
+    Assert-True ([int]$parsed.retryLessons[0].phaseAttempt -eq 1) "Retry context should preserve lesson phase attempt numbers."
+}
+
+function Test-WrongTaskRetryContextFallsBackGracefully {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-wrong-task-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-retry","attemptNumber":2,"latestFailure":{"finalCategory":"REVIEW_DENIED_MAJOR","summary":"review denied"}}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-RetryContextState -RetryContextFile $path -ExpectedTaskId "task-other") | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $false) "Retry context should reject payloads for the wrong task."
+}
+
+function Test-EmptyRetryContextPayloadFallsBackGracefully {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-empty-" + [guid]::NewGuid().ToString("N") + ".json")
+        [System.IO.File]::WriteAllText($path, '{"version":1,"taskId":"task-retry","attemptNumber":2}', [System.Text.Encoding]::UTF8)
+        try {
+            (Get-RetryContextState -RetryContextFile $path -ExpectedTaskId "task-retry") | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $false) "Retry context should reject payloads without actionable signal."
+}
+
+function Test-MissingRetryContextFallsBackGracefully {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Read-JsonFileBestEffort",
+        "Normalize-RepoRelativePath",
+        "Get-NormalizedPathSet",
+        "Get-RetryContextState"
+    ) -ScriptBlock {
+        $missingPath = Join-Path $env:TEMP ("missing-retry-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        (Get-RetryContextState -RetryContextFile $missingPath) | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.loaded -eq $false) "Missing retry context should fall back without loading."
+    Assert-True ([int]$parsed.attemptNumber -eq 0) "Missing retry context should preserve the empty-state attempt number."
+    Assert-True (@($parsed.retryLessons).Count -eq 0) "Missing retry context should not synthesize lessons."
+}
+
+function Test-RetryContextPromptBlockIncludesPriorDenialText {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Clip-Text",
+        "Format-BulletList",
+        "Format-RetryContextPromptBlock"
+    ) -ScriptBlock {
+        $retryContext = [pscustomobject]@{
+            loaded = $true
+            attemptNumber = 2
+            latestFailure = [pscustomobject]@{
+                finalCategory = "REVIEW_DENIED_MAJOR"
+                summary = "review denied"
+                feedback = "Reuse the existing converter."
+                investigationConclusion = ""
+            }
+            priorChangedFiles = @("src\Feature.cs")
+            retryLessons = @(
+                [pscustomobject]@{
+                    runAttemptNumber = 1
+                    phaseAttempt = 1
+                    source = "REVIEW"
+                    category = "REVIEW_DENIED_MAJOR"
+                    feedbackExcerpt = "Reuse the existing converter."
+                }
+            )
+        }
+
+        Format-RetryContextPromptBlock -RetryContext $retryContext -Mode "IMPLEMENT" -MaxChars 1200
+    }
+
+    Assert-True ([string]$output -match "existing converter") "Retry prompt blocks should include prior denial text."
+    Assert-True ([string]$output -match "RETRY RULE") "Retry prompt blocks should include the mode-specific retry rule."
+    Assert-True ([string]$output -match "- Run 1 \[REVIEW/REVIEW_DENIED_MAJOR\]") "Retry prompt blocks should label prior lessons with the scheduler run number."
+    Assert-True ([string]$output -notmatch "- Attempt 1 \[") "Retry prompt blocks should not expose ambiguous phase attempt labels."
+}
+
+function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Normalize-RetryLessons",
+        "Ensure-Directory",
+        "Ensure-ParentDirectory",
+        "Get-EnvironmentFailureCategories",
+        "Is-EnvironmentFailureCategory",
+        "Clip-DiscoveryBriefText",
+        "Get-RetryLessonComparisonText",
+        "Is-RetryContextSemanticCategory",
+        "Get-RetryContextRelevantRuns",
+        "Get-FallbackRetryLesson",
+        "Get-RetryContextPayload",
+        "Write-RetryContextFile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-" + [guid]::NewGuid().ToString("N") + ".json")
+        $task = [pscustomobject]@{
+            taskId = "task-retry"
+            runs = @(
+                [pscustomobject]@{
+                    attemptNumber = 1
+                    launchSequence = 1
+                    finalStatus = "FAILED"
+                    finalCategory = "REVIEW_DENIED_MAJOR"
+                    summary = "The reviewer rejected the first attempt."
+                    feedback = "REVIEW DENIED (MAJOR): Reuse the existing converter instead of adding a parallel path."
+                    investigationConclusion = "CHANGE_NEEDED"
+                    retryLessons = @(
+                        [pscustomobject]@{
+                            runAttemptNumber = 1
+                            phaseAttempt = 1
+                            source = "REVIEW"
+                            category = "REVIEW_DENIED_MAJOR"
+                            feedbackExcerpt = "Reuse the existing converter instead of adding a parallel path."
+                        }
+                    )
+                    actualFiles = @("src\Feature.cs", "src\ExistingConverter.cs")
+                    completedAt = (Get-Date).AddMinutes(-6).ToString("o")
+                }
+                [pscustomobject]@{
+                    attemptNumber = 2
+                    launchSequence = 2
+                    finalStatus = "FAILED"
+                    finalCategory = "REVIEW_INFRA_FAILURE"
+                    summary = "review infra issue"
+                    feedback = "review call failed"
+                    retryLessons = @()
+                    actualFiles = @()
+                    completedAt = (Get-Date).AddMinutes(-5).ToString("o")
+                }
+                [pscustomobject]@{
+                    attemptNumber = 3
+                    launchSequence = 3
+                    finalStatus = "ERROR"
+                    finalCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    summary = "environment issue"
+                    feedback = "worker crashed"
+                    retryLessons = @()
+                    actualFiles = @()
+                    completedAt = (Get-Date).AddMinutes(-4).ToString("o")
+                }
+                [pscustomobject]@{
+                    attemptNumber = 4
+                    launchSequence = 4
+                    finalStatus = "NO_CHANGE"
+                    finalCategory = "NO_CHANGE_ALREADY_SATISFIED"
+                    summary = "already done"
+                    feedback = "already done"
+                    retryLessons = @()
+                    actualFiles = @("src\Ignore.cs")
+                    completedAt = (Get-Date).AddMinutes(-3).ToString("o")
+                }
+            )
+        }
+
+        $payload = Write-RetryContextFile -Path $path -Task $task -AttemptNumber 5
+        try {
+            [pscustomobject]@{
+                payload = $payload
+                json = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+            } | ConvertTo-Json -Depth 16
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    $payload = $parsed.payload
+    $json = $parsed.json | ConvertFrom-Json
+    Assert-True ([int]$payload.attemptNumber -eq 5) "Retry context files should preserve the target retry attempt number."
+    Assert-True ([string]$payload.latestFailure.finalCategory -eq "REVIEW_DENIED_MAJOR") "Retry context should use the latest semantically relevant failure as the current blocker."
+    Assert-True (@($payload.retryLessons).Count -eq 1) "Retry context should exclude infra-only, environment-only, and already-satisfied runs."
+    Assert-True ([int]$payload.retryLessons[0].runAttemptNumber -eq 1) "Retry context should preserve lesson run attempt numbers."
+    Assert-True ([string]$payload.retryLessons[0].category -eq "REVIEW_DENIED_MAJOR") "Retry context should preserve prior review-denial lessons."
+    Assert-True (@($payload.priorChangedFiles) -contains "src\Feature.cs") "Retry context should carry prior changed files from relevant runs."
+    Assert-True (-not (@($payload.priorChangedFiles) -contains "src\Ignore.cs")) "Retry context should exclude already-satisfied runs from prior changed files."
+    Assert-True ([string]$json.retryLessons[0].feedbackExcerpt -match "converter") "Retry context JSON should persist the prior denial text."
+}
+
+function Test-WriteRetryContextFileSkipsInfraOnlyHistory {
+    $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
+        "Normalize-StringArray",
+        "Normalize-RetryLessons",
+        "Ensure-Directory",
+        "Ensure-ParentDirectory",
+        "Get-EnvironmentFailureCategories",
+        "Is-EnvironmentFailureCategory",
+        "Clip-DiscoveryBriefText",
+        "Get-RetryLessonComparisonText",
+        "Is-RetryContextSemanticCategory",
+        "Get-RetryContextRelevantRuns",
+        "Get-FallbackRetryLesson",
+        "Get-RetryContextPayload",
+        "Write-RetryContextFile"
+    ) -ScriptBlock {
+        $path = Join-Path $env:TEMP ("retry-context-none-" + [guid]::NewGuid().ToString("N") + ".json")
+        $task = [pscustomobject]@{
+            taskId = "task-retry-none"
+            runs = @(
+                [pscustomobject]@{
+                    attemptNumber = 1
+                    launchSequence = 1
+                    finalStatus = "FAILED"
+                    finalCategory = "REVIEW_INFRA_FAILURE"
+                    summary = "review infra failed"
+                    feedback = "review call failed"
+                    retryLessons = @()
+                    actualFiles = @()
+                }
+                [pscustomobject]@{
+                    attemptNumber = 2
+                    launchSequence = 2
+                    finalStatus = "ERROR"
+                    finalCategory = "UNEXPECTED_ERROR"
+                    summary = "unexpected worker exception"
+                    feedback = "unexpected worker exception"
+                    retryLessons = @()
+                    actualFiles = @()
+                }
+                [pscustomobject]@{
+                    attemptNumber = 3
+                    launchSequence = 3
+                    finalStatus = "ERROR"
+                    finalCategory = "WORKER_EXITED_WITHOUT_RESULT"
+                    summary = "worker exited"
+                    feedback = "worker exited"
+                    retryLessons = @()
+                    actualFiles = @()
+                }
+            )
+        }
+
+        try {
+            $payload = Write-RetryContextFile -Path $path -Task $task -AttemptNumber 4
+            [pscustomobject]@{
+                hasPayload = [bool]$payload
+                fileExists = Test-Path -LiteralPath $path
+            } | ConvertTo-Json -Depth 8
+        } finally {
+            Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $raw | ConvertFrom-Json
+    Assert-True ($parsed.hasPayload -eq $false) "Retry context should not be generated from infra-only history."
+    Assert-True ($parsed.fileExists -eq $false) "Retry context files should not be written when no semantic retry memory exists."
+}
+
+function Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts {
+    $repo = New-TestRepo
+    try {
+        $resultPath = Join-Path $repo.tasksDir "retry-context-reconcile-result.json"
+        $plannerContextPath = Join-Path $repo.root "planner-context.json"
+        $retryContextPath = Join-Path $repo.root "retry-context.json"
+        New-Item -ItemType Directory -Path $repo.tasksDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($resultPath, (@{
+            status = "FAILED"
+            finalCategory = "REVIEW_DENIED_MAJOR"
+            summary = "review denied"
+            feedback = "Reuse the existing converter."
+            noChangeReason = ""
+            files = @("src\Feature.cs")
+            branch = ""
+            retryLessons = @(
+                @{
+                    runAttemptNumber = 1
+                    phaseAttempt = 1
+                    source = "REVIEW"
+                    category = "REVIEW_DENIED_MAJOR"
+                    feedbackExcerpt = "Reuse the existing converter."
+                }
+            )
+            artifacts = @{
+                runDir = ""
+                timeline = ""
+                debugDir = (Join-Path $repo.root "debug")
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $latestRun = New-TestLatestRun -AttemptNumber 1 -LaunchSequence 1 -TaskName "develop-retry-context-a1" -ResultFile $resultPath -ProcessId 999999 -StartedAt (Get-Date).AddMinutes(-1).ToString("o")
+        $latestRun.artifacts = [pscustomobject]@{
+            plannerContext = $plannerContextPath
+            retryContext = $retryContextPath
+        }
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "retry-context-reconcile"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "retry context reconcile"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "retry-context-reconcile.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 1
+                    attemptsRemaining = 2
+                    workerLaunchSequence = 1
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "running"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = $latestRun
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "retry-context-reconcile" })[0]
+        Assert-True ([string]$task.state -eq "retry_scheduled") "Review-denied results should reconcile into retry_scheduled."
+        Assert-True (@($task.runs[0].retryLessons).Count -eq 1) "Reconciled run records should persist retry lessons."
+        Assert-True ([int]$task.runs[0].retryLessons[0].runAttemptNumber -eq 1) "Persisted retry lessons should preserve the scheduler run attempt number."
+        Assert-True ([string]$task.runs[0].retryLessons[0].category -eq "REVIEW_DENIED_MAJOR") "Persisted retry lessons should preserve the original blocker category."
+        Assert-True ([string]$task.progress.artifactPointers.plannerContextPath -eq $plannerContextPath) "Task progress should expose the preserved planner context path."
+        Assert-True ([string]$task.progress.artifactPointers.retryContextPath -eq $retryContextPath) "Task progress should expose the preserved retry context path."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
 }
 
 function Test-DirectionCheckVerdictParsesOnTrackCombination {
@@ -5828,6 +6246,15 @@ Test-EncodedWorkerLaunchCommandPreservesSpacedPaths
 Test-WritePlannerContextFilePersistsEffortClass
 Test-PlannerContextLowEffortSelectsSimpleProfile
 Test-MissingPlannerContextFallsBackToComplexProfile
+Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons
+Test-RetryContextRoundTripLoadsWorkerState
+Test-WrongTaskRetryContextFallsBackGracefully
+Test-EmptyRetryContextPayloadFallsBackGracefully
+Test-MissingRetryContextFallsBackGracefully
+Test-RetryContextPromptBlockIncludesPriorDenialText
+Test-WriteRetryContextFilePersistsRelevantPriorFailures
+Test-WriteRetryContextFileSkipsInfraOnlyHistory
+Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts
 Test-DirectionCheckVerdictParsesOnTrackCombination
 Test-DirectionCheckVerdictParsesMinorDriftCombination
 Test-DirectionCheckVerdictParsesMajorDriftCombination

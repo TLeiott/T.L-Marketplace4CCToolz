@@ -578,6 +578,52 @@ function Normalize-StringArray {
     )
 }
 
+function Normalize-RetryLessons {
+    param(
+        $Lessons,
+        [int]$DefaultRunAttemptNumber = 0
+    )
+
+    $normalizedLessons = @()
+    foreach ($lesson in @($Lessons)) {
+        if (-not $lesson) { continue }
+
+        $runAttemptNumber = if ($null -ne $lesson.runAttemptNumber) {
+            [int]$lesson.runAttemptNumber
+        } elseif ($DefaultRunAttemptNumber -gt 0) {
+            $DefaultRunAttemptNumber
+        } else {
+            0
+        }
+
+        $phaseAttempt = if ($null -ne $lesson.phaseAttempt) {
+            [int]$lesson.phaseAttempt
+        } elseif ($null -ne $lesson.attempt) {
+            [int]$lesson.attempt
+        } else {
+            0
+        }
+
+        $feedbackExcerpt = if ($null -ne $lesson.feedbackExcerpt) {
+            [string]$lesson.feedbackExcerpt
+        } elseif ($null -ne $lesson.feedback) {
+            [string]$lesson.feedback
+        } else {
+            ""
+        }
+
+        $normalizedLessons += [pscustomobject]@{
+            runAttemptNumber = $runAttemptNumber
+            phaseAttempt = $phaseAttempt
+            source = [string]$lesson.source
+            category = [string]$lesson.category
+            feedbackExcerpt = $feedbackExcerpt
+        }
+    }
+
+    return @($normalizedLessons)
+}
+
 function Normalize-LatestRun {
     param(
         $LatestRun,
@@ -627,8 +673,9 @@ function Normalize-RunRecords {
     $normalizedRuns = @()
     foreach ($run in @($Runs)) {
         if (-not $run) { continue }
+        $runAttemptNumber = if ($null -ne $run.attemptNumber) { [int]$run.attemptNumber } else { 0 }
         $normalizedRuns += [pscustomobject]@{
-            attemptNumber = if ($null -ne $run.attemptNumber) { [int]$run.attemptNumber } else { 0 }
+            attemptNumber = $runAttemptNumber
             launchSequence = if ($null -ne $run.launchSequence) { [int]$run.launchSequence } else { 0 }
             taskName = [string]$run.taskName
             finalStatus = [string]$run.finalStatus
@@ -638,6 +685,7 @@ function Normalize-RunRecords {
             noChangeReason = [string]$run.noChangeReason
             investigationConclusion = [string]$run.investigationConclusion
             reproductionConfirmed = [bool]$run.reproductionConfirmed
+            retryLessons = @(Normalize-RetryLessons -Lessons $run.retryLessons -DefaultRunAttemptNumber $runAttemptNumber)
             actualFiles = @(Normalize-StringArray -Value $run.actualFiles)
             branchName = [string]$run.branchName
             resultFile = [string]$run.resultFile
@@ -829,6 +877,18 @@ function Get-TaskArtifactPointers {
         ""
     }
 
+    $plannerContextPath = if ($Task.latestRun.artifacts -and $Task.latestRun.artifacts.plannerContext) {
+        [string]$Task.latestRun.artifacts.plannerContext
+    } else {
+        ""
+    }
+
+    $retryContextPath = if ($Task.latestRun.artifacts -and $Task.latestRun.artifacts.retryContext) {
+        [string]$Task.latestRun.artifacts.retryContext
+    } else {
+        ""
+    }
+
     return [pscustomobject]@{
         runDir = $runDir
         schedulerSnapshotPath = $schedulerSnapshotPath
@@ -836,6 +896,8 @@ function Get-TaskArtifactPointers {
         resultFile = [string]$Task.latestRun.resultFile
         workerStdoutPath = $workerStdoutPath
         workerStderrPath = $workerStderrPath
+        plannerContextPath = $plannerContextPath
+        retryContextPath = $retryContextPath
     }
 }
 
@@ -1546,9 +1608,204 @@ function Write-PlannerContextFile {
     $payload = [ordered]@{
         taskId = [string]$Task.taskId
         waveNumber = [int]$Task.waveNumber
+        attemptNumber = [int]$Task.attemptsUsed
+        launchSequence = [int]$Task.workerLaunchSequence
         plannerMetadata = if ($Task.plannerMetadata) { $Task.plannerMetadata } else { [pscustomobject]@{} }
     } | ConvertTo-Json -Depth 16
     [System.IO.File]::WriteAllText($Path, $payload, [System.Text.Encoding]::UTF8)
+}
+
+function Get-RetryLessonComparisonText {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+    $value = ([string]$Text).ToLowerInvariant()
+    $value = [regex]::Replace($value, '(?m)^\s*[-*]\s+', '')
+    $value = [regex]::Replace($value, '[\p{P}\p{S}]+', ' ')
+    $value = [regex]::Replace($value, '\s+', ' ')
+    return $value.Trim()
+}
+
+function Is-RetryContextSemanticCategory {
+    param([string]$Category)
+
+    $value = ([string]$Category).Trim().ToUpperInvariant()
+    if (-not $value) { return $false }
+    if (Is-EnvironmentFailureCategory -Category $value) { return $false }
+    if ($value -eq "NO_CHANGE_ALREADY_SATISFIED") { return $false }
+    if ($value -in @(
+        "REVIEW_INFRA_FAILURE",
+        "UNEXPECTED_ERROR",
+        "PREFLIGHT_PARSE_ERROR",
+        "DIRECTION_CHECK_CALL_FAILED",
+        "NO_CHANGE_TOOL_FAILURE"
+    )) {
+        return $false
+    }
+    if ($value -like "*_CALL_FAILED" -or $value -like "*_PARSE_ERROR") { return $false }
+    if ($value -like "REVIEW_DENIED_*") { return $true }
+    if ($value -in @(
+        "PREFLIGHT_FAILED",
+        "INVESTIGATION_INCONCLUSIVE",
+        "FIX_PLAN_INSUFFICIENT",
+        "FIX_PLAN_DIRECTION_DRIFT"
+    )) {
+        return $true
+    }
+    if ($value -like "NO_CHANGE_*") { return $true }
+    return $false
+}
+
+function Get-RetryContextRelevantRuns {
+    param($Task)
+
+    return @(
+        @($Task.runs) |
+            Where-Object {
+                $status = [string]$_.finalStatus
+                $category = [string]$_.finalCategory
+
+                if ($status -eq "ACCEPTED") { return $false }
+                return (Is-RetryContextSemanticCategory -Category $category)
+            } |
+            Sort-Object @(
+                @{ Expression = { [int]$_.attemptNumber } },
+                @{ Expression = { [int]$_.launchSequence } },
+                @{ Expression = {
+                    $completedAt = [string]$_.completedAt
+                    if ($completedAt) {
+                        try { return [datetime]$completedAt } catch { }
+                    }
+                    return [datetime]::MinValue
+                } }
+            )
+    )
+}
+
+function Get-FallbackRetryLesson {
+    param($Run)
+
+    if (-not $Run) { return $null }
+
+    $feedbackText = if ([string]$Run.feedback) {
+        [string]$Run.feedback
+    } elseif ([string]$Run.summary) {
+        [string]$Run.summary
+    } else {
+        [string]$Run.finalCategory
+    }
+
+    if (-not $feedbackText) { return $null }
+
+    return [pscustomobject]@{
+        runAttemptNumber = [int]$Run.attemptNumber
+        phaseAttempt = 0
+        source = if ([string]$Run.finalStatus) { [string]$Run.finalStatus } else { "RUN" }
+        category = if ([string]$Run.finalCategory) { [string]$Run.finalCategory } else { "RETRY_CONTEXT" }
+        feedbackExcerpt = Clip-DiscoveryBriefText -Text $feedbackText -MaxLength 260
+    }
+}
+
+function Get-RetryContextPayload {
+    param(
+        $Task,
+        [int]$AttemptNumber
+    )
+
+    $relevantRuns = @(Get-RetryContextRelevantRuns -Task $Task)
+    if ($relevantRuns.Count -eq 0) { return $null }
+
+    $selectedRuns = @($relevantRuns | Select-Object -Last 3)
+    $latestRun = @($selectedRuns | Select-Object -Last 1)[0]
+    if (-not $latestRun) { return $null }
+
+    $priorChangedFiles = @(
+        $selectedRuns |
+            ForEach-Object { @($_.actualFiles) } |
+            Where-Object { $_ } |
+            ForEach-Object { [string]$_ } |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { $_ } |
+            Select-Object -Unique |
+            Select-Object -First 12
+    )
+
+    $lessonKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $compiledLessons = [System.Collections.ArrayList]::new()
+    foreach ($run in @($selectedRuns | Sort-Object @(
+        @{ Expression = { [int]$_.attemptNumber }; Descending = $true },
+        @{ Expression = { [int]$_.launchSequence }; Descending = $true }
+    ))) {
+        $runLessons = @(Normalize-RetryLessons -Lessons $run.retryLessons -DefaultRunAttemptNumber ([int]$run.attemptNumber))
+        if ($runLessons.Count -eq 0) {
+            $fallbackLesson = Get-FallbackRetryLesson -Run $run
+            if ($fallbackLesson) {
+                $runLessons = @($fallbackLesson)
+            }
+        }
+
+        foreach ($lesson in $runLessons) {
+            if ($compiledLessons.Count -ge 8) { break }
+
+            $lessonKey = (
+                @(
+                    [string]$lesson.source,
+                    [string]$lesson.category,
+                    (Get-RetryLessonComparisonText -Text ([string]$lesson.feedbackExcerpt))
+                ) -join "|"
+            )
+
+            if (-not $lessonKey.Trim('|')) { continue }
+            if (-not $lessonKeys.Add($lessonKey)) { continue }
+
+            [void]$compiledLessons.Add([pscustomobject]@{
+                runAttemptNumber = if ($null -ne $lesson.runAttemptNumber) { [int]$lesson.runAttemptNumber } else { [int]$run.attemptNumber }
+                phaseAttempt = if ($null -ne $lesson.phaseAttempt) { [int]$lesson.phaseAttempt } else { 0 }
+                source = [string]$lesson.source
+                category = [string]$lesson.category
+                feedbackExcerpt = Clip-DiscoveryBriefText -Text ([string]$lesson.feedbackExcerpt) -MaxLength 260
+            })
+        }
+
+        if ($compiledLessons.Count -ge 8) { break }
+    }
+
+    $latestFailureSummary = Clip-DiscoveryBriefText -Text ([string]$latestRun.summary) -MaxLength 240
+    $latestFailureFeedback = Clip-DiscoveryBriefText -Text ([string]$latestRun.feedback) -MaxLength 500
+    $latestInvestigationConclusion = Clip-DiscoveryBriefText -Text ([string]$latestRun.investigationConclusion) -MaxLength 180
+
+    $hasSignal = $compiledLessons.Count -gt 0 -or $priorChangedFiles.Count -gt 0 -or $latestFailureSummary -or $latestFailureFeedback -or $latestInvestigationConclusion
+    if (-not $hasSignal) { return $null }
+
+    return [ordered]@{
+        version = 1
+        taskId = [string]$Task.taskId
+        attemptNumber = $AttemptNumber
+        latestFailure = [ordered]@{
+            finalStatus = [string]$latestRun.finalStatus
+            finalCategory = [string]$latestRun.finalCategory
+            summary = $latestFailureSummary
+            feedback = $latestFailureFeedback
+            investigationConclusion = $latestInvestigationConclusion
+        }
+        priorChangedFiles = @($priorChangedFiles)
+        retryLessons = @($compiledLessons)
+    }
+}
+
+function Write-RetryContextFile {
+    param(
+        [string]$Path,
+        $Task,
+        [int]$AttemptNumber
+    )
+
+    $payload = Get-RetryContextPayload -Task $Task -AttemptNumber $AttemptNumber
+    if (-not $payload) { return $null }
+
+    Ensure-ParentDirectory -Path $Path
+    [System.IO.File]::WriteAllText($Path, ($payload | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+    return $payload
 }
 
 function Normalize-RepoRelativePath {
@@ -2723,9 +2980,20 @@ function Apply-PipelineResultToTask {
     Set-ObjectProperty -Object $Task.latestRun -Name "reproductionConfirmed" -Value ([bool]$PipelineResult.reproductionConfirmed)
     Set-ObjectProperty -Object $Task.latestRun -Name "actualFiles" -Value @(Normalize-StringArray -Value $PipelineResult.files)
     Set-ObjectProperty -Object $Task.latestRun -Name "branchName" -Value ([string]$PipelineResult.branch)
-    Set-ObjectProperty -Object $Task.latestRun -Name "artifacts" -Value $PipelineResult.artifacts
     Set-ObjectProperty -Object $Task.latestRun -Name "completedAt" -Value ((Get-Date).ToString("o"))
     Set-ObjectProperty -Object $Task.latestRun -Name "launchSequence" -Value ([int]$Task.workerLaunchSequence)
+
+    $mergedArtifacts = [ordered]@{}
+    foreach ($artifactSource in @($Task.latestRun.artifacts, $PipelineResult.artifacts)) {
+        if (-not $artifactSource) { continue }
+        foreach ($property in $artifactSource.PSObject.Properties) {
+            $value = $property.Value
+            if ($null -eq $value) { continue }
+            if ($value -is [string] -and [string]::IsNullOrWhiteSpace([string]$value)) { continue }
+            $mergedArtifacts[$property.Name] = $value
+        }
+    }
+    Set-ObjectProperty -Object $Task.latestRun -Name "artifacts" -Value ([pscustomobject]$mergedArtifacts)
 
     $runRecord = [pscustomobject]@{
         attemptNumber = [int]$Task.attemptsUsed
@@ -2738,11 +3006,12 @@ function Apply-PipelineResultToTask {
         noChangeReason = [string]$PipelineResult.noChangeReason
         investigationConclusion = [string]$PipelineResult.investigationConclusion
         reproductionConfirmed = [bool]$PipelineResult.reproductionConfirmed
+        retryLessons = @(Normalize-RetryLessons -Lessons $PipelineResult.retryLessons -DefaultRunAttemptNumber ([int]$Task.attemptsUsed))
         actualFiles = @($PipelineResult.files)
         branchName = [string]$PipelineResult.branch
         resultFile = [string]$Task.latestRun.resultFile
         completedAt = $Task.latestRun.completedAt
-        artifacts = $PipelineResult.artifacts
+        artifacts = $Task.latestRun.artifacts
     }
     $Task.runs = @($Task.runs) + @($runRecord)
     if ($RepoRoot) {
@@ -3143,6 +3412,7 @@ function Get-EncodedWorkerLaunchCommand {
         [string]$SolutionPath,
         [string]$ResultFile,
         [string]$PlannerContextFile,
+        [string]$RetryContextFile,
         [string]$TaskName,
         [string]$SchedulerTaskId,
         [string]$CommandType,
@@ -3154,6 +3424,7 @@ function Get-EncodedWorkerLaunchCommand {
     $solutionLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SolutionPath
     $resultLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $ResultFile
     $plannerContextLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $PlannerContextFile
+    $retryContextLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $RetryContextFile
     $taskNameLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $TaskName
     $taskIdLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $SchedulerTaskId
     $commandTypeLiteral = ConvertTo-PowerShellSingleQuotedLiteral -Value $CommandType
@@ -3161,7 +3432,7 @@ function Get-EncodedWorkerLaunchCommand {
 
     $commandText = @"
 `$ErrorActionPreference = 'Stop'
-& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -PlannerContextFile $plannerContextLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
+& $scriptLiteral -PromptFile $promptLiteral -SolutionPath $solutionLiteral -ResultFile $resultLiteral -PlannerContextFile $plannerContextLiteral -RetryContextFile $retryContextLiteral -TaskName $taskNameLiteral -SchedulerTaskId $taskIdLiteral -CommandType $commandTypeLiteral$allowNugetFragment
 exit `$LASTEXITCODE
 "@
 
@@ -3939,6 +4210,9 @@ function Run-Task {
         $launchSequence = [int]$task.workerLaunchSequence
         $pipelineResultPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-result.json"
         $plannerContextPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-planner-context.json"
+        $retryContextPath = Join-Path $context.paths.tasksDir "$TaskId-launch-$launchSequence-retry-context.json"
+        $retryContextPayload = Write-RetryContextFile -Path $retryContextPath -Task $task -AttemptNumber $attemptNumber
+        $retryContextFileForLaunch = if ($retryContextPayload) { $retryContextPath } else { "" }
         $taskName = Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -LaunchSequence $launchSequence
         $runDir = Join-Path (Join-Path $context.repoRoot ".claude-develop-logs\runs") $taskName
         $artifactPointers = [pscustomobject]@{
@@ -3947,6 +4221,7 @@ function Run-Task {
             timelinePath = Join-Path $runDir "timeline.json"
             resultFile = $pipelineResultPath
             plannerContextFile = $plannerContextPath
+            retryContextFile = $retryContextFileForLaunch
         }
         $task.latestRun = New-LatestRunRecord `
             -AttemptNumber $attemptNumber `
@@ -3963,6 +4238,7 @@ function Run-Task {
             timeline = $artifactPointers.timelinePath
             schedulerSnapshot = $artifactPointers.schedulerSnapshotPath
             plannerContext = $artifactPointers.plannerContextFile
+            retryContext = $artifactPointers.retryContextFile
             workerLauncher = $workerLauncher.command
             workerStdout = ""
             workerStderr = ""
@@ -3982,6 +4258,7 @@ function Run-Task {
         -SolutionPath ([string]$task.solutionPath) `
         -ResultFile $pipelineResultPath `
         -PlannerContextFile $plannerContextPath `
+        -RetryContextFile ([string]$artifactPointers.retryContextFile) `
         -TaskName ([string]$task.latestRun.taskName) `
         -SchedulerTaskId ([string]$task.taskId) `
         -CommandType ([string]$task.sourceCommand) `

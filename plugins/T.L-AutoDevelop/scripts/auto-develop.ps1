@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [Parameter(Mandatory)][string]$ResultFile,
     [string]$PlannerContextFile = "",
+    [string]$RetryContextFile = "",
     [string]$TaskName = "develop-$(Get-Date -Format 'yyyyMMdd-HHmmss')",
     [string]$SchedulerTaskId = "",
     [string]$CommandType = "",
@@ -42,6 +43,10 @@ $CONST_REVIEW_HISTORY_MAX_CHARS = 1400
 $CONST_REVIEW_FAST_MAX_FILES = 3
 $CONST_REVIEW_FAST_MAX_DIFF_CHARS = 7000
 $CONST_TARGET_HINTS_MAX = 5
+$CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS = 900
+$CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS = 1200
+$CONST_RETRY_CONTEXT_IMPLEMENT_MAX_CHARS = 1600
+$CONST_RETRY_CONTEXT_REMEDIATE_MAX_CHARS = 1400
 
 $ErrorActionPreference = "Stop"
 $originalDir = Get-Location
@@ -86,6 +91,8 @@ $testability = "UNKNOWN"
 $testProjects = @()
 $plannerEffortClass = "UNKNOWN"
 $pipelineProfile = "COMPLEX"
+$currentRunAttemptNumber = 0
+$currentLaunchSequence = 0
 $reproductionAttempted = $false
 $reproductionConfirmed = $false
 $reproductionOutput = ""
@@ -114,6 +121,21 @@ $directionCheckVerdict = [ordered]@{
     warningOnly = $false
 }
 $directionCheckGuardrail = ""
+$retryContextState = [ordered]@{
+    loaded = $false
+    path = ""
+    taskId = ""
+    attemptNumber = 0
+    latestFailure = [ordered]@{
+        finalStatus = ""
+        finalCategory = ""
+        summary = ""
+        feedback = ""
+        investigationConclusion = ""
+    }
+    priorChangedFiles = @()
+    retryLessons = @()
+}
 $discoverVerdict = [ordered]@{
     route = "UNCERTAIN"
     bugConfidence = "LOW"
@@ -169,6 +191,202 @@ function Read-JsonFileBestEffort {
             return $null
         }
     }
+}
+
+function Get-RetryLessonComparisonText {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+    $value = ([string]$Text).ToLowerInvariant()
+    $value = [regex]::Replace($value, '(?m)^\s*[-*]\s+', '')
+    $value = [regex]::Replace($value, '[\p{P}\p{S}]+', ' ')
+    $value = [regex]::Replace($value, '\s+', ' ')
+    return $value.Trim()
+}
+
+function Get-RetryLessonsFromFeedbackHistory {
+    param(
+        [System.Collections.ArrayList]$History,
+        [int]$RunAttemptNumber = 0,
+        [int]$MaxLessons = 8,
+        [int]$MaxFeedbackChars = 260
+    )
+
+    if (-not $History -or $History.Count -eq 0) { return @() }
+
+    $lessons = [System.Collections.ArrayList]::new()
+    $seenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    for ($index = ($History.Count - 1); $index -ge 0; $index--) {
+        if ($lessons.Count -ge $MaxLessons) { break }
+        $entry = $History[$index]
+        if (-not $entry) { continue }
+
+        $feedbackText = [string]$entry.feedback
+        $firstLine = @($feedbackText -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1)[0]
+        if (-not $firstLine) {
+            $firstLine = [string]$entry.category
+        }
+
+        $dedupeKey = @(
+            ([string]$entry.source).Trim().ToUpperInvariant(),
+            ([string]$entry.category).Trim().ToUpperInvariant(),
+            (Get-RetryLessonComparisonText -Text $firstLine)
+        ) -join "|"
+        if (-not $dedupeKey.Trim('|')) { continue }
+        if (-not $seenKeys.Add($dedupeKey)) { continue }
+
+        [void]$lessons.Add([pscustomobject]@{
+            runAttemptNumber = $RunAttemptNumber
+            phaseAttempt = if ($null -ne $entry.attempt) { [int]$entry.attempt } else { 0 }
+            source = [string]$entry.source
+            category = [string]$entry.category
+            feedbackExcerpt = Clip-Text -Text $feedbackText -MaxChars $MaxFeedbackChars -Marker "Feedback trimmed"
+        })
+    }
+
+    return @($lessons)
+}
+
+function Get-RetryContextState {
+    param(
+        [string]$RetryContextFile,
+        [string]$ExpectedTaskId = ""
+    )
+
+    $emptyState = [ordered]@{
+        loaded = $false
+        path = [string]$RetryContextFile
+        taskId = ""
+        attemptNumber = 0
+        latestFailure = [ordered]@{
+            finalStatus = ""
+            finalCategory = ""
+            summary = ""
+            feedback = ""
+            investigationConclusion = ""
+        }
+        priorChangedFiles = @()
+        retryLessons = @()
+    }
+
+    if (-not $RetryContextFile) {
+        return [pscustomobject]$emptyState
+    }
+
+    $context = Read-JsonFileBestEffort -Path $RetryContextFile
+    if (-not $context) {
+        return [pscustomobject]$emptyState
+    }
+    if ($null -ne $context.version -and [int]$context.version -ne 1) {
+        return [pscustomobject]$emptyState
+    }
+    if ($ExpectedTaskId -and [string]$context.taskId -ne [string]$ExpectedTaskId) {
+        return [pscustomobject]$emptyState
+    }
+
+    $latestFailure = [ordered]@{
+        finalStatus = if ($context.latestFailure) { [string]$context.latestFailure.finalStatus } else { "" }
+        finalCategory = if ($context.latestFailure) { [string]$context.latestFailure.finalCategory } else { "" }
+        summary = if ($context.latestFailure) { [string]$context.latestFailure.summary } else { "" }
+        feedback = if ($context.latestFailure) { [string]$context.latestFailure.feedback } else { "" }
+        investigationConclusion = if ($context.latestFailure) { [string]$context.latestFailure.investigationConclusion } else { "" }
+    }
+
+    $retryLessons = @()
+    foreach ($lesson in @($context.retryLessons)) {
+        if (-not $lesson) { continue }
+        $retryLessons += [pscustomobject]@{
+            runAttemptNumber = if ($null -ne $lesson.runAttemptNumber) { [int]$lesson.runAttemptNumber } else { 0 }
+            phaseAttempt = if ($null -ne $lesson.phaseAttempt) { [int]$lesson.phaseAttempt } elseif ($null -ne $lesson.attempt) { [int]$lesson.attempt } else { 0 }
+            source = [string]$lesson.source
+            category = [string]$lesson.category
+            feedbackExcerpt = if ($null -ne $lesson.feedbackExcerpt) { [string]$lesson.feedbackExcerpt } else { "" }
+        }
+    }
+
+    $priorChangedFiles = @(Get-NormalizedPathSet -Paths $context.priorChangedFiles)
+    $hasSignal =
+        $latestFailure.finalStatus -or
+        $latestFailure.finalCategory -or
+        $latestFailure.summary -or
+        $latestFailure.feedback -or
+        $latestFailure.investigationConclusion -or
+        $priorChangedFiles.Count -gt 0 -or
+        $retryLessons.Count -gt 0
+    if (-not $hasSignal) {
+        return [pscustomobject]$emptyState
+    }
+
+    return [pscustomobject]@{
+        loaded = $true
+        path = [string]$RetryContextFile
+        taskId = [string]$context.taskId
+        attemptNumber = if ($null -ne $context.attemptNumber) { [int]$context.attemptNumber } else { 0 }
+        latestFailure = $latestFailure
+        priorChangedFiles = @($priorChangedFiles)
+        retryLessons = @($retryLessons)
+    }
+}
+
+function Format-RetryContextPromptBlock {
+    param(
+        $RetryContext,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    )
+
+    if (-not $RetryContext -or -not $RetryContext.loaded) { return "" }
+
+    $lines = [System.Collections.ArrayList]::new()
+    if ([int]$RetryContext.attemptNumber -gt 0) {
+        [void]$lines.Add("RETRY ATTEMPT: $([int]$RetryContext.attemptNumber)")
+    }
+    if ($RetryContext.latestFailure.finalCategory) {
+        [void]$lines.Add("LATEST FAILURE CATEGORY: $([string]$RetryContext.latestFailure.finalCategory)")
+    }
+    if ($RetryContext.latestFailure.summary) {
+        [void]$lines.Add("LATEST FAILURE SUMMARY: $([string]$RetryContext.latestFailure.summary)")
+    }
+    if ($RetryContext.latestFailure.feedback) {
+        [void]$lines.Add("LATEST FAILURE FEEDBACK: $([string]$RetryContext.latestFailure.feedback)")
+    }
+    if ($RetryContext.latestFailure.investigationConclusion) {
+        [void]$lines.Add("LATEST INVESTIGATION CONCLUSION: $([string]$RetryContext.latestFailure.investigationConclusion)")
+    }
+    if (@($RetryContext.priorChangedFiles).Count -gt 0) {
+        [void]$lines.Add("PRIOR CHANGED FILES:`n$(Format-BulletList -Items @($RetryContext.priorChangedFiles) -MaxItems 8 -EmptyText '- None')")
+    }
+    if (@($RetryContext.retryLessons).Count -gt 0) {
+        $lessonLines = @($RetryContext.retryLessons | ForEach-Object {
+            $runLabel = if ($null -ne $_.runAttemptNumber -and [int]$_.runAttemptNumber -gt 0) { "Run $([int]$_.runAttemptNumber) " } else { "" }
+            "- ${runLabel}[$([string]$_.source)/$([string]$_.category)]: $([string]$_.feedbackExcerpt)"
+        })
+        [void]$lines.Add("PRIOR LESSONS:`n$($lessonLines -join "`n")")
+    }
+
+    $modeRule = switch ($Mode.ToUpperInvariant()) {
+        "DISCOVER" { "Treat these blockers as disconfirming evidence. Do not route through the same failed assumption without new evidence." }
+        "INVESTIGATE" { "Re-check the failed assumption and identify what the earlier attempt missed." }
+        "FIX_PLAN" { "Plan around these blockers explicitly. Do not propose a path that repeats them." }
+        "IMPLEMENT" { "Resolve these blockers directly. Do not repeat a denied or broken approach." }
+        "REMEDIATE" { "Fix the current blockers without reintroducing the earlier denied or failed path." }
+        default { "Use this as must-fix retry memory for the current attempt." }
+    }
+    [void]$lines.Add("RETRY RULE: $modeRule")
+
+    return Clip-Text -Text (($lines | Where-Object { $_ }) -join "`n") -MaxChars $MaxChars -Marker "Retry context trimmed"
+}
+
+function Get-RetryContextPromptSection {
+    param(
+        $RetryContext,
+        [string]$Mode = "GENERAL",
+        [int]$MaxChars = $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    )
+
+    $block = Format-RetryContextPromptBlock -RetryContext $RetryContext -Mode $Mode -MaxChars $MaxChars
+    if (-not $block) { return "" }
+    return "RETRY CONTEXT:`n$block`n"
 }
 
 function Normalize-RepoRelativePath {
@@ -1413,6 +1631,8 @@ function Write-DebugManifest {
         promptFile = $PromptFile
         solutionPath = $SolutionPath
         resultFile = $ResultFile
+        plannerContextFile = $PlannerContextFile
+        retryContextFile = $RetryContextFile
         repoRoot = $repoRoot
         artifactRunDir = $artifactRunDir
         debugDir = $debugRunDir
@@ -1427,6 +1647,9 @@ function Write-DebugManifest {
         routeDecision = $routeDecision
         testability = $testability
         reproductionConfirmed = [bool]$reproductionConfirmed
+        retryContextLoaded = [bool]$retryContextState.loaded
+        retryLessonCount = @($retryContextState.retryLessons).Count
+        retryLatestFailureCategory = [string]$retryContextState.latestFailure.finalCategory
     }
     Save-DebugJson -Name "manifest.json" -Object $manifest | Out-Null
 }
@@ -1459,6 +1682,9 @@ function Write-SchedulerSnapshot {
         changedFiles = @(Get-NormalizedPathSet -Paths $changedFiles)
         implementationScopeCheck = $implementationScopeCheck
         directionCheck = $directionCheckVerdict
+        retryContextLoaded = [bool]$retryContextState.loaded
+        retryLessonCount = @($retryContextState.retryLessons).Count
+        retryLatestFailureCategory = [string]$retryContextState.latestFailure.finalCategory
         finalStatus = $finalStatus
         finalCategory = $finalCategory
         artifacts = [ordered]@{
@@ -2118,6 +2344,7 @@ function Write-ResultJson {
         $directionCheck = $null
     )
     $metricsSummary = Get-PhaseMetricsSummary
+    $retryLessons = @(Get-RetryLessonsFromFeedbackHistory -History $feedbackHistory -RunAttemptNumber $currentRunAttemptNumber)
     if ($artifactRunDir) {
         Save-JsonArtifact -Name "phase-metrics.json" -Object @($phaseMetrics) | Out-Null
         Save-JsonArtifact -Name "metrics-summary.json" -Object $metricsSummary | Out-Null
@@ -2140,6 +2367,8 @@ function Write-ResultJson {
             runDir = $artifactRunDir
             timeline = if ($artifactRunDir) { Join-Path $artifactRunDir "timeline.json" } else { "" }
             debugDir = $debugRunDir
+            plannerContext = $PlannerContextFile
+            retryContext = $RetryContextFile
         }
         planVersion = $planVersion
         investigationRequired = $investigationRequired
@@ -2157,6 +2386,7 @@ function Write-ResultJson {
         plannerEffortClass = $plannerEffortClass
         pipelineProfile = $pipelineProfile
         directionCheck = if ($directionCheck) { $directionCheck } else { [ordered]@{} }
+        retryLessons = @($retryLessons)
         metrics = $metricsSummary
     } | ConvertTo-Json -Depth 8
 
@@ -2959,6 +3189,9 @@ try {
     $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
     $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch "^\s*$|^##" } | Select-Object -First 1).Trim()
     $plannerContext = if ($PlannerContextFile) { Read-JsonFileBestEffort -Path $PlannerContextFile } else { $null }
+    $currentRunAttemptNumber = if ($plannerContext -and $null -ne $plannerContext.attemptNumber) { [int]$plannerContext.attemptNumber } else { 0 }
+    $currentLaunchSequence = if ($plannerContext -and $null -ne $plannerContext.launchSequence) { [int]$plannerContext.launchSequence } else { 0 }
+    $retryContextState = Get-RetryContextState -RetryContextFile $RetryContextFile -ExpectedTaskId $SchedulerTaskId
     if ($plannerContext -and $plannerContext.plannerMetadata) {
         $plannerEffortClass = Get-NormalizedPlannerEffortClass -EffortClass ([string]$plannerContext.plannerMetadata.effortClass)
     } else {
@@ -2969,12 +3202,22 @@ try {
     $investigationRequired = Test-InvestigationRequired -TaskText $taskPrompt -TaskClass $taskClass
     Save-Artifact -Name "input-task.txt" -Content $taskPrompt | Out-Null
     Save-DebugText -Name "input-task.txt" -Content $taskPrompt | Out-Null
-    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired; plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile; plannerContextLoaded = [bool]$plannerContext }
+    Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt eingelesen und Task klassifiziert." -Category $taskClass -Data @{ investigationRequired = $investigationRequired; plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile; plannerContextLoaded = [bool]$plannerContext; retryContextLoaded = [bool]$retryContextState.loaded; retryLessonCount = @($retryContextState.retryLessons).Count }
     if ($PlannerContextFile -and -not $plannerContext) {
         Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context file could not be read. Falling back to default pipeline profile." -Category "PLANNER_CONTEXT_INVALID" -Data @{ plannerContextFile = $PlannerContextFile }
     } elseif ($plannerContext) {
         Add-TimelineEvent -Phase "VALIDATE" -Message "Planner context loaded for worker startup." -Category "PLANNER_CONTEXT_LOADED" -Data @{ plannerEffortClass = $plannerEffortClass; pipelineProfile = $pipelineProfile }
     }
+    if ($RetryContextFile -and -not $retryContextState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Retry context file could not be read. Continuing without retry memory." -Category "RETRY_CONTEXT_INVALID" -Data @{ retryContextFile = $RetryContextFile }
+    } elseif ($retryContextState.loaded) {
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Retry context loaded for worker startup." -Category "RETRY_CONTEXT_LOADED" -Data @{ retryLessonCount = @($retryContextState.retryLessons).Count; latestFailureCategory = [string]$retryContextState.latestFailure.finalCategory }
+    }
+    $retryContextDiscoverBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "DISCOVER" -MaxChars $CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS
+    $retryContextInvestigateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "INVESTIGATE" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    $retryContextPlanBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "FIX_PLAN" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
+    $retryContextImplementBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "IMPLEMENT" -MaxChars $CONST_RETRY_CONTEXT_IMPLEMENT_MAX_CHARS
+    $retryContextRemediateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "REMEDIATE" -MaxChars $CONST_RETRY_CONTEXT_REMEDIATE_MAX_CHARS
     Write-SchedulerSnapshot
 
     $worktreeBase = Join-Path $env:TEMP "claude-worktrees"
@@ -3060,6 +3303,7 @@ $discoverTestProjectText
 
 CONTEXT:
 $discoverContext
+$retryContextDiscoverBlock
 $discoverCritiqueBlock
 OUTPUT FORMAT:
 ROUTE: DIRECT_EDIT | BUGFIX_TESTABLE | BUGFIX_NONTESTABLE | UNCERTAIN
@@ -3135,6 +3379,8 @@ $investigationContext
 
 PRIOR FEEDBACK:
 $historyText
+
+$retryContextInvestigateBlock
 
 OUTPUT FORMAT:
 RESULT: CHANGE_NEEDED | NO_CHANGE | INCONCLUSIVE
@@ -3497,6 +3743,7 @@ $reproductionBlock
 
 CONTEXT:
 $planContext
+$retryContextPlanBlock
 $replanBlock
 RULES:
 - No TODO/FIXME/HACK/Fix:/Note:/Hinweis(DE) comments
@@ -3754,6 +4001,8 @@ $targetText
 PRIOR FEEDBACK:
 $historyText
 
+$retryContextImplementBlock
+
 $(if ($directionCheckGuardrail) { "$directionCheckGuardrail`n" } else { "" })
 
 RULES:
@@ -4003,6 +4252,8 @@ Fix only the following deterministic blockers in the current worktree.
 BLOCKERS:
 $blockerText
 
+$retryContextRemediateBlock
+
 OUTPUT FORMAT AT THE END:
 RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
 SUMMARY:
@@ -4136,6 +4387,8 @@ FIX ONLY THESE MINOR ISSUES IN THE CURRENT WORKTREE.
 
 FEEDBACK:
 $($verdict.feedback)
+
+$retryContextRemediateBlock
 "@
                     $minorRescueModel = Get-ModelForRepair -PhaseName "REVIEW_MINOR" -TaskClass $taskClass -InvestigationRequired $investigationRequired -Targets $planTargets -PreviousOutput $verdict.feedback -TaskText $taskPrompt -PipelineProfile $pipelineProfile
                     $minorRescue = Invoke-ClaudeRepair -PhaseName "IMPLEMENT" -Prompt $minorRescuePrompt -Model $minorRescueModel -Attempt (500 + $implementAttempt * 10 + $reviewCycle) -CanWrite
@@ -4160,6 +4413,8 @@ Fix only the following review feedback in the current worktree.
 
 FEEDBACK:
 $($verdict.feedback)
+
+$retryContextRemediateBlock
 
 OUTPUT FORMAT AT THE END:
 RESULT: CHANGE_APPLIED | NO_CHANGE_BLOCKED
