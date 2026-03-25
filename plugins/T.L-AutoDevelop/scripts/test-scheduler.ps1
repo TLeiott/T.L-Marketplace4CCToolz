@@ -2166,6 +2166,10 @@ Bind the existing callback path instead of introducing a parallel implementation
 function Test-InvestigationPriorArtValidationRequiresAllFields {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
         "Get-PriorArtReferenceFiles",
         "Get-InvestigationPriorArtValidation"
     ) -ScriptBlock {
@@ -2188,6 +2192,10 @@ function Test-InvestigationPriorArtValidationRequiresAllFields {
 function Test-InvestigationPriorArtValidationAcceptsFileQualifiedSearchHits {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
         "Get-PriorArtReferenceFiles",
         "Get-InvestigationPriorArtValidation"
     ) -ScriptBlock {
@@ -2209,6 +2217,10 @@ function Test-InvestigationPriorArtValidationAcceptsFileQualifiedSearchHits {
 function Test-InvestigationPriorArtValidationRejectsRawSearchCommands {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
         "Get-PriorArtReferenceFiles",
         "Get-InvestigationPriorArtValidation"
     ) -ScriptBlock {
@@ -2230,6 +2242,10 @@ function Test-InvestigationPriorArtValidationRejectsRawSearchCommands {
 function Test-PlanValidationRequiresReuseSectionWhenPriorArtRequired {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
         "Get-PriorArtReferenceFiles",
         "Get-PlanValidation"
     ) -ScriptBlock {
@@ -2261,6 +2277,10 @@ investigationRequired: false
 function Test-PlanValidationAcceptsConcreteReuseSectionWhenPriorArtRequired {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
         "Get-PriorArtReferenceFiles",
         "Get-PlanValidation"
     ) -ScriptBlock {
@@ -2300,6 +2320,10 @@ investigationRequired: false
 function Test-PlanValidationRejectsSearchPatternReferenceWhenPriorArtRequired {
     $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
         "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
         "Get-PriorArtReferenceFiles",
         "Get-PlanValidation"
     ) -ScriptBlock {
@@ -2333,6 +2357,150 @@ investigationRequired: false
     $parsed = $output | ConvertFrom-Json
     Assert-True ($parsed.valid -eq $false) "Search-pattern-only references should not satisfy plan prior-art validation."
     Assert-True ((@($parsed.issues) -join "`n") -match "reference file paths") "Plan validation should explain that concrete reference file paths are required."
+}
+
+function Test-PlanValidationAcceptsMarkdownDecoratedPaths {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Darken the divider colors.
+
+## Files
+- **Path:** `Hmd.Docs/wwwroot/css/app.css`
+- **Action:** MODIFY
+- **Changes:** Replace the existing dark-mode divider color.
+
+## Order
+1. Update the CSS file.
+2. Verify the result.
+
+## Constraints
+- Keep the change scoped to the dark-mode divider rules.
+
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- `Hmd.Docs/wwwroot/css/app.css` (lines 2533-2635, existing dark-mode override block)
+Reuse Path:
+Extend the existing dark-mode border-color overrides already defined in app.css.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $true) "Markdown-decorated file paths and inline line notes should still satisfy plan validation."
+    Assert-True ($output -match [regex]::Escape('"targets":  [')) "Markdown-decorated plan validation should still emit parsed targets."
+    Assert-True ($output -match [regex]::Escape("Hmd.Docs\\wwwroot\\css\\app.css")) "Markdown path bullets should normalize to concrete target and reference paths."
+}
+
+function Test-PriorArtReferenceFilesAcceptMarkdownWrappedEntries {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-PriorArtReferenceFiles"
+    ) -ScriptBlock {
+        (Get-PriorArtReferenceFiles -Entries @(
+            '`Hmd.Docs/Components/Editor/VorlagenBrowserDialog.razor` (lines 118-134, confirmed via Read)',
+            '**Hmd.Docs.Tests/Components/Editor/VorlagenBrowserDialogGroupingTests.cs**'
+        )) | ConvertTo-Json -Depth 12
+    }
+
+    Assert-True ($output -match [regex]::Escape("Hmd.Docs\\Components\\Editor\\VorlagenBrowserDialog.razor")) "Backticked reference entries with inline notes should normalize to concrete file paths."
+    Assert-True ($output -match [regex]::Escape("Hmd.Docs.Tests\\Components\\Editor\\VorlagenBrowserDialogGroupingTests.cs")) "Markdown emphasis around reference entries should not break path extraction."
+}
+
+function Test-ReadOnlyPhaseConfusionDetectorFlagsApprovalChatter {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion"
+    ) -ScriptBlock {
+        [pscustomobject]@{
+            waiting = (Test-ReadOnlyPhaseConfusion -Text "Waiting for permission to write to app.css.")
+            approve = (Test-ReadOnlyPhaseConfusion -Text "Please approve the file edit above to apply the CSS fix.")
+            legitPermission = (Test-ReadOnlyPhaseConfusion -Text "Restore write permission handling for exported files.")
+            clean = (Test-ReadOnlyPhaseConfusion -Text "RESULT: CHANGE_NEEDED`nTARGET_FILES:`n- app.css")
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.waiting -eq $true) "Waiting-for-permission chatter must be detected in read-only phases."
+    Assert-True ($parsed.approve -eq $true) "Approval-request chatter must be detected in read-only phases."
+    Assert-True ($parsed.legitPermission -eq $false) "Legitimate permission-domain language must not be flagged as approval chatter."
+    Assert-True ($parsed.clean -eq $false) "Structured read-only outputs without approval chatter must not be flagged."
+}
+
+function Test-SanitizeReadOnlyPhaseTextPreservesStructuredEvidence {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Sanitize-ReadOnlyPhaseText"
+    ) -ScriptBlock {
+        Sanitize-ReadOnlyPhaseText -Text @"
+Please approve the file write to apply the CSS fix.
+
+RESULT: CHANGE_NEEDED
+TARGET_FILES:
+- Hmd.Docs/wwwroot/css/app.css
+ROOT_CAUSE:
+The CSS flex layout collapses block markdown content into one row.
+"@
+    }
+
+    Assert-True ($output -notmatch '(?i)please approve') "Sanitization must remove approval chatter from read-only reused context."
+    Assert-True ($output -match [regex]::Escape("RESULT: CHANGE_NEEDED")) "Sanitization must preserve structured investigation evidence."
+    Assert-True ($output -match [regex]::Escape("Hmd.Docs/wwwroot/css/app.css")) "Sanitization must preserve concrete targets."
+}
+
+function Test-PlanValidationRejectsApprovalChatterInOtherwiseValidPlan {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Normalize-RepoRelativePath",
+        "Get-ConcretePathToken",
+        "Get-ReadOnlyPhaseConfusionPatterns",
+        "Test-ReadOnlyPhaseConfusion",
+        "Get-ReadOnlyPhaseConfusionIssue",
+        "Get-PriorArtReferenceFiles",
+        "Get-PlanValidation"
+    ) -ScriptBlock {
+        (Get-PlanValidation -PriorArtRequired $true -Plan @"
+## Goal
+Darken the divider colors.
+
+Please approve the file edit above to apply the CSS fix.
+
+## Files
+- Path: Hmd.Docs/wwwroot/css/app.css
+- Action: MODIFY
+- Changes: Replace the existing dark-mode divider color.
+
+## Order
+1. Update the CSS file.
+2. Verify the result.
+
+## Constraints
+- Keep the change scoped to the dark-mode divider rules.
+
+## Reuse / Reference Pattern
+Required: YES
+Reference Files:
+- Hmd.Docs/wwwroot/css/app.css
+Reuse Path:
+Extend the existing dark-mode border-color overrides already defined in app.css.
+
+investigationRequired: false
+"@) | ConvertTo-Json -Depth 12
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.valid -eq $false) "Approval chatter must invalidate otherwise well-formed read-only fix plans."
+    Assert-True ((@($parsed.issues) -join "`n") -match "approval or permission chatter") "Plan validation must report the read-only phase-confusion issue explicitly."
 }
 
 function Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons {
@@ -7257,6 +7425,11 @@ Test-InvestigationPriorArtValidationRejectsRawSearchCommands
 Test-PlanValidationRequiresReuseSectionWhenPriorArtRequired
 Test-PlanValidationAcceptsConcreteReuseSectionWhenPriorArtRequired
 Test-PlanValidationRejectsSearchPatternReferenceWhenPriorArtRequired
+Test-PlanValidationAcceptsMarkdownDecoratedPaths
+Test-PriorArtReferenceFilesAcceptMarkdownWrappedEntries
+Test-ReadOnlyPhaseConfusionDetectorFlagsApprovalChatter
+Test-SanitizeReadOnlyPhaseTextPreservesStructuredEvidence
+Test-PlanValidationRejectsApprovalChatterInOtherwiseValidPlan
 Test-GetRetryLessonsFromFeedbackHistoryProducesStructuredLessons
 Test-RetryContextRoundTripLoadsWorkerState
 Test-WrongTaskRetryContextFallsBackGracefully
