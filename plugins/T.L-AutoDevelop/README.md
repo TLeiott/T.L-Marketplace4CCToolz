@@ -6,6 +6,7 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 
 - `/develop [task text or path-to-task-file]`
 - `/develop-prepare`
+- `/pipe-feedback [optional: path-to-run-dir or task-id]`
 
 ## What V4 Does
 
@@ -23,6 +24,7 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 
 - `skills/develop/SKILL.md` — Main-Claude interactive orchestrator
 - `skills/develop-prepare/SKILL.md` — Explicit prepare and hygiene command
+- `skills/pipe-feedback/SKILL.md` — Post-run pipeline feedback and friction analysis
 - `agents/scheduler-agent.md` — Read-only queue planner
 - `agents/reviewer.md` — Independent code reviewer
 - `scripts/scheduler.ps1` — Durable repo-local queue engine
