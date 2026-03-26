@@ -151,6 +151,10 @@ Important:
 - Before every actual worker launch set, you must run a fresh usage probe again.
 - The real launch decision is based on the projected cost of the next launch set, not only the current usage seen here.
 
+Launch-cost constant:
+- `PIPE_USAGE_PERCENT = 8`
+- use this constant for every projected per-pipe 5h usage calculation in this command
+
 ## 7. Snapshot the Existing Queue
 
 Call:
@@ -239,7 +243,7 @@ Launch-gate procedure:
 3. Run the usage gate again in `probe` mode with `-ThresholdPercent 90`.
 4. Compute:
    - `currentUsage = fiveHourUtilization`
-   - `estimatedWaveCost = pipeCount * 5`
+   - `estimatedWaveCost = pipeCount * PIPE_USAGE_PERCENT`
    - `projectedUsage = currentUsage + estimatedWaveCost`
 5. Interpret the result:
    - fatal gate error -> stop
@@ -252,7 +256,7 @@ The question must be about the current launch set only, not about the whole sess
 Always mention:
 - current 5h utilization
 - number of pipes about to start
-- estimated wave cost (`5% * pipeCount`)
+- estimated wave cost (`PIPE_USAGE_PERCENT% * pipeCount`, currently `8% * pipeCount`)
 - projected usage after this launch set
 
 For every task id in the candidate launch set, launch a background worker:
