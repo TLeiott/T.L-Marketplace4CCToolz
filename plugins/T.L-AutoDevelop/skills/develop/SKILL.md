@@ -110,6 +110,8 @@ The prompt file must exist on disk before `register-tasks` is called.
 The scheduler now rejects registrations with a missing, empty, or unreadable `promptFile`.
 Write prompt markdown and registration JSON with explicit UTF-8 encoding.
 Do not rely on PowerShell here-strings for JSON escaping; prefer object -> `ConvertTo-Json` -> UTF-8 file writes so arbitrary Unicode task text survives intact.
+Do not inline multiline PowerShell prompt-writing logic inside bash-quoted `-Command "..."` strings. Write files with direct UTF-8 file writes instead.
+After writing each prompt file, verify it is non-empty and still contains a readable task line before calling `register-tasks`.
 
 Each task prompt file must contain:
 
