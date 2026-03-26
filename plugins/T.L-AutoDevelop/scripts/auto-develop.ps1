@@ -216,6 +216,98 @@ function Read-JsonFileBestEffort {
     }
 }
 
+function Get-TaskPromptFirstReadableLine {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+
+    $lines = @($Text -split "\r?\n" | ForEach-Object { [string]$_ })
+    $inTaskSection = $false
+    $sawTaskHeading = $false
+    foreach ($rawLine in $lines) {
+        $trimmed = $rawLine.Trim()
+        if ($trimmed -match '^\s*##\s*Task\s*$') {
+            $inTaskSection = $true
+            $sawTaskHeading = $true
+            continue
+        }
+        if ($inTaskSection -and $trimmed -match '^\s*##(?:\s|$)') {
+            break
+        }
+        if ($inTaskSection -and $trimmed) {
+            return $trimmed
+        }
+    }
+    if ($sawTaskHeading) {
+        return ""
+    }
+
+    $line = @(
+        $lines |
+            Where-Object { $_ -notmatch "^\s*$|^\s*##(?:\s|$)" } |
+            Select-Object -First 1
+    )[0]
+
+    if (-not $line) { return "" }
+    return ([string]$line).Trim()
+}
+
+function Get-TaskPromptValidationResult {
+    param([string]$PromptFile)
+
+    $result = [ordered]@{
+        isValid = $false
+        message = ""
+        promptText = ""
+        taskLine = ""
+    }
+
+    if (-not $PromptFile) {
+        $result.message = "Prompt file path is missing."
+        return [pscustomobject]$result
+    }
+    if (-not (Test-Path -LiteralPath $PromptFile)) {
+        $result.message = "Prompt file does not exist: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $item = $null
+    try {
+        $item = Get-Item -LiteralPath $PromptFile -ErrorAction Stop
+    } catch {
+        $result.message = "Prompt file could not be accessed: $PromptFile"
+        return [pscustomobject]$result
+    }
+    if ($item.PSIsContainer) {
+        $result.message = "Prompt file is not a file: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $promptText = ""
+    try {
+        $promptText = [System.IO.File]::ReadAllText([string]$item.FullName, [System.Text.Encoding]::UTF8)
+    } catch {
+        $result.message = "Prompt file is unreadable: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    if (-not $promptText -or -not $promptText.Trim()) {
+        $result.message = "Prompt file is empty: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $taskLine = Get-TaskPromptFirstReadableLine -Text $promptText
+    if (-not $taskLine) {
+        $result.message = "Prompt file has no readable task line."
+        return [pscustomobject]$result
+    }
+
+    $result.isValid = $true
+    $result.promptText = $promptText
+    $result.taskLine = $taskLine
+    return [pscustomobject]$result
+}
+
 function Get-RetryLessonComparisonText {
     param([string]$Text)
 
@@ -3739,14 +3831,24 @@ try {
         exit 1
     }
 
-    $currentPhase = "WORKTREE"
     Ensure-DebugDir | Out-Null
     $repoRoot = (Invoke-NativeCommand git @("rev-parse", "--show-toplevel")).output
     Ensure-ArtifactDir -Root $repoRoot | Out-Null
     Write-DebugManifest
+    Write-TimelineArtifact
 
-    $taskPrompt = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
-    $taskLine = ($taskPrompt -split "`n" | Where-Object { $_ -notmatch "^\s*$|^##" } | Select-Object -First 1).Trim()
+    $promptValidation = Get-TaskPromptValidationResult -PromptFile $PromptFile
+    if (-not $promptValidation.isValid) {
+        $finalStatus = "ERROR"
+        $finalCategory = "INVALID_PROMPT_FILE"
+        $finalSummary = "Prompt file validation failed before worktree setup."
+        $finalFeedback = [string]$promptValidation.message
+        Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt file validation failed." -Category "INVALID_PROMPT_FILE" -Data @{ promptFile = $PromptFile; reason = [string]$promptValidation.message }
+        throw [System.Exception]::new("TERMINAL_INVALID_PROMPT_FILE")
+    }
+
+    $taskPrompt = [string]$promptValidation.promptText
+    $taskLine = [string]$promptValidation.taskLine
     $plannerContext = if ($PlannerContextFile) { Read-JsonFileBestEffort -Path $PlannerContextFile } else { $null }
     $currentRunAttemptNumber = if ($plannerContext -and $null -ne $plannerContext.attemptNumber) { [int]$plannerContext.attemptNumber } else { 0 }
     $currentLaunchSequence = if ($plannerContext -and $null -ne $plannerContext.launchSequence) { [int]$plannerContext.launchSequence } else { 0 }
@@ -3779,6 +3881,8 @@ try {
     } elseif ($workerBriefsState.loaded) {
         Add-TimelineEvent -Phase "VALIDATE" -Message "Worker briefs loaded for worker startup." -Category "WORKER_BRIEFS_LOADED" -Data @{ briefCount = @($workerBriefsState.briefs).Count }
     }
+
+    $currentPhase = "WORKTREE"
     $retryContextDiscoverBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "DISCOVER" -MaxChars $CONST_RETRY_CONTEXT_DISCOVER_MAX_CHARS
     $retryContextInvestigateBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "INVESTIGATE" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS
     $retryContextPlanBlock = Get-RetryContextPromptSection -RetryContext $retryContextState -Mode "FIX_PLAN" -MaxChars $CONST_RETRY_CONTEXT_ANALYZE_MAX_CHARS

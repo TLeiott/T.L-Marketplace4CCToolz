@@ -309,6 +309,102 @@ function Read-JsonFileBestEffort {
     return $null
 }
 
+function Get-PromptFileFirstReadableTaskLine {
+    param([string]$Text)
+
+    if (-not $Text) { return "" }
+
+    $lines = @($Text -split "\r?\n" | ForEach-Object { [string]$_ })
+    $inTaskSection = $false
+    $sawTaskHeading = $false
+    foreach ($rawLine in $lines) {
+        $trimmed = $rawLine.Trim()
+        if ($trimmed -match '^\s*##\s*Task\s*$') {
+            $inTaskSection = $true
+            $sawTaskHeading = $true
+            continue
+        }
+        if ($inTaskSection -and $trimmed -match '^\s*##(?:\s|$)') {
+            break
+        }
+        if ($inTaskSection -and $trimmed) {
+            return $trimmed
+        }
+    }
+    if ($sawTaskHeading) {
+        return ""
+    }
+
+    $line = @(
+        $lines |
+            Where-Object { $_ -notmatch "^\s*$|^\s*##(?:\s|$)" } |
+            Select-Object -First 1
+    )[0]
+
+    if (-not $line) { return "" }
+    return ([string]$line).Trim()
+}
+
+function Get-PromptFileValidationResult {
+    param([string]$PromptFile)
+
+    $result = [ordered]@{
+        isValid = $false
+        category = "INVALID_PROMPT_FILE"
+        message = ""
+        taskLine = ""
+    }
+
+    if (-not $PromptFile) {
+        $result.message = "promptFile is missing."
+        return [pscustomobject]$result
+    }
+    if (-not (Test-Path -LiteralPath $PromptFile)) {
+        $result.message = "promptFile does not exist: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $item = $null
+    try {
+        $item = Get-Item -LiteralPath $PromptFile -ErrorAction Stop
+    } catch {
+        $result.message = "promptFile could not be accessed: $PromptFile"
+        return [pscustomobject]$result
+    }
+    if (-not $item -or -not $item.PSIsContainer -and -not $item.Exists) {
+        $result.message = "promptFile could not be accessed: $PromptFile"
+        return [pscustomobject]$result
+    }
+    if ($item.PSIsContainer) {
+        $result.message = "promptFile is not a file: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $content = ""
+    try {
+        $content = [System.IO.File]::ReadAllText([string]$item.FullName, [System.Text.Encoding]::UTF8)
+    } catch {
+        $result.message = "promptFile is unreadable: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    if (-not $content -or -not $content.Trim()) {
+        $result.message = "promptFile is empty: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $taskLine = Get-PromptFileFirstReadableTaskLine -Text $content
+    if (-not $taskLine) {
+        $result.message = "promptFile has no readable task line: $PromptFile"
+        return [pscustomobject]$result
+    }
+
+    $result.isValid = $true
+    $result.message = ""
+    $result.taskLine = $taskLine
+    return [pscustomobject]$result
+}
+
 function Read-JsonLinesFile {
     param(
         [string]$Path,
@@ -508,6 +604,7 @@ function New-LatestRunRecord {
 
 function Get-EnvironmentFailureCategories {
     return @(
+        "INVALID_PROMPT_FILE",
         "WORKTREE_ERROR",
         "WORKTREE_INVALID",
         "SOLUTION_PATH_MISSING",
@@ -2130,8 +2227,12 @@ function Get-SubmissionOrder {
 function Get-TaskFailureCategory {
     param($Task)
 
+    if (([string]$Task.latestRun.finalCategory).Trim().ToUpperInvariant() -eq "INVALID_PROMPT_FILE") {
+        return ""
+    }
     $text = (([string]$Task.latestRun.finalCategory) + " " + ([string]$Task.merge.reason) + " " + ([string]$Task.latestRun.feedback)).ToLowerInvariant()
     if (-not $text.Trim()) { return "" }
+    if ($text -match 'invalid_prompt_file|promptfile is empty|promptfile is unreadable|promptfile has no readable task line|promptfile is not a file') { return "" }
     if ($text -match 'worktree_invalid|solution_path_missing|worktree_environment_error|worker_start_failed|worker_exited_without_result') { return "environment_state" }
     if ($text -match 'nuget|restore|package') { return "restore_infra" }
     if ($text -match 'msb3021|msb3027|lock|locked|access to the path|used by another process') { return "locked_environment" }
@@ -2730,6 +2831,11 @@ function Get-TaskIntegrityWarnings {
     }
     if ([string]$Task.promptFile -and -not (Test-Path -LiteralPath ([string]$Task.promptFile))) {
         [void]$warnings.Add("promptFile path does not exist.")
+    } elseif ([string]$Task.promptFile) {
+        $promptValidation = Get-PromptFileValidationResult -PromptFile ([string]$Task.promptFile)
+        if (-not $promptValidation.isValid) {
+            [void]$warnings.Add($promptValidation.message)
+        }
     }
 
     $latestRun = $Task.latestRun
@@ -3428,6 +3534,12 @@ function Assert-TaskRecordValid {
     }
     if ([string]$Task.promptFile -and -not (Test-Path -LiteralPath ([string]$Task.promptFile))) {
         throw "$Operation rejected task '$taskId' because promptFile does not exist: $([string]$Task.promptFile)"
+    }
+    if ([string]$Task.promptFile) {
+        $promptValidation = Get-PromptFileValidationResult -PromptFile ([string]$Task.promptFile)
+        if (-not $promptValidation.isValid) {
+            throw "$Operation rejected task '$taskId' because $([string]$promptValidation.message)"
+        }
     }
 }
 
@@ -4548,6 +4660,7 @@ function Run-Task {
     $artifactPointers = $null
     $workerOutputFile = ""
     $workerErrorFile = ""
+    $taskName = ""
 
     $lock = Acquire-Lock -LockFile $context.paths.lockFile
     try {
@@ -4563,6 +4676,44 @@ function Run-Task {
         if ((Get-StartableTaskIds -State $state) -notcontains $TaskId) {
             throw "Task '$TaskId' is not startable in the current wave."
         }
+
+        $promptValidation = Get-PromptFileValidationResult -PromptFile ([string]$task.promptFile)
+        if (-not $promptValidation.isValid) {
+            $task.latestRun = New-LatestRunRecord `
+                -AttemptNumber ([int]$task.attemptsUsed) `
+                -LaunchSequence ([int]$task.workerLaunchSequence) `
+                -TaskName "" `
+                -ResultFile ([string]$task.resultFile) `
+                -ProcessId 0 `
+                -StartedAt ((Get-Date).ToString("o")) `
+                -CompletedAt ((Get-Date).ToString("o"))
+            Apply-PipelineResultToTask -Task $task -PipelineResult ([pscustomobject]@{
+                status = "ERROR"
+                finalCategory = "INVALID_PROMPT_FILE"
+                summary = "Prompt file validation failed before worker launch."
+                feedback = [string]$promptValidation.message
+                phase = "VALIDATE"
+                files = @()
+                branch = ""
+                artifacts = $null
+            }) -State $state -RepoRoot $context.repoRoot
+            Write-TaskResultFile -Task $task
+            $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile
+            Save-State -StateFile $context.paths.stateFile -State $state
+            Append-StateEvent -EventsFile $context.paths.eventsFile -TaskId $task.taskId -Kind "completed" -Message "Task was not launched because its prompt file is invalid." -Data @{
+                attempt = [int]$task.attemptsUsed
+                finalStatus = [string]$task.latestRun.finalStatus
+                finalCategory = [string]$task.latestRun.finalCategory
+                state = [string]$task.state
+            }
+
+            return [pscustomobject]@{
+                started = $false
+                task = ConvertTo-TaskSnapshot -Task $task -RepoRoot $context.repoRoot
+                snapshot = Get-SnapshotPayload -State $state -EventsFile $context.paths.eventsFile
+            }
+        }
+
         Assert-TaskRecordValid -Task $task -Operation "run-task"
 
         $task.state = "running"
@@ -4587,6 +4738,7 @@ function Run-Task {
         $briefsFileForLaunch = if ($briefsPayload) { $briefsFilePath } else { "" }
         $taskName = Get-AttemptTaskName -TaskId $TaskId -SourceCommand $task.sourceCommand -LaunchSequence $launchSequence
         $runDir = Join-Path (Join-Path $context.repoRoot ".claude-develop-logs\runs") $taskName
+        Ensure-Directory -Path $runDir
         $artifactPointers = [pscustomobject]@{
             runDir = $runDir
             schedulerSnapshotPath = Join-Path $runDir "scheduler-snapshot.json"
@@ -4617,6 +4769,7 @@ function Run-Task {
             workerStdout = ""
             workerStderr = ""
         }
+        [System.IO.File]::WriteAllText($artifactPointers.timelinePath, "[]", [System.Text.Encoding]::UTF8)
         Write-PlannerContextFile -Path $plannerContextPath -Task $task
         Write-TaskResultFile -Task $task
         $null = Update-CircuitBreakerState -State $state -EventsFile $context.paths.eventsFile

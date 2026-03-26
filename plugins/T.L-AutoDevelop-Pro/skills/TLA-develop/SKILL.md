@@ -103,6 +103,10 @@ For each new task create:
 
 The prompt file must exist on disk before `register-tasks` is called.
 The scheduler now rejects registrations with a missing, empty, or unreadable `promptFile`.
+Write prompt markdown and registration JSON with explicit UTF-8 encoding.
+Do not rely on PowerShell here-strings for JSON escaping; prefer object -> `ConvertTo-Json` -> UTF-8 file writes so arbitrary Unicode task text survives intact.
+Do not inline multiline PowerShell prompt-writing logic inside bash-quoted `-Command "..."` strings. Write files with direct UTF-8 file writes instead.
+After writing each prompt file, verify it is non-empty and still contains a readable task line before calling `register-tasks`.
 
 Each task prompt file must contain:
 
@@ -132,6 +136,10 @@ Important:
 - Before every actual worker launch set, you must run a fresh usage probe again.
 - The real launch decision is based on the projected cost of the next launch set, not only the current usage seen here.
 
+Launch-cost constant:
+- `PIPE_USAGE_PERCENT = 8`
+- use this constant for every projected per-pipe 5h usage calculation in this command
+
 Autonomous wait rules:
 - If a later launch-gate probe is blocked and `fiveHourResetAt` is available, call the usage gate in `wait` mode with the same threshold and let it wait until the gate opens.
 - If a later launch-gate probe is unavailable, sleep for 1 hour, then run `probe` again.
@@ -148,7 +156,7 @@ User-facing reporting:
 - when it resumes, report how long it waited and the final utilization that allowed launch
 - when a launch set is blocked by projected cost, also report:
   - number of pipes about to start
-  - estimated wave cost (`5% * pipeCount`)
+  - estimated wave cost (`PIPE_USAGE_PERCENT% * pipeCount`, currently `8% * pipeCount`)
   - projected usage after this launch set
 
 ## 7. Snapshot, Register, and Replan the Whole Queue
@@ -199,7 +207,7 @@ Launch-gate procedure:
    - if the probe is still unavailable, stop and report that the autonomous gate state could not be determined
 6. Let `currentUsage = fiveHourUtilization` from the fresh available probe result.
 7. Compute the largest ordered prefix of `candidateTaskIds` that fits under the projected threshold using:
-   - `estimatedWaveCost = pipeCount * 5`
+   - `estimatedWaveCost = pipeCount * PIPE_USAGE_PERCENT`
    - `projectedUsage = currentUsage + estimatedWaveCost`
    - only prefixes with `projectedUsage < 90` fit
 8. Interpret the fitting result:

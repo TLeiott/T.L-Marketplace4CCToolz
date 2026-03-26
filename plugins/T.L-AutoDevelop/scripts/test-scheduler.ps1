@@ -3584,6 +3584,121 @@ function Test-RegistrationRejectsMissingPromptFile {
     }
 }
 
+function Test-RegistrationRejectsEmptyPromptFile {
+    $repo = New-TestRepo
+    try {
+        $promptFile = Join-Path $repo.root "empty-task-prompt.md"
+        [System.IO.File]::WriteAllText($promptFile, "", [System.Text.Encoding]::UTF8)
+        $tasksFile = Join-Path $repo.root "tasks-empty-prompt.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            @{
+                taskId = "task-empty-prompt"
+                taskText = "A"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                solutionPath = $repo.solution
+                promptFile = $promptFile
+                resultFile = (Join-Path $repo.resultsDir "task-empty-prompt.json")
+            }
+        ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $stdout = Join-Path $repo.root "register-empty-prompt.stdout.txt"
+        $stderr = Join-Path $repo.root "register-empty-prompt.stderr.txt"
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "register-tasks",
+            "-SolutionPath", $repo.solution,
+            "-TasksFile", $tasksFile
+        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $combined = ""
+        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
+        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+
+        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile is empty."
+        Assert-True ($combined -match "promptFile is empty") "register-tasks should explain the empty promptFile."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RegistrationRejectsPromptDirectoryPath {
+    $repo = New-TestRepo
+    try {
+        $tasksFile = Join-Path $repo.root "tasks-directory-prompt.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            @{
+                taskId = "task-directory-prompt"
+                taskText = "A"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                solutionPath = $repo.solution
+                promptFile = $repo.root
+                resultFile = (Join-Path $repo.resultsDir "task-directory-prompt.json")
+            }
+        ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $stdout = Join-Path $repo.root "register-directory-prompt.stdout.txt"
+        $stderr = Join-Path $repo.root "register-directory-prompt.stderr.txt"
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "register-tasks",
+            "-SolutionPath", $repo.solution,
+            "-TasksFile", $tasksFile
+        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $combined = ""
+        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
+        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+
+        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile points to a directory."
+        Assert-True ($combined -match "promptFile is not a file") "register-tasks should explain that promptFile must be a file."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RegistrationRejectsPromptWithoutReadableTaskLine {
+    $repo = New-TestRepo
+    try {
+        $promptFile = Join-Path $repo.root "heading-only-task-prompt.md"
+        [System.IO.File]::WriteAllText($promptFile, "## Task`n`n## Solution`n$($repo.solution)", [System.Text.Encoding]::UTF8)
+        $tasksFile = Join-Path $repo.root "tasks-heading-only-prompt.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            @{
+                taskId = "task-heading-only-prompt"
+                taskText = "A"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                solutionPath = $repo.solution
+                promptFile = $promptFile
+                resultFile = (Join-Path $repo.resultsDir "task-heading-only-prompt.json")
+            }
+        ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $stdout = Join-Path $repo.root "register-heading-only-prompt.stdout.txt"
+        $stderr = Join-Path $repo.root "register-heading-only-prompt.stderr.txt"
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "register-tasks",
+            "-SolutionPath", $repo.solution,
+            "-TasksFile", $tasksFile
+        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $combined = ""
+        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
+        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+
+        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile has no readable task line."
+        Assert-True ($combined -match "promptFile has no readable task line") "register-tasks should explain the malformed prompt content."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-CollidingTaskIdPrefixesGenerateUniqueTaskNames {
     $firstName = Invoke-SchedulerHelperFunctions -FunctionNames @("Get-TaskPrefix", "Get-ShortTaskLabel", "Get-TaskIdentityToken", "Get-AttemptTaskName") -ScriptBlock {
         Get-AttemptTaskName -TaskId "tla-20260318-151706-t01" -SourceCommand "TLA-develop" -LaunchSequence 1
@@ -3640,6 +3755,192 @@ function Test-SnapshotSurfacesMissingPromptFileIntegrityError {
         $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-bad-prompt" })[0]
         Assert-True (@($task.integrityWarnings).Count -gt 0) "Task snapshots should expose prompt integrity warnings."
         Assert-True (@($task.integrityWarnings) -contains "promptFile is missing for a runnable task.") "Integrity warning should explain the missing prompt file."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RunTaskInvalidPromptBecomesEnvironmentRetryWithoutBreaker {
+    $repo = New-TestRepo
+    try {
+        $promptFile = Join-Path $repo.root "invalid-run-prompt.md"
+        [System.IO.File]::WriteAllText($promptFile, "## Task`n`n## Solution`n$($repo.solution)", [System.Text.Encoding]::UTF8)
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = [pscustomobject]@{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-invalid-run-prompt"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "bad prompt"
+                    solutionPath = $repo.solution
+                    promptFile = $promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-invalid-run-prompt.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "invalid-run-launch-result.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $result = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "run-task" -TaskId "task-invalid-run-prompt"
+        $task = @($result.snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-invalid-run-prompt" })[0]
+        Assert-True ($result.started -eq $false) "run-task should not start a worker when prompt validation fails."
+        Assert-True ([string]$task.state -eq "environment_retry_scheduled") "Invalid prompt files should route through environment retry scheduling."
+        Assert-True ([string]$task.finalCategory -eq "INVALID_PROMPT_FILE") "Invalid prompt files should record INVALID_PROMPT_FILE."
+        Assert-True ([string]$task.lastEnvironmentFailureCategory -eq "INVALID_PROMPT_FILE") "Invalid prompt files should preserve the environment failure category."
+        Assert-True ([int]$task.attemptsUsed -eq 0) "Invalid prompt prelaunch failures should not consume a worker attempt."
+        Assert-True ([int]$task.environmentRepairAttemptsUsed -eq 1) "Invalid prompt prelaunch failures should consume one environment repair attempt."
+        Assert-True ([string]$result.snapshot.circuitBreaker.status -eq "closed") "Invalid prompt failures should not open the circuit breaker."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-InvalidPromptFailuresDoNotOpenCircuitBreaker {
+    $repo = New-TestRepo
+    try {
+        $tasks = foreach ($i in 1..3) {
+            [pscustomobject]@{
+                taskId = "invalid-prompt-$i"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                taskText = "invalid prompt $i"
+                solutionPath = $repo.solution
+                promptFile = $repo.promptFile
+                planFile = ""
+                resultFile = (Join-Path $repo.resultsDir "invalid-prompt-$i.json")
+                allowNuget = $false
+                submissionOrder = $i
+                waveNumber = 1
+                blockedBy = @()
+                maxAttempts = 3
+                attemptsUsed = 0
+                attemptsRemaining = 3
+                workerLaunchSequence = 1
+                retryScheduled = $true
+                waitingUserTest = $false
+                mergeState = ""
+                state = "retry_scheduled"
+                plannerMetadata = [pscustomobject]@{}
+                latestRun = [pscustomobject]@{
+                    attemptNumber = 0
+                    launchSequence = 0
+                    taskName = ""
+                    resultFile = (Join-Path $repo.tasksDir "invalid-prompt-$i-result.json")
+                    processId = 0
+                    startedAt = ""
+                    completedAt = (Get-Date).AddMinutes(-1).ToString("o")
+                    finalStatus = "ERROR"
+                    finalCategory = "INVALID_PROMPT_FILE"
+                    summary = "prompt invalid"
+                    feedback = "promptFile has no readable task line."
+                    noChangeReason = ""
+                    investigationConclusion = ""
+                    reproductionConfirmed = $false
+                    actualFiles = @()
+                    branchName = ""
+                    artifacts = $null
+                    runDir = ""
+                    schedulerSnapshotPath = ""
+                    timelinePath = ""
+                    workerStdoutPath = ""
+                    workerStderrPath = ""
+                }
+                runs = @()
+                merge = (New-TestMergeRecord)
+            }
+        }
+
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = [pscustomobject]@{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @($tasks)
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.circuitBreaker.status -eq "closed") "Correlated INVALID_PROMPT_FILE failures must not open the breaker."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopInvalidPromptWritesStructuredErrorAndTimeline {
+    $repo = New-TestRepo
+    try {
+        $promptFile = Join-Path $repo.root "worker-invalid-prompt.md"
+        [System.IO.File]::WriteAllText($promptFile, "## Task`n`n## Solution`n$($repo.solution)", [System.Text.Encoding]::UTF8)
+        $resultFile = Join-Path $repo.root "worker-invalid-prompt-result.json"
+        $stdout = Join-Path $repo.root "worker-invalid-prompt.stdout.txt"
+        $stderr = Join-Path $repo.root "worker-invalid-prompt.stderr.txt"
+        $autoDevelopPath = Join-Path $PSScriptRoot "auto-develop.ps1"
+
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $autoDevelopPath,
+            "-PromptFile", $promptFile,
+            "-SolutionPath", $repo.solution,
+            "-ResultFile", $resultFile,
+            "-TaskName", "invalid-prompt-worker"
+        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+        Assert-True ($process.ExitCode -ne 0) "auto-develop should fail fast on an invalid prompt file."
+        $result = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+        Assert-True ([string]$result.finalCategory -eq "INVALID_PROMPT_FILE") "auto-develop should emit INVALID_PROMPT_FILE."
+        Assert-True ([string]$result.phase -eq "VALIDATE") "Invalid prompt failures should report the VALIDATE phase."
+        $timelinePath = [string]$result.artifacts.timeline
+        Assert-True (-not [string]::IsNullOrWhiteSpace($timelinePath)) "Invalid prompt failures should still publish a timeline artifact path."
+        Assert-True (Test-Path -LiteralPath $timelinePath) "Invalid prompt failures should create the timeline artifact."
+        $timelineRaw = Get-Content -LiteralPath $timelinePath -Raw
+        Assert-True (-not [string]::IsNullOrWhiteSpace($timelineRaw)) "Timeline artifact must not be empty for invalid prompt failures."
+        $timeline = $timelineRaw | ConvertFrom-Json
+        Assert-True (@($timeline).Count -ge 1) "Timeline artifact should record the invalid prompt validation event."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -7737,6 +8038,9 @@ Test-ImplementationScopeCheckWildcardStillDetectsOutOfScopeFiles
 Test-ImplementationScopeCheckReportsUnmatchedWildcardTargets
 Test-ImplementationScopeCheckSupportsMixedExactAndWildcardTargets
 Test-RegistrationRejectsMissingPromptFile
+Test-RegistrationRejectsEmptyPromptFile
+Test-RegistrationRejectsPromptDirectoryPath
+Test-RegistrationRejectsPromptWithoutReadableTaskLine
 Test-SnapshotSurfacesMissingPromptFileIntegrityError
 Test-SnapshotCompactViewExcludesRunHistory
 Test-BlockedByNormalization
@@ -7801,5 +8105,8 @@ Test-WaitQueueWakesOnMergeReady
 Test-WaitQueueWakesOnBreakerOpen
 Test-WaitQueueTimesOutWithoutChanges
 Test-WaitQueueReconcilesWorkerExitWithoutResult
+Test-RunTaskInvalidPromptBecomesEnvironmentRetryWithoutBreaker
+Test-InvalidPromptFailuresDoNotOpenCircuitBreaker
+Test-AutoDevelopInvalidPromptWritesStructuredErrorAndTimeline
 
 Write-Host "Scheduler regression checks passed."
