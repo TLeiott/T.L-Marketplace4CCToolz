@@ -1953,6 +1953,45 @@ function Test-ReadOnlyPhaseConfusionCategory {
     return $value -in @("FIX_PLAN_PHASE_CONFUSION", "INVESTIGATION_PHASE_CONFUSION")
 }
 
+function Get-RetryDirective {
+    param(
+        $SelectedRuns,
+        $LatestRun
+    )
+
+    $feedbackText = (([string]$LatestRun.feedback) + " " + ([string]$LatestRun.summary)).ToLowerInvariant()
+
+    # CS0101 / duplicate type definition - worker created a type that already exists
+    if ($feedbackText -match 'cs0101|duplicate.*definition|type.*already.*defines|already contains a definition') {
+        return "CRITICAL: Your prior attempt created a class or type that already exists in the project namespace. Do NOT add a new class file. Instead, find and modify the existing class. Search the codebase for the type name before creating anything new."
+    }
+
+    # CS0111 / duplicate method
+    if ($feedbackText -match 'cs0111|already defines a member.*with the same') {
+        return "CRITICAL: Your prior attempt added a method that already exists. Do NOT add a duplicate method. Find and modify the existing method instead."
+    }
+
+    # Repeated NO_CHANGE_UNCERTAIN - worker keeps producing no changes
+    $noChangeCount = @($SelectedRuns | Where-Object { [string]$_.finalCategory -eq "NO_CHANGE_UNCERTAIN" }).Count
+    if ($noChangeCount -ge 2) {
+        return "CRITICAL: Your prior $noChangeCount attempts produced no file changes. You MUST make at least one file change this time. If the issue appears already fixed, add an explicit test or code comment confirming it. Do not produce another no-change result."
+    }
+
+    # Repeated INVESTIGATION_INCONCLUSIVE
+    $inconclusiveCount = @($SelectedRuns | Where-Object { [string]$_.finalCategory -eq "INVESTIGATION_INCONCLUSIVE" }).Count
+    if ($inconclusiveCount -ge 2) {
+        return "CRITICAL: Prior $inconclusiveCount attempts were inconclusive. Try a different investigation strategy: search for the symptom in different files, check configuration, or examine recent git history for related changes. Do not repeat the same investigation approach."
+    }
+
+    # Repeated PREFLIGHT_FAILED with build errors
+    $preflightCount = @($SelectedRuns | Where-Object { [string]$_.finalCategory -eq "PREFLIGHT_FAILED" }).Count
+    if ($preflightCount -ge 2) {
+        return "CRITICAL: Prior $preflightCount attempts failed preflight (build/test). Review the exact compiler errors carefully. If you introduced new files or classes, verify they don't conflict with existing ones. Build the solution locally before finalizing changes."
+    }
+
+    return $null
+}
+
 function Get-RetryContextPayload {
     param(
         $Task,
@@ -2025,7 +2064,10 @@ function Get-RetryContextPayload {
     $hasSignal = $compiledLessons.Count -gt 0 -or $priorChangedFiles.Count -gt 0 -or $latestFailureSummary -or $latestFailureFeedback -or $latestInvestigationConclusion -or $latestValidationIssues.Count -gt 0
     if (-not $hasSignal) { return $null }
 
-    return [ordered]@{
+    # Build error-class-specific retry directive
+    $retryDirective = Get-RetryDirective -SelectedRuns $selectedRuns -LatestRun $latestRun
+
+    $result = [ordered]@{
         version = 1
         taskId = [string]$Task.taskId
         attemptNumber = $AttemptNumber
@@ -2042,6 +2084,18 @@ function Get-RetryContextPayload {
         priorChangedFiles = @($priorChangedFiles)
         retryLessons = @($compiledLessons)
     }
+    if ($retryDirective) {
+        $result.retryDirective = $retryDirective
+        # Also surface directive via latestFailure.feedback so existing workers see it
+        # (workers only read known fields; retryDirective alone would be silently dropped)
+        $directiveBlock = "`n`n[RETRY DIRECTIVE]`n$retryDirective"
+        if ($result.latestFailure.feedback) {
+            $result.latestFailure.feedback += $directiveBlock
+        } else {
+            $result.latestFailure.feedback = $directiveBlock.TrimStart()
+        }
+    }
+    return $result
 }
 
 function Write-RetryContextFile {
@@ -2277,7 +2331,7 @@ function Get-RecentFailureCandidates {
                 $completedAt = Get-TaskCompletionTimestamp -Task $_
                 if ($null -eq $completedAt -or $completedAt -lt $cutoff) { return }
                 $category = Get-TaskFailureCategory -Task $_
-                if (-not $category -or $category -eq "review_denied") { return }
+                if (-not $category -or $category -in @("review_denied", "environment_state", "locked_environment")) { return }
                 [pscustomobject]@{
                     taskId = [string]$_.taskId
                     waveNumber = [int]$_.waveNumber
@@ -3017,6 +3071,37 @@ function Restore-RetryWavePlacement {
     return (-not $hasDependencySignal -or $Task.blockedBy.Count -gt 0)
 }
 
+function Clear-TerminalTaskFromBlockedBy {
+    param(
+        [string]$TaskId,
+        $State
+    )
+    if (-not $State -or -not $TaskId) { return }
+    foreach ($otherTask in @(Get-Tasks -State $State)) {
+        if ([string]$otherTask.taskId -eq $TaskId) { continue }
+        if (Is-TerminalState -State $otherTask.state) { continue }
+        $dependencyChanged = $false
+        $currentBlockedBy = @($otherTask.blockedBy)
+        if ($currentBlockedBy -contains $TaskId) {
+            $newBlockedBy = @($currentBlockedBy | Where-Object { [string]$_ -ne $TaskId })
+            Set-ObjectProperty -Object $otherTask -Name "blockedBy" -Value ([object[]]$newBlockedBy)
+            $dependencyChanged = $true
+        }
+        # Keep planned dependencies consistent so admin auto-restore does not
+        # reintroduce a cleared dependency on a terminal task.
+        $plannedBlockedBy = @($otherTask.lastPlannedBlockedBy)
+        if ($plannedBlockedBy -contains $TaskId) {
+            $newPlannedBlockedBy = @($plannedBlockedBy | Where-Object { [string]$_ -ne $TaskId })
+            Set-ObjectProperty -Object $otherTask -Name "lastPlannedBlockedBy" -Value ([object[]]$newPlannedBlockedBy)
+            $dependencyChanged = $true
+        }
+        if ($dependencyChanged) {
+            Set-ObjectProperty -Object $otherTask -Name "lastPlanSignature" -Value ""
+            Write-TaskResultFile -Task $otherTask
+        }
+    }
+}
+
 function Get-RetryableResult {
     param(
         $Task,
@@ -3045,6 +3130,7 @@ function Get-RetryableResult {
         $Task.merge.state = "failed_terminal"
         $Task.merge.reason = $Reason
         $Task.manualDebugReason = ""
+        Clear-TerminalTaskFromBlockedBy -TaskId ([string]$Task.taskId) -State $State
     }
     $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
 }
@@ -3052,7 +3138,8 @@ function Get-RetryableResult {
 function Get-ManualDebugResult {
     param(
         $Task,
-        [string]$Reason
+        [string]$Reason,
+        $State = $null
     )
 
     $Task.state = "manual_debug_needed"
@@ -3066,6 +3153,7 @@ function Get-ManualDebugResult {
     $Task.merge.branchName = ""
     $Task.manualDebugReason = if ($Reason) { [string]$Reason } else { "Repeated inconclusive investigation produced no new evidence." }
     $Task.attemptsRemaining = [Math]::Max(0, [int]$Task.maxAttempts - [int]$Task.attemptsUsed)
+    Clear-TerminalTaskFromBlockedBy -TaskId ([string]$Task.taskId) -State $State
 }
 
 function Get-EnvironmentRetryableResult {
@@ -3359,7 +3447,28 @@ function Apply-PipelineResultToTask {
         completedAt = $Task.latestRun.completedAt
         artifacts = $Task.latestRun.artifacts
     }
-    $Task.runs = @($Task.runs) + @($runRecord)
+    # Upsert guard: when launchSequence > 0, replace first matching run and skip subsequent duplicates
+    if ([int]$runRecord.launchSequence -gt 0) {
+        $updatedRuns = @()
+        $replaced = $false
+        foreach ($existingRun in @($Task.runs)) {
+            if ([int]$existingRun.launchSequence -eq [int]$runRecord.launchSequence) {
+                if (-not $replaced) {
+                    $updatedRuns += $runRecord
+                    $replaced = $true
+                }
+                # Skip subsequent duplicates with the same launchSequence
+            } else {
+                $updatedRuns += $existingRun
+            }
+        }
+        if (-not $replaced) {
+            $updatedRuns += $runRecord
+        }
+        $Task.runs = $updatedRuns
+    } else {
+        $Task.runs = @($Task.runs) + @($runRecord)
+    }
     if ($RepoRoot) {
         Set-ObjectProperty -Object $Task -Name "plannerFeedback" -Value (Evaluate-PlannerPrediction -RepoRoot $RepoRoot -Task $Task)
     }
@@ -3402,7 +3511,7 @@ function Apply-PipelineResultToTask {
                 $currentRun = @($Task.runs)[-1]
                 $previousRun = @($Task.runs)[-2]
                 if ([string]$previousRun.finalCategory -eq "INVESTIGATION_INCONCLUSIVE" -and -not (Test-InvestigationRetryHasNewEvidence -PreviousRun $previousRun -CurrentRun $currentRun)) {
-                    Get-ManualDebugResult -Task $Task -Reason (Get-ManualDebugReason -Task $Task)
+                    Get-ManualDebugResult -Task $Task -Reason (Get-ManualDebugReason -Task $Task) -State $State
                     break
                 }
             }
@@ -4529,10 +4638,21 @@ function Register-Tasks {
         $submissionOrder = Get-SubmissionOrder -State $state
         $registered = [System.Collections.ArrayList]::new()
 
+        # Pre-compute max active wave for auto-assignment of newly registered tasks
+        $maxActiveWave = @((Get-Tasks -State $state) | Where-Object { -not (Is-TerminalState -State $_.state) -and [int]$_.waveNumber -gt 0 } | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Maximum).Maximum
+        if (-not $maxActiveWave) { $maxActiveWave = 0 }
+
         foreach ($inputTask in $registrationTasks) {
             $task = New-TaskRecord -RepoRoot $context.repoRoot -DefaultSolutionPath $ResolvedSolutionPath -InputTask $inputTask -SubmissionOrder $submissionOrder
             Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
             Assert-TaskRecordValid -Task $task -Operation "register-tasks"
+            # Auto-assign wave when registering into a queue with active waves,
+            # but only if the registration payload did not explicitly specify waveNumber.
+            $waveNumberProvided = $inputTask.PSObject.Properties.Name -contains 'waveNumber'
+            if (-not $waveNumberProvided -and [int]$task.waveNumber -eq 0 -and $maxActiveWave -gt 0) {
+                $task.waveNumber = $maxActiveWave + 1
+                $task.lastPlannedWaveNumber = $task.waveNumber
+            }
             Update-TaskUsageEstimate -State $state -Task $task
             if (Get-TaskById -State $state -TaskId $task.taskId) {
                 throw "Task id '$($task.taskId)' is already registered."
@@ -4572,13 +4692,26 @@ function Apply-Plan {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
         $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
 
+        # Precompute fallback wave for assignments that omit waveNumber
+        $fallbackWaveBase = @((Get-Tasks -State $state) | Where-Object { -not (Is-TerminalState -State $_.state) -and [int]$_.waveNumber -gt 0 } | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Maximum).Maximum
+        $fallbackWave = if ($fallbackWaveBase -gt 0) { $fallbackWaveBase + 1 } else { 1 }
+
         foreach ($assignment in $assignments) {
             if (-not $assignment.taskId) { continue }
             $task = Get-TaskById -State $state -TaskId ([string]$assignment.taskId)
             if (-not $task) { continue }
             if (Is-TerminalState -State $task.state) { continue }
 
-            if ($assignment.waveNumber) { $task.waveNumber = [int]$assignment.waveNumber }
+            # Distinguish between omitted waveNumber and an explicit value (including 0)
+            $hasWaveNumber = $assignment.PSObject.Properties.Name -contains 'waveNumber'
+            $parsedWave = $assignment.waveNumber -as [int]
+            if ($hasWaveNumber -and $null -ne $parsedWave) {
+                # Planner explicitly provided a valid waveNumber (including 0 to keep paused)
+                $task.waveNumber = $parsedWave
+            } elseif ([int]$task.waveNumber -eq 0) {
+                # Auto-assign to precomputed fallback wave when planner omits or sends null/invalid
+                $task.waveNumber = $fallbackWave
+            }
             Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $assignment.blockedBy))
             Set-ObjectProperty -Object $task -Name "lastPlannedWaveNumber" -Value ([int]$task.waveNumber)
             Set-ObjectProperty -Object $task -Name "lastPlannedBlockedBy" -Value ([object[]](Normalize-StringArray -Value $task.blockedBy))
@@ -5203,6 +5336,17 @@ function Admin-Edit-Task {
             if ($null -ne $updates.latestRun.actualFiles) {
                 Set-ObjectProperty -Object $task.latestRun -Name "actualFiles" -Value ([object[]](Normalize-StringArray -Value $updates.latestRun.actualFiles))
             }
+        }
+
+        # Auto-restore waveNumber from lastPlannedWaveNumber when resetting to queued state
+        # Only restore if the admin didn't explicitly set waveNumber in the update payload
+        if ([string]$task.state -in @("queued", "retry_scheduled") -and [int]$task.waveNumber -eq 0 -and [int]$task.lastPlannedWaveNumber -gt 0 -and $null -eq $updates.waveNumber) {
+            $task.waveNumber = [int]$task.lastPlannedWaveNumber
+        }
+        # Auto-restore blockedBy from lastPlannedBlockedBy when resetting to queued state
+        # Only restore if the admin didn't explicitly set blockedBy in the update payload
+        if ([string]$task.state -in @("queued", "retry_scheduled") -and @($task.blockedBy).Count -eq 0 -and @($task.lastPlannedBlockedBy).Count -gt 0 -and $null -eq $updates.blockedBy) {
+            Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]]@($task.lastPlannedBlockedBy))
         }
 
         Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
