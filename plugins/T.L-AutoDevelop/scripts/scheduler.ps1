@@ -1985,7 +1985,7 @@ function Get-RetryDirective {
     }
 
     # Repeated PREFLIGHT_FAILED with build errors
-    $preflightCount = @($SelectedRuns | Where-Object { [string]$_.finalStatus -eq "PREFLIGHT_FAILED" }).Count
+    $preflightCount = @($SelectedRuns | Where-Object { [string]$_.finalCategory -eq "PREFLIGHT_FAILED" }).Count
     if ($preflightCount -ge 2) {
         return "CRITICAL: Prior $preflightCount attempts failed preflight (build/test). Review the exact compiler errors carefully. If you introduced new files or classes, verify they don't conflict with existing ones. Build the solution locally before finalizing changes."
     }
@@ -3073,10 +3073,23 @@ function Clear-TerminalTaskFromBlockedBy {
     foreach ($otherTask in @(Get-Tasks -State $State)) {
         if ([string]$otherTask.taskId -eq $TaskId) { continue }
         if (Is-TerminalState -State $otherTask.state) { continue }
+        $dependencyChanged = $false
         $currentBlockedBy = @($otherTask.blockedBy)
         if ($currentBlockedBy -contains $TaskId) {
             $newBlockedBy = @($currentBlockedBy | Where-Object { [string]$_ -ne $TaskId })
             Set-ObjectProperty -Object $otherTask -Name "blockedBy" -Value ([object[]]$newBlockedBy)
+            $dependencyChanged = $true
+        }
+        # Keep planned dependencies consistent so admin auto-restore does not
+        # reintroduce a cleared dependency on a terminal task.
+        $plannedBlockedBy = @($otherTask.lastPlannedBlockedBy)
+        if ($plannedBlockedBy -contains $TaskId) {
+            $newPlannedBlockedBy = @($plannedBlockedBy | Where-Object { [string]$_ -ne $TaskId })
+            Set-ObjectProperty -Object $otherTask -Name "lastPlannedBlockedBy" -Value ([object[]]$newPlannedBlockedBy)
+            $dependencyChanged = $true
+        }
+        if ($dependencyChanged) {
+            Set-ObjectProperty -Object $otherTask -Name "lastPlanSignature" -Value ""
         }
     }
 }
@@ -3426,9 +3439,13 @@ function Apply-PipelineResultToTask {
         completedAt = $Task.latestRun.completedAt
         artifacts = $Task.latestRun.artifacts
     }
-    # Dedup guard: skip if a run with the same launchSequence already exists
-    $existingLaunchSequences = @($Task.runs | ForEach-Object { [int]$_.launchSequence })
-    if ([int]$runRecord.launchSequence -notin $existingLaunchSequences) {
+    # Dedup guard: only apply when launchSequence > 0 to avoid dropping runs at sequence 0
+    if ([int]$runRecord.launchSequence -gt 0) {
+        $existingLaunchSequences = @($Task.runs | ForEach-Object { [int]$_.launchSequence })
+        if ([int]$runRecord.launchSequence -notin $existingLaunchSequences) {
+            $Task.runs = @($Task.runs) + @($runRecord)
+        }
+    } else {
         $Task.runs = @($Task.runs) + @($runRecord)
     }
     if ($RepoRoot) {
@@ -4652,6 +4669,10 @@ function Apply-Plan {
         $state = Load-State -StateFile $context.paths.stateFile -RepoRoot $context.repoRoot
         $null = Reconcile-State -State $state -EventsFile $context.paths.eventsFile
 
+        # Precompute fallback wave for assignments that omit waveNumber
+        $fallbackWaveBase = @((Get-Tasks -State $state) | Where-Object { -not (Is-TerminalState -State $_.state) -and [int]$_.waveNumber -gt 0 } | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Maximum).Maximum
+        $fallbackWave = if ($fallbackWaveBase -gt 0) { $fallbackWaveBase + 1 } else { 1 }
+
         foreach ($assignment in $assignments) {
             if (-not $assignment.taskId) { continue }
             $task = Get-TaskById -State $state -TaskId ([string]$assignment.taskId)
@@ -4661,9 +4682,8 @@ function Apply-Plan {
             if ($null -ne $assignment.waveNumber -and [int]$assignment.waveNumber -gt 0) {
                 $task.waveNumber = [int]$assignment.waveNumber
             } elseif ([int]$task.waveNumber -eq 0) {
-                # Auto-assign to next available wave when planner omits waveNumber
-                $maxWave = @((Get-Tasks -State $state) | Where-Object { -not (Is-TerminalState -State $_.state) -and [int]$_.waveNumber -gt 0 } | ForEach-Object { [int]$_.waveNumber } | Measure-Object -Maximum).Maximum
-                if ($maxWave -gt 0) { $task.waveNumber = $maxWave + 1 } else { $task.waveNumber = 1 }
+                # Auto-assign to precomputed fallback wave when planner omits waveNumber
+                $task.waveNumber = $fallbackWave
             }
             Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $assignment.blockedBy))
             Set-ObjectProperty -Object $task -Name "lastPlannedWaveNumber" -Value ([int]$task.waveNumber)
@@ -5292,11 +5312,13 @@ function Admin-Edit-Task {
         }
 
         # Auto-restore waveNumber from lastPlannedWaveNumber when resetting to queued state
-        if ([string]$task.state -in @("queued", "retry_scheduled") -and [int]$task.waveNumber -eq 0 -and [int]$task.lastPlannedWaveNumber -gt 0) {
+        # Only restore if the admin didn't explicitly set waveNumber in the update payload
+        if ([string]$task.state -in @("queued", "retry_scheduled") -and [int]$task.waveNumber -eq 0 -and [int]$task.lastPlannedWaveNumber -gt 0 -and $null -eq $updates.waveNumber) {
             $task.waveNumber = [int]$task.lastPlannedWaveNumber
         }
         # Auto-restore blockedBy from lastPlannedBlockedBy when resetting to queued state
-        if ([string]$task.state -in @("queued", "retry_scheduled") -and @($task.blockedBy).Count -eq 0 -and @($task.lastPlannedBlockedBy).Count -gt 0) {
+        # Only restore if the admin didn't explicitly set blockedBy in the update payload
+        if ([string]$task.state -in @("queued", "retry_scheduled") -and @($task.blockedBy).Count -eq 0 -and @($task.lastPlannedBlockedBy).Count -gt 0 -and $null -eq $updates.blockedBy) {
             Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]]@($task.lastPlannedBlockedBy))
         }
 
