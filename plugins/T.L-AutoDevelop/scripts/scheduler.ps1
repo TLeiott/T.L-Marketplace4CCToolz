@@ -3439,12 +3439,22 @@ function Apply-PipelineResultToTask {
         completedAt = $Task.latestRun.completedAt
         artifacts = $Task.latestRun.artifacts
     }
-    # Dedup guard: only apply when launchSequence > 0 to avoid dropping runs at sequence 0
+    # Upsert guard: when launchSequence > 0, replace existing run with same sequence or append
     if ([int]$runRecord.launchSequence -gt 0) {
-        $existingLaunchSequences = @($Task.runs | ForEach-Object { [int]$_.launchSequence })
-        if ([int]$runRecord.launchSequence -notin $existingLaunchSequences) {
-            $Task.runs = @($Task.runs) + @($runRecord)
+        $updatedRuns = @()
+        $replaced = $false
+        foreach ($existingRun in @($Task.runs)) {
+            if ([int]$existingRun.launchSequence -eq [int]$runRecord.launchSequence) {
+                $updatedRuns += $runRecord
+                $replaced = $true
+            } else {
+                $updatedRuns += $existingRun
+            }
         }
+        if (-not $replaced) {
+            $updatedRuns += $runRecord
+        }
+        $Task.runs = $updatedRuns
     } else {
         $Task.runs = @($Task.runs) + @($runRecord)
     }
@@ -4679,8 +4689,9 @@ function Apply-Plan {
             if (-not $task) { continue }
             if (Is-TerminalState -State $task.state) { continue }
 
-            if ($null -ne $assignment.waveNumber -and [int]$assignment.waveNumber -gt 0) {
-                $task.waveNumber = [int]$assignment.waveNumber
+            $parsedWave = $assignment.waveNumber -as [int]
+            if ($null -ne $parsedWave -and $parsedWave -gt 0) {
+                $task.waveNumber = $parsedWave
             } elseif ([int]$task.waveNumber -eq 0) {
                 # Auto-assign to precomputed fallback wave when planner omits waveNumber
                 $task.waveNumber = $fallbackWave
