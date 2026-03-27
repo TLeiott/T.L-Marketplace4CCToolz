@@ -4689,11 +4689,16 @@ function Apply-Plan {
             if (-not $task) { continue }
             if (Is-TerminalState -State $task.state) { continue }
 
+            # Distinguish between omitted waveNumber and an explicit value (including 0)
+            $hasWaveNumber = $assignment.PSObject.Properties.Name -contains 'waveNumber'
             $parsedWave = $assignment.waveNumber -as [int]
-            if ($null -ne $parsedWave -and $parsedWave -gt 0) {
+            if ($hasWaveNumber -and $null -ne $parsedWave -and $parsedWave -gt 0) {
                 $task.waveNumber = $parsedWave
-            } elseif ([int]$task.waveNumber -eq 0) {
-                # Auto-assign to precomputed fallback wave when planner omits waveNumber
+            } elseif ($hasWaveNumber -and $null -ne $parsedWave -and $parsedWave -eq 0) {
+                # Planner explicitly set waveNumber=0 to keep task paused/detached
+                $task.waveNumber = 0
+            } elseif (-not $hasWaveNumber -and [int]$task.waveNumber -eq 0) {
+                # Auto-assign to precomputed fallback wave only when planner omits waveNumber
                 $task.waveNumber = $fallbackWave
             }
             Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $assignment.blockedBy))
