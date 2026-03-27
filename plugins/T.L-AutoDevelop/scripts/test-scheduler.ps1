@@ -8109,4 +8109,564 @@ Test-RunTaskInvalidPromptBecomesEnvironmentRetryWithoutBreaker
 Test-InvalidPromptFailuresDoNotOpenCircuitBreaker
 Test-AutoDevelopInvalidPromptWritesStructuredErrorAndTimeline
 
+function Test-ApplyPlanOmittedWaveNumberGetsFallbackWave {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-existing"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "existing wave-2 task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-existing.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 2
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    lastPlannedWaveNumber = 2
+                    lastPlannedBlockedBy = @()
+                    lastPlanSignature = ""
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "task-existing-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "task-new"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "new task without wave"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-new.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 0
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    lastPlannedWaveNumber = 0
+                    lastPlannedBlockedBy = @()
+                    lastPlanSignature = ""
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "task-new-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $planFile = Join-Path $repo.root "plan-omitted-wave.json"
+        [System.IO.File]::WriteAllText($planFile, (@{
+            summary = "plan without waveNumber for new task"
+            tasks = @(
+                @{ taskId = "task-existing"; waveNumber = 2; blockedBy = @() },
+                @{ taskId = "task-new"; blockedBy = @() }
+            )
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $applyResult = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "apply-plan" -PlanFile $planFile
+        $task = @($applyResult.snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-new" })[0]
+        Assert-True ([int]$task.waveNumber -eq 3) "Omitted waveNumber should auto-assign to max active wave + 1 (2+1=3)."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ApplyPlanExplicitWaveZeroKeepsTaskDetached {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-active"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "active task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-active.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    lastPlannedWaveNumber = 1
+                    lastPlannedBlockedBy = @()
+                    lastPlanSignature = ""
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "task-active-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                },
+                [pscustomobject]@{
+                    taskId = "task-paused"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "paused task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-paused.json")
+                    allowNuget = $false
+                    submissionOrder = 2
+                    waveNumber = 0
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "manual_debug_needed"
+                    lastPlannedWaveNumber = 0
+                    lastPlannedBlockedBy = @()
+                    lastPlanSignature = ""
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "task-paused-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $planFile = Join-Path $repo.root "plan-explicit-zero.json"
+        [System.IO.File]::WriteAllText($planFile, (@{
+            summary = "keep paused task detached"
+            tasks = @(
+                @{ taskId = "task-active"; waveNumber = 1; blockedBy = @() },
+                @{ taskId = "task-paused"; waveNumber = 0; blockedBy = @() }
+            )
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $applyResult = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "apply-plan" -PlanFile $planFile
+        $task = @($applyResult.snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-paused" })[0]
+        Assert-True ([int]$task.waveNumber -eq 0) "Explicit waveNumber=0 should keep the task detached/paused."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AdminEditAutoRestoresWaveWhenOmitted {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-restore"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "task with planned wave"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-restore.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 2
+                    attemptsRemaining = 1
+                    workerLaunchSequence = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = "Repeated inconclusive."
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "manual_debug_needed"
+                    lastPlannedWaveNumber = 5
+                    lastPlannedBlockedBy = @("upstream-dep")
+                    lastPlanSignature = "wave=5;blockedBy=upstream-dep"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 2 -ResultFile (Join-Path $repo.tasksDir "task-restore-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $editFile = Join-Path $repo.root "admin-edit-restore.json"
+        [System.IO.File]::WriteAllText($editFile, (@{
+            taskId = "task-restore"
+            updates = @{
+                state = "queued"
+                attemptsUsed = 0
+                attemptsRemaining = 3
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:SchedulerPath -Mode "admin-edit-task" -SolutionPath $repo.solution -EditFile $editFile
+        $editResult = ($raw | Out-String | ConvertFrom-Json)
+
+        Assert-True ([string]$editResult.task.state -eq "queued") "Admin edit should reset task state to queued."
+        Assert-True ([int]$editResult.task.waveNumber -eq 5) "Admin edit should auto-restore waveNumber from lastPlannedWaveNumber when not specified."
+        Assert-True (@($editResult.task.blockedBy).Count -eq 1 -and [string]$editResult.task.blockedBy[0] -eq "upstream-dep") "Admin edit should auto-restore blockedBy from lastPlannedBlockedBy when not specified."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AdminEditExplicitWaveZeroDoesNotRestore {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-force-clear"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "force-cleared task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-force-clear.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 0
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 2
+                    attemptsRemaining = 1
+                    workerLaunchSequence = 2
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = "Stuck."
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "manual_debug_needed"
+                    lastPlannedWaveNumber = 3
+                    lastPlannedBlockedBy = @("other-task")
+                    lastPlanSignature = "wave=3;blockedBy=other-task"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -AttemptNumber 2 -ResultFile (Join-Path $repo.tasksDir "task-force-clear-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $editFile = Join-Path $repo.root "admin-edit-force.json"
+        [System.IO.File]::WriteAllText($editFile, (@{
+            taskId = "task-force-clear"
+            updates = @{
+                state = "queued"
+                waveNumber = 0
+                blockedBy = @()
+            }
+        } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:SchedulerPath -Mode "admin-edit-task" -SolutionPath $repo.solution -EditFile $editFile
+        $editResult = ($raw | Out-String | ConvertFrom-Json)
+
+        Assert-True ([string]$editResult.task.state -eq "queued") "Admin edit should set state."
+        Assert-True ([int]$editResult.task.waveNumber -eq 0) "Explicit waveNumber=0 in admin edit should NOT trigger auto-restore."
+        Assert-True (@($editResult.task.blockedBy).Count -eq 0) "Explicit empty blockedBy in admin edit should NOT trigger auto-restore."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-RegisterTasksAutoAssignsWaveInActiveQueue {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            tasks = @(
+                [pscustomobject]@{
+                    taskId = "task-wave3"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "existing wave-3 task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-wave3.json")
+                    allowNuget = $false
+                    submissionOrder = 1
+                    waveNumber = 3
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    workerLaunchSequence = 0
+                    maxEnvironmentRepairAttempts = 2
+                    environmentRepairAttemptsUsed = 0
+                    environmentRepairAttemptsRemaining = 2
+                    lastEnvironmentFailureCategory = ""
+                    manualDebugReason = ""
+                    maxMergeAttempts = 3
+                    mergeAttemptsUsed = 0
+                    mergeAttemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    lastPlannedWaveNumber = 3
+                    lastPlannedBlockedBy = @()
+                    lastPlanSignature = ""
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun -ResultFile (Join-Path $repo.tasksDir "task-wave3-run.json"))
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $tasksFile = Join-Path $repo.root "new-tasks.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            @{
+                taskId = "task-new-auto"
+                taskText = "newly registered task"
+                promptFile = $repo.promptFile
+            }
+        ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
+
+        $registerResult = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "register-tasks" -TasksFile $tasksFile
+        $newTask = @($registerResult.snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-new-auto" })[0]
+        Assert-True ([int]$newTask.waveNumber -eq 4) "Newly registered task should auto-assign to max active wave + 1 (3+1=4)."
+        Assert-True ([int]$newTask.lastPlannedWaveNumber -eq 4) "Auto-assigned waveNumber should also set lastPlannedWaveNumber consistently."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-CircuitBreakerIgnoresEnvironmentStateFailures {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                1..3 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "task-env-fail-$_"
+                        sourceCommand = "develop"
+                        sourceInputType = "inline"
+                        taskText = "Environment failure $_"
+                        solutionPath = $repo.solution
+                        promptFile = $repo.promptFile
+                        planFile = ""
+                        resultFile = (Join-Path $repo.resultsDir "task-env-fail-$_.json")
+                        allowNuget = $false
+                        submissionOrder = $_
+                        waveNumber = 1
+                        blockedBy = @()
+                        declaredDependencies = @()
+                        declaredPriority = "normal"
+                        serialOnly = $false
+                        maxAttempts = 3
+                        attemptsUsed = 1
+                        attemptsRemaining = 2
+                        retryScheduled = $true
+                        waitingUserTest = $false
+                        mergeState = ""
+                        state = "retry_scheduled"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            attemptNumber = 1
+                            taskName = "task-env-fail-$_"
+                            resultFile = ""
+                            processId = 0
+                            startedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                            completedAt = (Get-Date).AddMinutes(-2).ToString("o")
+                            finalStatus = "FAILED"
+                            finalCategory = "worktree_environment_error"
+                            summary = "worktree_environment_error"
+                            feedback = "worktree creation failed"
+                            noChangeReason = ""
+                            actualFiles = @()
+                            branchName = ""
+                            artifacts = $null
+                        }
+                        runs = @()
+                        merge = (New-TestMergeRecord)
+                    }
+                }
+            ) + @(
+                [pscustomobject]@{
+                    taskId = "task-queued-env"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "queued task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-queued-env.json")
+                    allowNuget = $false
+                    submissionOrder = 4
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.circuitBreaker.status -eq "closed") "Circuit breaker should stay closed when all 3 failures are environment_state category."
+        Assert-True (@($snapshot.startableTaskIds).Count -gt 0) "Queued task should still be startable since circuit breaker is closed."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+Test-ApplyPlanOmittedWaveNumberGetsFallbackWave
+Test-ApplyPlanExplicitWaveZeroKeepsTaskDetached
+Test-AdminEditAutoRestoresWaveWhenOmitted
+Test-AdminEditExplicitWaveZeroDoesNotRestore
+Test-RegisterTasksAutoAssignsWaveInActiveQueue
+Test-CircuitBreakerIgnoresEnvironmentStateFailures
+
 Write-Host "Scheduler regression checks passed."

@@ -1955,7 +1955,6 @@ function Test-ReadOnlyPhaseConfusionCategory {
 
 function Get-RetryDirective {
     param(
-        $Task,
         $SelectedRuns,
         $LatestRun
     )
@@ -2066,7 +2065,7 @@ function Get-RetryContextPayload {
     if (-not $hasSignal) { return $null }
 
     # Build error-class-specific retry directive
-    $retryDirective = Get-RetryDirective -Task $Task -SelectedRuns $selectedRuns -LatestRun $latestRun
+    $retryDirective = Get-RetryDirective -SelectedRuns $selectedRuns -LatestRun $latestRun
 
     $result = [ordered]@{
         version = 1
@@ -3098,6 +3097,7 @@ function Clear-TerminalTaskFromBlockedBy {
         }
         if ($dependencyChanged) {
             Set-ObjectProperty -Object $otherTask -Name "lastPlanSignature" -Value ""
+            Write-TaskResultFile -Task $otherTask
         }
     }
 }
@@ -3447,14 +3447,17 @@ function Apply-PipelineResultToTask {
         completedAt = $Task.latestRun.completedAt
         artifacts = $Task.latestRun.artifacts
     }
-    # Upsert guard: when launchSequence > 0, replace existing run with same sequence or append
+    # Upsert guard: when launchSequence > 0, replace first matching run and skip subsequent duplicates
     if ([int]$runRecord.launchSequence -gt 0) {
         $updatedRuns = @()
         $replaced = $false
         foreach ($existingRun in @($Task.runs)) {
             if ([int]$existingRun.launchSequence -eq [int]$runRecord.launchSequence) {
-                $updatedRuns += $runRecord
-                $replaced = $true
+                if (-not $replaced) {
+                    $updatedRuns += $runRecord
+                    $replaced = $true
+                }
+                # Skip subsequent duplicates with the same launchSequence
             } else {
                 $updatedRuns += $existingRun
             }
