@@ -2087,6 +2087,14 @@ function Get-RetryContextPayload {
     }
     if ($retryDirective) {
         $result.retryDirective = $retryDirective
+        # Also surface directive via latestFailure.feedback so existing workers see it
+        # (workers only read known fields; retryDirective alone would be silently dropped)
+        $directiveBlock = "`n`n[RETRY DIRECTIVE]`n$retryDirective"
+        if ($result.latestFailure.feedback) {
+            $result.latestFailure.feedback += $directiveBlock
+        } else {
+            $result.latestFailure.feedback = $directiveBlock.TrimStart()
+        }
     }
     return $result
 }
