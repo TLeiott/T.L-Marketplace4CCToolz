@@ -4646,8 +4646,10 @@ function Register-Tasks {
             $task = New-TaskRecord -RepoRoot $context.repoRoot -DefaultSolutionPath $ResolvedSolutionPath -InputTask $inputTask -SubmissionOrder $submissionOrder
             Ensure-TaskShape -Task $task -RepoRoot $context.repoRoot
             Assert-TaskRecordValid -Task $task -Operation "register-tasks"
-            # Auto-assign wave when registering into a queue with active waves
-            if ([int]$task.waveNumber -eq 0 -and $maxActiveWave -gt 0) {
+            # Auto-assign wave when registering into a queue with active waves,
+            # but only if the registration payload did not explicitly specify waveNumber.
+            $waveNumberProvided = $inputTask.PSObject.Properties.Name -contains 'waveNumber'
+            if (-not $waveNumberProvided -and [int]$task.waveNumber -eq 0 -and $maxActiveWave -gt 0) {
                 $task.waveNumber = $maxActiveWave + 1
                 $task.lastPlannedWaveNumber = $task.waveNumber
             }
@@ -4703,13 +4705,11 @@ function Apply-Plan {
             # Distinguish between omitted waveNumber and an explicit value (including 0)
             $hasWaveNumber = $assignment.PSObject.Properties.Name -contains 'waveNumber'
             $parsedWave = $assignment.waveNumber -as [int]
-            if ($hasWaveNumber -and $null -ne $parsedWave -and $parsedWave -gt 0) {
+            if ($hasWaveNumber -and $null -ne $parsedWave) {
+                # Planner explicitly provided a valid waveNumber (including 0 to keep paused)
                 $task.waveNumber = $parsedWave
-            } elseif ($hasWaveNumber -and $null -ne $parsedWave -and $parsedWave -eq 0) {
-                # Planner explicitly set waveNumber=0 to keep task paused/detached
-                $task.waveNumber = 0
-            } elseif (-not $hasWaveNumber -and [int]$task.waveNumber -eq 0) {
-                # Auto-assign to precomputed fallback wave only when planner omits waveNumber
+            } elseif ([int]$task.waveNumber -eq 0) {
+                # Auto-assign to precomputed fallback wave when planner omits or sends null/invalid
                 $task.waveNumber = $fallbackWave
             }
             Set-ObjectProperty -Object $task -Name "blockedBy" -Value ([object[]](Normalize-StringArray -Value $assignment.blockedBy))

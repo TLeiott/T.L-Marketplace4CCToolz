@@ -8662,11 +8662,119 @@ function Test-CircuitBreakerIgnoresEnvironmentStateFailures {
     }
 }
 
+function Test-CircuitBreakerIgnoresLockedEnvironmentFailures {
+    $repo = New-TestRepo
+    try {
+        Write-StateFile -StateFile $repo.stateFile -State ([pscustomobject]@{
+            version = 4
+            repoRoot = $repo.root
+            createdAt = (Get-Date).ToString("o")
+            updatedAt = (Get-Date).ToString("o")
+            lastPlanAppliedAt = ""
+            circuitBreaker = @{
+                status = "closed"
+                openedAt = ""
+                closedAt = ""
+                scopeWave = 0
+                reasonCategory = ""
+                reasonSummary = ""
+                affectedTaskIds = @()
+                manualOverrideUntil = ""
+            }
+            tasks = @(
+                1..3 | ForEach-Object {
+                    [pscustomobject]@{
+                        taskId = "task-lock-fail-$_"
+                        sourceCommand = "develop"
+                        sourceInputType = "inline"
+                        taskText = "Lock failure $_"
+                        solutionPath = $repo.solution
+                        promptFile = $repo.promptFile
+                        planFile = ""
+                        resultFile = (Join-Path $repo.resultsDir "task-lock-fail-$_.json")
+                        allowNuget = $false
+                        submissionOrder = $_
+                        waveNumber = 1
+                        blockedBy = @()
+                        declaredDependencies = @()
+                        declaredPriority = "normal"
+                        serialOnly = $false
+                        maxAttempts = 3
+                        attemptsUsed = 1
+                        attemptsRemaining = 2
+                        retryScheduled = $true
+                        waitingUserTest = $false
+                        mergeState = ""
+                        state = "retry_scheduled"
+                        plannerMetadata = [pscustomobject]@{}
+                        plannerFeedback = [pscustomobject]@{}
+                        latestRun = [pscustomobject]@{
+                            attemptNumber = 1
+                            taskName = "task-lock-fail-$_"
+                            resultFile = ""
+                            processId = 0
+                            startedAt = (Get-Date).AddMinutes(-10).ToString("o")
+                            completedAt = (Get-Date).AddMinutes(-2).ToString("o")
+                            finalStatus = "FAILED"
+                            finalCategory = "MSB3021"
+                            summary = "MSB3021 locked"
+                            feedback = "MSB3021: Unable to copy file. The process cannot access the file because it is being used by another process."
+                            noChangeReason = ""
+                            actualFiles = @()
+                            branchName = ""
+                            artifacts = $null
+                        }
+                        runs = @()
+                        merge = (New-TestMergeRecord)
+                    }
+                }
+            ) + @(
+                [pscustomobject]@{
+                    taskId = "task-queued-lock"
+                    sourceCommand = "develop"
+                    sourceInputType = "inline"
+                    taskText = "queued task"
+                    solutionPath = $repo.solution
+                    promptFile = $repo.promptFile
+                    planFile = ""
+                    resultFile = (Join-Path $repo.resultsDir "task-queued-lock.json")
+                    allowNuget = $false
+                    submissionOrder = 4
+                    waveNumber = 1
+                    blockedBy = @()
+                    declaredDependencies = @()
+                    declaredPriority = "normal"
+                    serialOnly = $false
+                    maxAttempts = 3
+                    attemptsUsed = 0
+                    attemptsRemaining = 3
+                    retryScheduled = $false
+                    waitingUserTest = $false
+                    mergeState = ""
+                    state = "queued"
+                    plannerMetadata = [pscustomobject]@{}
+                    plannerFeedback = [pscustomobject]@{}
+                    latestRun = (New-TestLatestRun)
+                    runs = @()
+                    merge = (New-TestMergeRecord)
+                }
+            )
+        })
+
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        Assert-True ([string]$snapshot.circuitBreaker.status -eq "closed") "Circuit breaker should stay closed when all 3 failures are locked_environment category (MSB3021)."
+        Assert-True (@($snapshot.startableTaskIds).Count -gt 0) "Queued task should still be startable since circuit breaker is closed."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 Test-ApplyPlanOmittedWaveNumberGetsFallbackWave
 Test-ApplyPlanExplicitWaveZeroKeepsTaskDetached
 Test-AdminEditAutoRestoresWaveWhenOmitted
 Test-AdminEditExplicitWaveZeroDoesNotRestore
 Test-RegisterTasksAutoAssignsWaveInActiveQueue
 Test-CircuitBreakerIgnoresEnvironmentStateFailures
+Test-CircuitBreakerIgnoresLockedEnvironmentFailures
 
 Write-Host "Scheduler regression checks passed."
