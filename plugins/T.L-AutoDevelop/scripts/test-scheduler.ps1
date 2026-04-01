@@ -4,6 +4,8 @@ $ErrorActionPreference = "Stop"
 
 $script:SchedulerPath = Join-Path $PSScriptRoot "scheduler.ps1"
 $script:PreflightPath = Join-Path $PSScriptRoot "preflight.ps1"
+$script:AutoDevelopConfigPath = Join-Path $PSScriptRoot "autodevelop-config.ps1"
+$script:PlannerRunnerPath = Join-Path $PSScriptRoot "planner-runner.ps1"
 
 function Assert-True {
     param(
@@ -335,12 +337,70 @@ function Invoke-AutoDevelopHelperFunctions {
     $functionDefinitions = @($FunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $autoDevelopPath -FunctionName $_ })
     $bootstrap = ($functionDefinitions -join "`r`n`r`n")
     $wrapped = @"
+. (Resolve-Path '$script:AutoDevelopConfigPath')
 $bootstrap
 & {
 $($ScriptBlock.ToString())
 }
 "@
     $tempScript = Join-Path $env:TEMP ("autodev-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
+        return ($raw | Out-String).Trim()
+    } finally {
+        Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-AutoDevelopConfigHelperFunctions {
+    param(
+        [string[]]$FunctionNames,
+        [scriptblock]$ScriptBlock,
+        [object[]]$Arguments = @()
+    )
+
+    $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
+    $wrapped = @"
+. (Resolve-Path '$script:AutoDevelopConfigPath')
+`$__configArgs = ConvertFrom-Json @'
+$argumentsJson
+'@
+& {
+$($ScriptBlock.ToString())
+} @`$__configArgs
+"@
+    $tempScript = Join-Path $env:TEMP ("autodev-config-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
+        return ($raw | Out-String).Trim()
+    } finally {
+        Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-PlannerRunnerHelperFunctions {
+    param(
+        [string[]]$PlannerFunctionNames,
+        [scriptblock]$ScriptBlock,
+        [object[]]$Arguments = @()
+    )
+
+    $plannerDefinitions = @($PlannerFunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $script:PlannerRunnerPath -FunctionName $_ })
+    $plannerBootstrap = ($plannerDefinitions -join "`r`n`r`n")
+    $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
+    $wrapped = @"
+. (Resolve-Path '$script:AutoDevelopConfigPath')
+$plannerBootstrap
+`$__plannerArgs = ConvertFrom-Json @'
+$argumentsJson
+'@
+& {
+$($ScriptBlock.ToString())
+} @`$__plannerArgs
+"@
+    $tempScript = Join-Path $env:TEMP ("planner-runner-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
         $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
@@ -2165,6 +2225,359 @@ function Test-MissingPlannerContextFallsBackToComplexProfile {
     Assert-True ($parsed.contextLoaded -eq $false) "Missing planner context should not load successfully."
     Assert-True ([string]$parsed.plannerEffortClass -eq "UNKNOWN") "Missing planner context should fall back to UNKNOWN effort."
     Assert-True ([string]$parsed.pipelineProfile -eq "COMPLEX") "Missing planner context should fall back to the COMPLEX profile."
+}
+
+function Test-AutoDevelopConfigFallsBackToDefaultsWhenFileIsMissing {
+    $repo = New-TestRepo
+    try {
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @(
+            "Get-AutoDevelopConfigPath",
+            "ConvertTo-AutoDevelopStringArray",
+            "Test-AutoDevelopConfigObject",
+            "Copy-AutoDevelopConfigValue",
+            "Get-AutoDevelopConfigPropertyNames",
+            "Get-AutoDevelopConfigPropertyValue",
+            "Merge-AutoDevelopRoleConfig",
+            "Get-DefaultAutoDevelopConfig",
+            "Merge-AutoDevelopConfigWithDefaults",
+            "Read-AutoDevelopConfigFile",
+            "Get-AutoDevelopConfigState",
+            "Resolve-AutoDevelopRoleConfig"
+        ) -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement"
+            [pscustomobject]@{
+                exists = [bool]$state.file.exists
+                loaded = [bool]$state.file.loaded
+                configPath = [string]$state.path
+                implementModel = [string]$implementRole.model
+                provider = [string]$implementRole.provider
+                allowedTools = @($implementRole.allowedTools)
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ($parsed.exists -eq $false) "Missing repo config should be treated as absent, not invalid."
+        Assert-True ($parsed.loaded -eq $false) "Missing repo config should not report as loaded."
+        Assert-True ([string]$parsed.implementModel -eq "claude-opus-4-6") "Missing repo config should keep the built-in implement model."
+        Assert-True ([string]$parsed.provider -eq "claude-code") "Missing repo config should keep the built-in provider."
+        Assert-True (@($parsed.allowedTools).Count -eq 6) "Missing repo config should keep the built-in implement tool set."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopConfigAppliesExplicitRoleOverrides {
+    $repo = New-TestRepo
+    try {
+        $configPath = Join-Path $repo.root ".claude\autodevelop.json"
+        Write-TestFile -Path $configPath -Content @"
+{
+  "version": 1,
+  "providerDefaults": {
+    "provider": "claude-code",
+    "command": "claude"
+  },
+  "roles": {
+    "implement": {
+      "model": "claude-sonnet-4-6",
+      "reasoningEffort": "low",
+      "maxTurns": 9,
+      "allowedTools": ["Read", "Edit", "Bash"],
+      "dangerouslySkipPermissions": true,
+      "extraArgs": ["--append-system-prompt", "Implement carefully"]
+    },
+    "scheduler": {
+      "model": "claude-sonnet-4-6",
+      "reasoningEffort": "medium",
+      "maxTurns": 11,
+      "allowedTools": ["Read", "Glob"]
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @(
+            "Get-AutoDevelopConfigPath",
+            "ConvertTo-AutoDevelopStringArray",
+            "Test-AutoDevelopConfigObject",
+            "Copy-AutoDevelopConfigValue",
+            "Get-AutoDevelopConfigPropertyNames",
+            "Get-AutoDevelopConfigPropertyValue",
+            "Merge-AutoDevelopRoleConfig",
+            "Get-DefaultAutoDevelopConfig",
+            "Merge-AutoDevelopConfigWithDefaults",
+            "Read-AutoDevelopConfigFile",
+            "Get-AutoDevelopConfigState",
+            "Resolve-AutoDevelopRoleConfig"
+        ) -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement"
+            $schedulerRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "scheduler"
+            [pscustomobject]@{
+                loaded = [bool]$state.file.loaded
+                implement = $implementRole
+                scheduler = $schedulerRole
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ($parsed.loaded -eq $true) "Repo config should load successfully when the file exists."
+        Assert-True ([string]$parsed.implement.model -eq "claude-sonnet-4-6") "Explicit implement model should override the built-in default."
+        Assert-True ([string]$parsed.implement.reasoningEffort -eq "low") "Explicit implement reasoning effort should be preserved."
+        Assert-True ([int]$parsed.implement.maxTurns -eq 9) "Explicit implement maxTurns should be preserved."
+        Assert-True (@($parsed.implement.allowedTools).Count -eq 3) "Explicit implement tool selection should replace the built-in set."
+        Assert-True ([string]$parsed.scheduler.model -eq "claude-sonnet-4-6") "Scheduler role should be independently configurable."
+        Assert-True ([string]$parsed.scheduler.reasoningEffort -eq "medium") "Scheduler role should preserve its own reasoning effort override."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-ClaudeRoleArgumentsIncludeConfiguredReasoningEffort {
+    $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @(
+        "ConvertTo-AutoDevelopStringArray",
+        "Get-ClaudeRoleArguments"
+    ) -ScriptBlock {
+        $role = [pscustomobject]@{
+            roleName = "implement"
+            provider = "claude-code"
+            model = "claude-sonnet-4-6"
+            reasoningEffort = "low"
+            maxTurns = 24
+            allowedTools = @("Read", "Edit", "Bash")
+            dangerouslySkipPermissions = $true
+            extraArgs = @("--append-system-prompt", "Stay focused")
+        }
+        [pscustomobject]@{
+            args = @(Get-ClaudeRoleArguments -RoleConfig $role)
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    $argList = @($parsed.args)
+    Assert-True (($argList -join " ") -match [regex]::Escape("--reasoning-effort low")) "Configured reasoning effort must be forwarded to the Claude CLI call."
+    Assert-True (($argList -join " ") -match [regex]::Escape("--allowedTools Read,Edit,Bash")) "Configured allowed tools must be forwarded to the Claude CLI call."
+    Assert-True ($argList -contains "--dangerously-skip-permissions") "Configured permission bypass should be forwarded to the Claude CLI call."
+}
+
+function Test-AutoDevelopRuntimeModelOverrideWinsWithoutExplicitPin {
+    $repo = New-TestRepo
+    try {
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "claude-sonnet-4-6"
+            [pscustomobject]@{
+                model = [string]$implementRole.model
+                modelPinned = [bool]$implementRole.modelPinned
+                modelSource = [string]$implementRole.modelSource
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.model -eq "claude-sonnet-4-6") "Runtime model heuristics must still win when no explicit role model is configured."
+        Assert-True ($parsed.modelPinned -eq $false) "Built-in fallback models must not masquerade as explicit pins."
+        Assert-True ([string]$parsed.modelSource -eq "runtime") "Unpinned roles should report runtime model resolution when a heuristic override is supplied."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopExplicitModelPinsAgainstRuntimeOverride {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 1,
+  "roles": {
+    "implement": {
+      "model": "claude-sonnet-4-6"
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "claude-opus-4-6"
+            [pscustomobject]@{
+                model = [string]$implementRole.model
+                modelPinned = [bool]$implementRole.modelPinned
+                modelSource = [string]$implementRole.modelSource
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.model -eq "claude-sonnet-4-6") "Explicit role model config must pin the role model against runtime heuristics."
+        Assert-True ($parsed.modelPinned -eq $true) "Explicit role model config must be marked as pinned."
+        Assert-True ([string]$parsed.modelSource -eq "explicit") "Pinned role models should report explicit model resolution."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 1,
+  "providerDefaults": {
+    "provider": "invalid-provider"
+  },
+  "roles": {
+    "implement": {
+      "command": { "bad": true },
+      "reasoningEffort": "maximum",
+      "maxTurns": "abc",
+      "allowedTools": ["Read", { "bad": true }],
+      "extraArgs": ["--append-system-prompt", { "bad": true }],
+      "dangerouslySkipPermissions": "maybe"
+    },
+    "reviewer": {
+      "promptTemplatePath": { "bad": true }
+    },
+    "scheduler": {
+      "timeoutSeconds": "later"
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "claude-sonnet-4-6"
+            $schedulerRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "scheduler"
+            [pscustomobject]@{
+                warnings = @($state.warnings | ForEach-Object { [string]$_.scope })
+                implementProvider = [string]$implementRole.provider
+                implementCommand = [string]$implementRole.command
+                implementReasoning = [string]$implementRole.reasoningEffort
+                implementMaxTurns = [int]$implementRole.maxTurns
+                implementAllowedTools = @($implementRole.allowedTools)
+                implementExtraArgs = @($implementRole.extraArgs)
+                implementSkipPermissions = [bool]$implementRole.dangerouslySkipPermissions
+                implementModel = [string]$implementRole.model
+                reviewerPromptTemplate = [string](Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "reviewer").promptTemplatePath
+                schedulerTimeout = [int]$schedulerRole.timeoutSeconds
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        $warnings = @($parsed.warnings)
+        Assert-True ($warnings -contains "providerDefaults.provider") "Invalid provider defaults should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.implement.reasoningEffort") "Invalid reasoning effort should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.implement.maxTurns") "Invalid maxTurns should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.implement.command") "Invalid command values should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.implement.allowedTools") "Invalid allowedTools entries should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.implement.extraArgs") "Invalid extraArgs entries should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.implement.dangerouslySkipPermissions") "Invalid permission flags should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.reviewer.promptTemplatePath") "Invalid prompt template paths should emit a scoped warning."
+        Assert-True ($warnings -contains "roles.scheduler.timeoutSeconds") "Invalid timeoutSeconds should emit a scoped warning."
+        Assert-True ([string]$parsed.implementProvider -eq "claude-code") "Invalid provider config must fall back to the built-in provider."
+        Assert-True ([string]$parsed.implementCommand -eq "claude") "Invalid command config must fall back to the built-in command."
+        Assert-True ([string]$parsed.implementReasoning -eq "") "Invalid reasoning effort must fall back to the built-in reasoning default."
+        Assert-True ([int]$parsed.implementMaxTurns -eq 24) "Invalid maxTurns must fall back to the built-in role value."
+        Assert-True (@($parsed.implementAllowedTools).Count -eq 1 -and [string]$parsed.implementAllowedTools[0] -eq "Read") "Invalid allowedTools entries must be ignored while valid entries survive."
+        Assert-True (@($parsed.implementExtraArgs).Count -eq 1 -and [string]$parsed.implementExtraArgs[0] -eq "--append-system-prompt") "Invalid extraArgs entries must be ignored while valid entries survive."
+        Assert-True ($parsed.implementSkipPermissions -eq $true) "Invalid permission flags must fall back to the built-in role value."
+        Assert-True ([string]$parsed.implementModel -eq "claude-sonnet-4-6") "Invalid typed config must not prevent runtime model heuristics from being applied."
+        Assert-True ([string]$parsed.reviewerPromptTemplate -eq "agents/reviewer.md") "Invalid prompt template paths must fall back to the built-in role value."
+        Assert-True ([int]$parsed.schedulerTimeout -eq 0) "Invalid timeoutSeconds must fall back to the built-in role timeout."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopResolvedTimeoutPrefersRoleConfig {
+    $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+        $role = [pscustomobject]@{
+            timeoutSeconds = 321
+        }
+        [pscustomobject]@{
+            resolvedTimeout = [int](Get-AutoDevelopResolvedTimeoutSeconds -RoleConfig $role -FallbackTimeoutSeconds 900)
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([int]$parsed.resolvedTimeout -eq 321) "Role-specific timeoutSeconds must override the planner fallback timeout."
+}
+
+function Test-PlannerRunnerRespectsGitCommandOverride {
+    $repo = New-TestRepo
+    try {
+        $fakeGitPath = Join-Path $repo.root "fake-git.cmd"
+        Write-TestFile -Path $fakeGitPath -Content @"
+@echo off
+if "%~1"=="rev-parse" if "%~2"=="--show-toplevel" (
+  echo %CD%
+  exit /b 0
+)
+exit /b 1
+"@
+
+        $output = Invoke-PlannerRunnerHelperFunctions -PlannerFunctionNames @(
+            "Invoke-NativeCommand",
+            "Get-CanonicalPath",
+            "Get-RepoRootFromSolution"
+        ) -ScriptBlock {
+            param($SolutionPath, $FakeGitPath)
+            $previous = $env:AUTODEV_GIT_COMMAND
+            $env:AUTODEV_GIT_COMMAND = $FakeGitPath
+            try {
+                [pscustomobject]@{
+                    repoRoot = [string](Get-RepoRootFromSolution -ResolvedSolutionPath $SolutionPath)
+                } | ConvertTo-Json -Depth 8
+            } finally {
+                $env:AUTODEV_GIT_COMMAND = $previous
+            }
+        } -Arguments @($repo.solution, $fakeGitPath)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.repoRoot -eq $repo.root) "Planner repo discovery must honor AUTODEV_GIT_COMMAND just like the scheduler does."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopWorkerRespectsGitCommandOverride {
+    $repo = New-TestRepo
+    try {
+        $fakeGitPath = Join-Path $repo.root "fake-git.ps1"
+        Write-TestFile -Path $fakeGitPath -Content @"
+if (`$args.Count -ge 2 -and `$args[0] -eq "rev-parse" -and `$args[1] -eq "--show-toplevel") {
+    [Console]::Out.WriteLine((Get-Location).Path)
+    exit 0
+}
+exit 1
+"@
+
+        $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+            "Invoke-NativeCommand"
+        ) -ScriptBlock {
+            param($RepoRoot, $FakeGitPath)
+            $previous = $env:AUTODEV_GIT_COMMAND
+            $env:AUTODEV_GIT_COMMAND = $FakeGitPath
+            Push-Location $RepoRoot
+            try {
+                Invoke-NativeCommand -Command "git" -Arguments @("rev-parse", "--show-toplevel") | ConvertTo-Json -Depth 8
+            } finally {
+                Pop-Location
+                $env:AUTODEV_GIT_COMMAND = $previous
+            }
+        } -Arguments @($repo.root, $fakeGitPath)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.output -eq $repo.root) "Worker git invocations must honor AUTODEV_GIT_COMMAND just like scheduler and planner paths."
+        Assert-True ([int]$parsed.exitCode -eq 0) "Worker git override should preserve a successful exit code."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
 }
 
 function Test-WriteWorkerBriefsFilePersistsAcceptedCompletedBriefs {
@@ -8776,5 +9189,14 @@ Test-AdminEditExplicitWaveZeroDoesNotRestore
 Test-RegisterTasksAutoAssignsWaveInActiveQueue
 Test-CircuitBreakerIgnoresEnvironmentStateFailures
 Test-CircuitBreakerIgnoresLockedEnvironmentFailures
+Test-AutoDevelopConfigFallsBackToDefaultsWhenFileIsMissing
+Test-AutoDevelopConfigAppliesExplicitRoleOverrides
+Test-ClaudeRoleArgumentsIncludeConfiguredReasoningEffort
+Test-AutoDevelopRuntimeModelOverrideWinsWithoutExplicitPin
+Test-AutoDevelopExplicitModelPinsAgainstRuntimeOverride
+Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings
+Test-AutoDevelopResolvedTimeoutPrefersRoleConfig
+Test-PlannerRunnerRespectsGitCommandOverride
+Test-AutoDevelopWorkerRespectsGitCommandOverride
 
 Write-Host "Scheduler regression checks passed."

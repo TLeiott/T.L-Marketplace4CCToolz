@@ -13,6 +13,8 @@ param(
     [switch]$AllowNuget
 )
 
+. (Join-Path $PSScriptRoot "autodevelop-config.ps1")
+
 $CONST_MODEL_PLAN = "claude-opus-4-6"
 $CONST_MODEL_INVESTIGATE = "claude-opus-4-6"
 $CONST_MODEL_IMPLEMENT = "claude-opus-4-6"
@@ -92,6 +94,7 @@ $discoverConclusion = ""
 $routeDecision = "UNCERTAIN"
 $testability = "UNKNOWN"
 $testProjects = @()
+$autoDevelopConfigState = $null
 $plannerEffortClass = "UNKNOWN"
 $pipelineProfile = "COMPLEX"
 $currentRunAttemptNumber = 0
@@ -180,9 +183,10 @@ Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
 
 function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments)
+    $resolvedCommand = Resolve-AutoDevelopNativeCommandName -Command $Command
     $output = & {
         $ErrorActionPreference = "Continue"
-        & $Command @Arguments 2>&1
+        & $resolvedCommand @Arguments 2>&1
     }
     return @{ output = ($output | Out-String).Trim(); exitCode = $LASTEXITCODE }
 }
@@ -3020,7 +3024,7 @@ function Invoke-ClaudeWithTimeout {
     param(
         [string]$PhaseName,
         [string]$Prompt,
-        [string[]]$ExtraArgs = @(),
+        [string]$RoleName,
         [int]$TimeoutSec = $CONST_TIMEOUT_SECONDS,
         [int]$Attempt = 1,
         [string]$Model = ""
@@ -3033,10 +3037,13 @@ function Invoke-ClaudeWithTimeout {
     if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
     $debugSubdir = $PhaseName
 
+    $roleConfig = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName $RoleName -ModelOverride $Model
+    $resolvedTimeoutSec = Get-AutoDevelopResolvedTimeoutSeconds -RoleConfig $roleConfig -FallbackTimeoutSeconds $TimeoutSec
+    $extraArgs = Get-ClaudeRoleArguments -RoleConfig $roleConfig
+
     [System.IO.File]::WriteAllText($tempPromptFile, $Prompt, [System.Text.Encoding]::UTF8)
 
-    $claudeExe = (Get-Command claude -ErrorAction SilentlyContinue).Source
-    if (-not $claudeExe) { $claudeExe = "$env:USERPROFILE\.local\bin\claude.exe" }
+    $claudeExe = Get-ClaudeExecutablePath -RoleConfig $roleConfig
 
     $job = Start-Job -ScriptBlock {
         param($exe, $promptFile, $extraArgs, $outFile, $workDir)
@@ -3052,9 +3059,9 @@ function Invoke-ClaudeWithTimeout {
             $exitCode = 99
         }
         [System.IO.File]::WriteAllText($outFile, "$exitCode`n$output", [System.Text.Encoding]::UTF8)
-    } -ArgumentList $claudeExe, $tempPromptFile, $ExtraArgs, $tempOutputFile, (Get-Location).Path
+    } -ArgumentList $claudeExe, $tempPromptFile, $extraArgs, $tempOutputFile, (Get-Location).Path
 
-    $completed = Wait-Job $job -Timeout $TimeoutSec
+    $completed = Wait-Job $job -Timeout $resolvedTimeoutSec
     if (-not $completed -or $job.State -eq "Running") {
         Stop-Job $job -ErrorAction SilentlyContinue
         Remove-Job $job -Force -ErrorAction SilentlyContinue
@@ -3063,20 +3070,24 @@ function Invoke-ClaudeWithTimeout {
         Save-JsonArtifact -Name "$PhaseName-attempt-$Attempt-meta.json" -Object ([ordered]@{
             phase = $PhaseName
             attempt = $Attempt
-            model = $Model
+            model = $roleConfig.model
             exitCode = -1
-            timeoutSeconds = $TimeoutSec
-            args = $ExtraArgs
+            timeoutSeconds = $resolvedTimeoutSec
+            args = $extraArgs
+            role = $RoleName
+            reasoningEffort = $roleConfig.reasoningEffort
         }) | Out-Null
-        Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content "TIMEOUT nach $TimeoutSec Sekunden" | Out-Null
+        Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content "TIMEOUT nach $resolvedTimeoutSec Sekunden" | Out-Null
         Add-DebugSnapshot -SourcePath $tempPromptFile -TargetName "prompt.md" -Subdir $debugSubdir | Out-Null
         Save-DebugJson -Name "meta.json" -Object ([ordered]@{
             phase = $PhaseName
             attempt = $Attempt
-            model = $Model
+            model = $roleConfig.model
             exitCode = -1
-            timeoutSeconds = $TimeoutSec
-            args = $ExtraArgs
+            timeoutSeconds = $resolvedTimeoutSec
+            args = $extraArgs
+            role = $RoleName
+            reasoningEffort = $roleConfig.reasoningEffort
             claudeExe = $claudeExe
             workingDirectory = (Get-Location).Path
             tempPromptFile = $tempPromptFile
@@ -3084,11 +3095,11 @@ function Invoke-ClaudeWithTimeout {
             timedOut = $true
             jobState = "Running"
         }) -Subdir $debugSubdir | Out-Null
-        Save-DebugText -Name "output.txt" -Content "TIMEOUT nach $TimeoutSec Sekunden" -Subdir $debugSubdir | Out-Null
-        Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $Model -Prompt $Prompt -Output "TIMEOUT nach $TimeoutSec Sekunden" -DurationSeconds $durationSeconds -Success $false -TimedOut $true -ExitCode -1
+        Save-DebugText -Name "output.txt" -Content "TIMEOUT nach $resolvedTimeoutSec Sekunden" -Subdir $debugSubdir | Out-Null
+        Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $roleConfig.model -Prompt $Prompt -Output "TIMEOUT nach $resolvedTimeoutSec Sekunden" -DurationSeconds $durationSeconds -Success $false -TimedOut $true -ExitCode -1
         Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
         Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
-        return @{ success = $false; output = "TIMEOUT nach $TimeoutSec Sekunden"; timedOut = $true; exitCode = -1 }
+        return @{ success = $false; output = "TIMEOUT nach $resolvedTimeoutSec Sekunden"; timedOut = $true; exitCode = -1 }
     }
 
     $jobFailed = $job.State -eq "Failed"
@@ -3117,10 +3128,12 @@ function Invoke-ClaudeWithTimeout {
     Save-JsonArtifact -Name "$PhaseName-attempt-$Attempt-meta.json" -Object ([ordered]@{
         phase = $PhaseName
         attempt = $Attempt
-        model = $Model
+        model = $roleConfig.model
         exitCode = $exitCode
-        timeoutSeconds = $TimeoutSec
-        args = $ExtraArgs
+        timeoutSeconds = $resolvedTimeoutSec
+        args = $extraArgs
+        role = $RoleName
+        reasoningEffort = $roleConfig.reasoningEffort
         jobFailed = $jobFailed
     }) | Out-Null
     Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content $output | Out-Null
@@ -3129,10 +3142,12 @@ function Invoke-ClaudeWithTimeout {
     Save-DebugJson -Name "meta.json" -Object ([ordered]@{
         phase = $PhaseName
         attempt = $Attempt
-        model = $Model
+        model = $roleConfig.model
         exitCode = $exitCode
-        timeoutSeconds = $TimeoutSec
-        args = $ExtraArgs
+        timeoutSeconds = $resolvedTimeoutSec
+        args = $extraArgs
+        role = $RoleName
+        reasoningEffort = $roleConfig.reasoningEffort
         jobFailed = $jobFailed
         claudeExe = $claudeExe
         workingDirectory = (Get-Location).Path
@@ -3146,7 +3161,7 @@ function Invoke-ClaudeWithTimeout {
     if ($jobErrors.Trim()) {
         Save-DebugText -Name "job-errors.txt" -Content $jobErrors -Subdir $debugSubdir | Out-Null
     }
-    Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $Model -Prompt $Prompt -Output $output -DurationSeconds $durationSeconds -Success ($exitCode -eq 0) -TimedOut $false -ExitCode $exitCode
+    Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $roleConfig.model -Prompt $Prompt -Output $output -DurationSeconds $durationSeconds -Success ($exitCode -eq 0) -TimedOut $false -ExitCode $exitCode
 
     Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
     Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
@@ -3156,74 +3171,51 @@ function Invoke-ClaudeWithTimeout {
 
 function Invoke-ClaudeDiscover {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "DISCOVER nutzt $Model" -Category "DISCOVER_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "discover-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
-        "--model", $Model,
-        "--allowedTools", "Read,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_DISCOVER.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "discover" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "DISCOVER nutzt $($resolvedRole.model)" -Category "DISCOVER_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "discover-v$Attempt" -Prompt $Prompt -RoleName "discover" -Model $Model -Attempt $Attempt
 }
 
 function Invoke-ClaudePlan {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "PLAN nutzt $Model" -Category "PLAN_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "plan-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
-        "--model", $Model,
-        "--allowedTools", "Read,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_PLAN.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "plan" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "PLAN nutzt $($resolvedRole.model)" -Category "PLAN_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "plan-v$Attempt" -Prompt $Prompt -RoleName "plan" -Model $Model -Attempt $Attempt
 }
 
 function Invoke-ClaudeFixPlan {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "FIX_PLAN nutzt $Model" -Category "FIX_PLAN_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "fix-plan-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
-        "--model", $Model,
-        "--allowedTools", "Read,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_PLAN.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "fixPlan" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "FIX_PLAN nutzt $($resolvedRole.model)" -Category "FIX_PLAN_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "fix-plan-v$Attempt" -Prompt $Prompt -RoleName "fixPlan" -Model $Model -Attempt $Attempt
 }
 
 function Invoke-ClaudeDirectionCheck {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "DIRECTION_CHECK nutzt $Model" -Category "DIRECTION_CHECK_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "direction-check-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
-        "--model", $Model,
-        "--allowedTools", "Read,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_DIRECTION_CHECK.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "directionCheck" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "DIRECTION_CHECK nutzt $($resolvedRole.model)" -Category "DIRECTION_CHECK_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "direction-check-v$Attempt" -Prompt $Prompt -RoleName "directionCheck" -Model $Model -Attempt $Attempt
 }
 
 function Invoke-ClaudeInvestigate {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "INVESTIGATE nutzt $Model" -Category "INVESTIGATE_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "investigate-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -ExtraArgs @(
-        "--model", $Model,
-        "--allowedTools", "Read,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_INVESTIGATE.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "investigate" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "INVESTIGATE nutzt $($resolvedRole.model)" -Category "INVESTIGATE_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "investigate-v$Attempt" -Prompt $Prompt -RoleName "investigate" -Model $Model -Attempt $Attempt
 }
 
 function Invoke-ClaudeImplement {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "IMPLEMENT nutzt $Model" -Category "IMPLEMENT_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "implement-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2) -ExtraArgs @(
-        "--model", $Model,
-        "--dangerously-skip-permissions",
-        "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_IMPL.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "implement" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "IMPLEMENT nutzt $($resolvedRole.model)" -Category "IMPLEMENT_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "implement-v$Attempt" -Prompt $Prompt -RoleName "implement" -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2)
 }
 
 function Invoke-ClaudeReproduce {
     param([string]$Prompt, [string]$Model, [int]$Attempt)
-    Add-TimelineEvent -Phase "MODEL" -Message "REPRODUCE nutzt $Model" -Category "REPRODUCE_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "reproduce-v$Attempt" -Prompt $Prompt -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2) -ExtraArgs @(
-        "--model", $Model,
-        "--dangerously-skip-permissions",
-        "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_IMPL.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "reproduce" -ModelOverride $Model
+    Add-TimelineEvent -Phase "MODEL" -Message "REPRODUCE nutzt $($resolvedRole.model)" -Category "REPRODUCE_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "reproduce-v$Attempt" -Prompt $Prompt -RoleName "reproduce" -Model $Model -Attempt $Attempt -TimeoutSec ($CONST_TIMEOUT_SECONDS * 2)
 }
 
 function Invoke-ClaudeReview {
@@ -3233,12 +3225,9 @@ function Invoke-ClaudeReview {
         [string]$Model
     )
     $model = if ($Model) { $Model } else { $CONST_MODEL_REVIEW }
-    Add-TimelineEvent -Phase "MODEL" -Message "REVIEW nutzt $model" -Category "REVIEW_MODEL"
-    return Invoke-ClaudeWithTimeout -PhaseName "review-$AttemptLabel" -Prompt $Prompt -Model $model -Attempt 1 -ExtraArgs @(
-        "--model", $model,
-        "--allowedTools", "Read,Glob,Grep",
-        "--max-turns", $CONST_MAX_TURNS_REVIEW.ToString()
-    )
+    $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "reviewer" -ModelOverride $model
+    Add-TimelineEvent -Phase "MODEL" -Message "REVIEW nutzt $($resolvedRole.model)" -Category "REVIEW_MODEL"
+    return Invoke-ClaudeWithTimeout -PhaseName "review-$AttemptLabel" -Prompt $Prompt -RoleName "reviewer" -Model $model -Attempt 1
 }
 
 function Get-ReviewVerdict {
@@ -3833,9 +3822,15 @@ try {
 
     Ensure-DebugDir | Out-Null
     $repoRoot = (Invoke-NativeCommand git @("rev-parse", "--show-toplevel")).output
+    $autoDevelopConfigState = Get-AutoDevelopConfigState -RepoRoot $repoRoot
     Ensure-ArtifactDir -Root $repoRoot | Out-Null
     Write-DebugManifest
     Write-TimelineArtifact
+    if (@($autoDevelopConfigState.warnings).Count -gt 0) {
+        Add-TimelineEvent -Phase "CONFIG" -Message "AutoDevelop-Konfiguration mit Warnungen geladen. Teilweise werden Defaults verwendet." -Category "CONFIG_WARNING" -Data @{ path = $autoDevelopConfigState.path; warnings = @($autoDevelopConfigState.warnings) }
+    } elseif ($autoDevelopConfigState.file.loaded) {
+        Add-TimelineEvent -Phase "CONFIG" -Message "AutoDevelop-Konfiguration aus dem Repository geladen." -Category "CONFIG_LOADED" -Data @{ path = $autoDevelopConfigState.path }
+    }
 
     $promptValidation = Get-TaskPromptValidationResult -PromptFile $PromptFile
     if (-not $promptValidation.isValid) {
@@ -4702,11 +4697,8 @@ Write ONLY the plan.
     $implementationHistoryHashes = [System.Collections.ArrayList]::new()
     $accepted = $false
     $preflightScript = Join-Path $PSScriptRoot "preflight.ps1"
-    $reviewerMd = Join-Path $PSScriptRoot "..\agents\reviewer.md"
-    $reviewerContent = if (Test-Path $reviewerMd) { [System.IO.File]::ReadAllText($reviewerMd, [System.Text.Encoding]::UTF8) } else { "" }
-    if ($reviewerContent -match "(?s)^---\r?\n.*?\r?\n---\r?\n(.*)$") {
-        $reviewerContent = $Matches[1].TrimStart()
-    }
+    $reviewerRoleConfig = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName "reviewer"
+    $reviewerContent = Get-AutoDevelopPromptTemplateBody -BasePath (Join-Path $PSScriptRoot "..") -RelativePath ([string]$reviewerRoleConfig.promptTemplatePath)
     $lastImplementOutput = ""
 
     for ($implementAttempt = 1; $implementAttempt -le $CONST_IMPLEMENT_ATTEMPTS; $implementAttempt++) {

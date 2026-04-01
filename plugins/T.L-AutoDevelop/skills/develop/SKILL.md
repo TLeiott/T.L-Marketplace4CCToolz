@@ -14,7 +14,7 @@ Your job is to:
 - run the shared prepare check before queue orchestration
 - resolve the argument as a direct task or a task file
 - maintain the shared scheduler queue
-- invoke the read-only `scheduler-agent` for conservative wave planning
+- invoke the config-driven scheduler role for conservative wave planning
 - start background task pipes when the current wave allows them
 - prepare normal merges one by one
 - ask the user to test interactive tasks before the final merge commit
@@ -42,6 +42,7 @@ From this point on, always work with the absolute solution path.
 
 Find `scheduler.ps1` from the installed plugin and derive:
 - `scheduler.ps1`
+- `planner-runner.ps1`
 - `claude-usage-gate.ps1`
 
 If `scheduler.ps1` cannot be found, stop.
@@ -194,23 +195,37 @@ Then snapshot the queue again so the full active queue now includes:
 
 Use compact snapshots for routine orchestration reads. Only fall back to the full snapshot view when you need detailed run history or deep debug data.
 
-## 9. Plan Waves with `scheduler-agent`
+## 9. Plan Waves with the scheduler role
 
-Use the `scheduler-agent` as a read-only subagent.
+Do not rely on the static `scheduler-agent` frontmatter for runtime model selection.
 
-Give it:
+Instead, run the config-driven planner script from the installed plugin:
+
+- `planner-runner.ps1`
+
+It reads `.claude/autodevelop.json` from the target repository and resolves the `scheduler` role there.
+
+Prepare these planner inputs first:
 - the full queue snapshot after registration
-- the new tasks added in this invocation
-- the current running tasks
-- the current pending-merge tasks
-- recent completed task discovery briefs from the latest queue snapshot
-- recent planner feedback from `plannerFeedbackSummary`
-- the nearest relevant `CLAUDE.md`, `AGENTS.md`, and `README.md`
-- up to three additional nearby `*.md` files from relevant module or `docs/` directories
+- the ids of the new tasks added in this invocation
 
-Use `completedTaskBriefs` only as advisory planning context for recently touched files, shared modules, and conflict risk. Do not treat them as hard dependency evidence when they are vague or failure-only.
+Write the queue snapshot to a UTF-8 JSON file.
 
-Ask it for a conservative whole-queue execution plan in JSON with:
+Write the new task ids to a UTF-8 JSON file as a string array.
+
+Then invoke:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<planner-runner.ps1>" -SolutionPath "<solution>" -SnapshotFile "<snapshot.json>" -NewTaskIdsFile "<new-task-ids.json>" -OutputFile "<plan.json>"
+```
+
+The planner script is responsible for reading:
+- `.claude/autodevelop.json`
+- the scheduler prompt template
+- the queue snapshot context
+- relevant markdown context
+
+The resulting JSON must contain:
 - `summary`
 - `tasks[]` containing `taskId`, `waveNumber`, `blockedBy`, `plannerMetadata`
 - `startableTaskIds`
@@ -227,7 +242,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode 
 Snapshot the queue again after applying the plan.
 
 If that snapshot reports `queueStall.status == "stalled"`, do one automatic stall-recovery cycle before any launch attempt:
-1. call the `scheduler-agent` again on the latest snapshot
+1. call the scheduler role runner again on the latest snapshot
 2. `apply-plan`
 3. `snapshot-queue` again
 4. only continue if the new snapshot is no longer stalled
@@ -314,7 +329,7 @@ Do not reduce this to only "started" / "queued" lines when richer progress data 
 Whenever `wait-queue` wakes or you are re-entered while tasks may have progressed, always do this in order:
 1. Snapshot the queue.
 2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
-   - call the `scheduler-agent` on the latest snapshot
+   - call the scheduler role runner on the latest snapshot
    - `apply-plan`
    - `snapshot-queue` again
    - if the same `queueStall.signature` is still stalled, report that the queue remains stalled and stop instead of looping
@@ -377,7 +392,7 @@ If merge preparation fails after a worker already produced an accepted branch, t
 
 ## 13. Replanning Rule
 
-Run the scheduler-agent planning pass whenever the queue materially changes:
+Run the scheduler role planning pass whenever the queue materially changes:
 - new task submission
 - task-file expansion
 - task completion
