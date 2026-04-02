@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "dgSpecHash": "wCNzJIE+U5o=",
+  "success": true,
+  "projectFilePath": "D:\\Repos\\T.L-Marketplace\\plugins\\T.L-Claude-Code-Custom\\src\\OpenRouterProxy.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\531 leiott tim\\.nuget\\packages\\microsoft.netcore.app.runtime.win-x64\\9.0.12\\microsoft.netcore.app.runtime.win-x64.9.0.12.nupkg.sha512",
+    "C:\\Users\\531 leiott tim\\.nuget\\packages\\microsoft.netcore.app.runtime.linux-x64\\9.0.12\\microsoft.netcore.app.runtime.linux-x64.9.0.12.nupkg.sha512",
+    "C:\\Users\\531 leiott tim\\.nuget\\packages\\microsoft.windowsdesktop.app.runtime.win-x64\\9.0.12\\microsoft.windowsdesktop.app.runtime.win-x64.9.0.12.nupkg.sha512",
+    "C:\\Users\\531 leiott tim\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.win-x64\\9.0.12\\microsoft.aspnetcore.app.runtime.win-x64.9.0.12.nupkg.sha512",
+    "C:\\Users\\531 leiott tim\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.linux-x64\\9.0.12\\microsoft.aspnetcore.app.runtime.linux-x64.9.0.12.nupkg.sha512",
+    "C:\\Users\\531 leiott tim\\.nuget\\packages\\microsoft.netcore.app.host.linux-x64\\9.0.12\\microsoft.netcore.app.host.linux-x64.9.0.12.nupkg.sha512"
+  ],
+  "logs": []
+}

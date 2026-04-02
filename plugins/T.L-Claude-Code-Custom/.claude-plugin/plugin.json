@@ -1,0 +1,8 @@
+{
+  "name": "T.L-Claude-Code-Custom",
+  "version": "1.0.0",
+  "description": "Launch Claude Code with custom OpenRouter models and provider routing. Skill: /init-add-claude-code-custom.",
+  "author": {
+    "name": "TLeiott"
+  }
+}

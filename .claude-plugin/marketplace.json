@@ -16,6 +16,12 @@
       "source": "./plugins/T.L-AutoDevelop-Pro",
       "description": "Autonomous addon for T.L-AutoDevelop. Skill: /TLA-develop. Uses the same prepare-aware queue scheduler and auto-commits prepared merges. Requires T.L-AutoDevelop.",
       "version": "4.2.12"
+    },
+    {
+      "name": "T.L-Claude-Code-Custom",
+      "source": "./plugins/T.L-Claude-Code-Custom",
+      "description": "Launch Claude Code with custom OpenRouter models and provider routing. Skill: /init-add-claude-code-custom.",
+      "version": "1.0.0"
     }
   ]
 }
