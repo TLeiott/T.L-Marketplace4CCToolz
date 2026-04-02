@@ -14,12 +14,13 @@ param(
 )
 
 . (Join-Path $PSScriptRoot "autodevelop-config.ps1")
+. (Join-Path $PSScriptRoot "autodevelop-role-runner.ps1")
 
-$CONST_MODEL_PLAN = "claude-opus-4-6"
-$CONST_MODEL_INVESTIGATE = "claude-opus-4-6"
-$CONST_MODEL_IMPLEMENT = "claude-opus-4-6"
-$CONST_MODEL_REVIEW = "claude-opus-4-6"
-$CONST_MODEL_FAST = "claude-sonnet-4-6"
+$CONST_MODEL_PLAN = "opus"
+$CONST_MODEL_INVESTIGATE = "opus"
+$CONST_MODEL_IMPLEMENT = "opus"
+$CONST_MODEL_REVIEW = "opus"
+$CONST_MODEL_FAST = "sonnet"
 $CONST_MAX_TURNS_DISCOVER = 12
 $CONST_MAX_TURNS_PLAN = 18
 $CONST_MAX_TURNS_DIRECTION_CHECK = 8
@@ -3030,42 +3031,14 @@ function Invoke-ClaudeWithTimeout {
         [string]$Model = ""
     )
     Ensure-DebugDir | Out-Null
-    $startedAt = Get-Date
-    $tempPromptFile = Join-Path $env:TEMP "claude-develop\claude-input-$([guid]::NewGuid()).md"
-    $tempOutputFile = Join-Path $env:TEMP "claude-develop\claude-output-$([guid]::NewGuid()).txt"
-    $tempDir = Split-Path $tempPromptFile -Parent
-    if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
     $debugSubdir = $PhaseName
 
     $roleConfig = Resolve-AutoDevelopRoleConfig -ConfigState $autoDevelopConfigState -RoleName $RoleName -ModelOverride $Model
     $resolvedTimeoutSec = Get-AutoDevelopResolvedTimeoutSeconds -RoleConfig $roleConfig -FallbackTimeoutSeconds $TimeoutSec
-    $extraArgs = Get-ClaudeRoleArguments -RoleConfig $roleConfig
+    $invokeResult = Invoke-AutoDevelopRole -Prompt $Prompt -RoleConfig $roleConfig -WorkingDirectory (Get-Location).Path -TimeoutSeconds $resolvedTimeoutSec -DebugTempPrefix "claude-develop-$RoleName"
+    $durationSeconds = [double]$invokeResult.durationSeconds
 
-    [System.IO.File]::WriteAllText($tempPromptFile, $Prompt, [System.Text.Encoding]::UTF8)
-
-    $claudeExe = Get-ClaudeExecutablePath -RoleConfig $roleConfig
-
-    $job = Start-Job -ScriptBlock {
-        param($exe, $promptFile, $extraArgs, $outFile, $workDir)
-        Set-Location $workDir
-        Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
-        $promptContent = [System.IO.File]::ReadAllText($promptFile, [System.Text.Encoding]::UTF8)
-        $allArgs = @("-p") + $extraArgs
-        try {
-            $output = $promptContent | & $exe @allArgs 2>&1 | Out-String
-            $exitCode = $LASTEXITCODE
-        } catch {
-            $output = "JOB_EXCEPTION: $_"
-            $exitCode = 99
-        }
-        [System.IO.File]::WriteAllText($outFile, "$exitCode`n$output", [System.Text.Encoding]::UTF8)
-    } -ArgumentList $claudeExe, $tempPromptFile, $extraArgs, $tempOutputFile, (Get-Location).Path
-
-    $completed = Wait-Job $job -Timeout $resolvedTimeoutSec
-    if (-not $completed -or $job.State -eq "Running") {
-        Stop-Job $job -ErrorAction SilentlyContinue
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
-        $durationSeconds = ((Get-Date) - $startedAt).TotalSeconds
+    if ($invokeResult.timedOut) {
         Save-Artifact -Name "$PhaseName-attempt-$Attempt-prompt.md" -Content $Prompt | Out-Null
         Save-JsonArtifact -Name "$PhaseName-attempt-$Attempt-meta.json" -Object ([ordered]@{
             phase = $PhaseName
@@ -3073,56 +3046,38 @@ function Invoke-ClaudeWithTimeout {
             model = $roleConfig.model
             exitCode = -1
             timeoutSeconds = $resolvedTimeoutSec
-            args = $extraArgs
+            args = @($invokeResult.arguments)
             role = $RoleName
+            cliProfile = $roleConfig.cliProfile
+            provider = $roleConfig.provider
+            modelClass = $roleConfig.modelClass
             reasoningEffort = $roleConfig.reasoningEffort
         }) | Out-Null
         Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content "TIMEOUT nach $resolvedTimeoutSec Sekunden" | Out-Null
-        Add-DebugSnapshot -SourcePath $tempPromptFile -TargetName "prompt.md" -Subdir $debugSubdir | Out-Null
         Save-DebugJson -Name "meta.json" -Object ([ordered]@{
             phase = $PhaseName
             attempt = $Attempt
             model = $roleConfig.model
             exitCode = -1
             timeoutSeconds = $resolvedTimeoutSec
-            args = $extraArgs
+            args = @($invokeResult.arguments)
             role = $RoleName
+            cliProfile = $roleConfig.cliProfile
+            provider = $roleConfig.provider
+            modelClass = $roleConfig.modelClass
             reasoningEffort = $roleConfig.reasoningEffort
-            claudeExe = $claudeExe
+            executable = $invokeResult.executable
             workingDirectory = (Get-Location).Path
-            tempPromptFile = $tempPromptFile
-            tempOutputFile = $tempOutputFile
             timedOut = $true
-            jobState = "Running"
         }) -Subdir $debugSubdir | Out-Null
         Save-DebugText -Name "output.txt" -Content "TIMEOUT nach $resolvedTimeoutSec Sekunden" -Subdir $debugSubdir | Out-Null
         Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $roleConfig.model -Prompt $Prompt -Output "TIMEOUT nach $resolvedTimeoutSec Sekunden" -DurationSeconds $durationSeconds -Success $false -TimedOut $true -ExitCode -1
-        Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
-        Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
         return @{ success = $false; output = "TIMEOUT nach $resolvedTimeoutSec Sekunden"; timedOut = $true; exitCode = -1 }
     }
 
-    $jobFailed = $job.State -eq "Failed"
-    $jobErrors = Receive-Job $job 2>&1 | Out-String
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
-
-    $rawOutput = ""
-    if (Test-Path $tempOutputFile) {
-        $rawOutput = [System.IO.File]::ReadAllText($tempOutputFile, [System.Text.Encoding]::UTF8)
-    }
-
-    $lines = $rawOutput -split "`n", 2
-    $exitCode = 0
-    $output = $rawOutput
-    if ($lines.Count -ge 2 -and $lines[0] -match "^\d+$") {
-        $exitCode = [int]$lines[0]
-        $output = $lines[1]
-    }
-    if ($jobFailed) {
-        $output = "JOB_FAILED: $jobErrors"
-        $exitCode = 99
-    }
-    $durationSeconds = ((Get-Date) - $startedAt).TotalSeconds
+    $exitCode = [int]$invokeResult.exitCode
+    $output = [string]$invokeResult.output
+    $jobFailed = -not $invokeResult.success
 
     Save-Artifact -Name "$PhaseName-attempt-$Attempt-prompt.md" -Content $Prompt | Out-Null
     Save-JsonArtifact -Name "$PhaseName-attempt-$Attempt-meta.json" -Object ([ordered]@{
@@ -3131,40 +3086,36 @@ function Invoke-ClaudeWithTimeout {
         model = $roleConfig.model
         exitCode = $exitCode
         timeoutSeconds = $resolvedTimeoutSec
-        args = $extraArgs
+        args = @($invokeResult.arguments)
         role = $RoleName
+        cliProfile = $roleConfig.cliProfile
+        provider = $roleConfig.provider
+        modelClass = $roleConfig.modelClass
         reasoningEffort = $roleConfig.reasoningEffort
         jobFailed = $jobFailed
     }) | Out-Null
     Save-Artifact -Name "$PhaseName-attempt-$Attempt-output.txt" -Content $output | Out-Null
-    Add-DebugSnapshot -SourcePath $tempPromptFile -TargetName "prompt.md" -Subdir $debugSubdir | Out-Null
-    Add-DebugSnapshot -SourcePath $tempOutputFile -TargetName "raw-output.txt" -Subdir $debugSubdir | Out-Null
     Save-DebugJson -Name "meta.json" -Object ([ordered]@{
         phase = $PhaseName
         attempt = $Attempt
         model = $roleConfig.model
         exitCode = $exitCode
         timeoutSeconds = $resolvedTimeoutSec
-        args = $extraArgs
+        args = @($invokeResult.arguments)
         role = $RoleName
+        cliProfile = $roleConfig.cliProfile
+        provider = $roleConfig.provider
+        modelClass = $roleConfig.modelClass
         reasoningEffort = $roleConfig.reasoningEffort
         jobFailed = $jobFailed
-        claudeExe = $claudeExe
+        executable = $invokeResult.executable
         workingDirectory = (Get-Location).Path
-        tempPromptFile = $tempPromptFile
-        tempOutputFile = $tempOutputFile
         timedOut = $false
         promptChars = $Prompt.Length
         outputChars = $output.Length
     }) -Subdir $debugSubdir | Out-Null
     Save-DebugText -Name "output.txt" -Content $output -Subdir $debugSubdir | Out-Null
-    if ($jobErrors.Trim()) {
-        Save-DebugText -Name "job-errors.txt" -Content $jobErrors -Subdir $debugSubdir | Out-Null
-    }
     Add-PhaseMetric -PhaseName $PhaseName -Attempt $Attempt -Model $roleConfig.model -Prompt $Prompt -Output $output -DurationSeconds $durationSeconds -Success ($exitCode -eq 0) -TimedOut $false -ExitCode $exitCode
-
-    Remove-Item $tempPromptFile -ErrorAction SilentlyContinue
-    Remove-Item $tempOutputFile -ErrorAction SilentlyContinue
 
     return @{ success = ($exitCode -eq 0); output = $output; timedOut = $false; exitCode = $exitCode }
 }

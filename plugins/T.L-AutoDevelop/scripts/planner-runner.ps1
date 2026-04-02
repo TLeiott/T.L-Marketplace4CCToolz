@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "autodevelop-config.ps1")
+. (Join-Path $PSScriptRoot "autodevelop-role-runner.ps1")
 
 function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments, [string]$WorkingDirectory = "")
@@ -130,68 +131,6 @@ function Format-MarkdownContextBlock {
     return ($parts -join "`n`n")
 }
 
-function Invoke-ClaudePlanner {
-    param(
-        [string]$Prompt,
-        $RoleConfig,
-        [string]$WorkingDirectory,
-        [int]$TimeoutSeconds
-    )
-
-    $tempPromptFile = Join-Path $env:TEMP ("autodev-planner-input-" + [guid]::NewGuid().ToString("N") + ".md")
-    $tempOutputFile = Join-Path $env:TEMP ("autodev-planner-output-" + [guid]::NewGuid().ToString("N") + ".txt")
-    $parent = Split-Path -Path $tempPromptFile -Parent
-    if (-not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    }
-
-    [System.IO.File]::WriteAllText($tempPromptFile, $Prompt, [System.Text.Encoding]::UTF8)
-    $exe = Get-ClaudeExecutablePath -RoleConfig $RoleConfig
-    $arguments = @("-p") + (Get-ClaudeRoleArguments -RoleConfig $RoleConfig)
-
-    $job = Start-Job -ScriptBlock {
-        param($Executable, $PromptFile, $Args, $OutFile, $Location)
-        Set-Location $Location
-        Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
-        $content = [System.IO.File]::ReadAllText($PromptFile, [System.Text.Encoding]::UTF8)
-        try {
-            $output = $content | & $Executable @Args 2>&1 | Out-String
-            $exitCode = $LASTEXITCODE
-        } catch {
-            $output = "JOB_EXCEPTION: $_"
-            $exitCode = 99
-        }
-        [System.IO.File]::WriteAllText($OutFile, "$exitCode`n$output", [System.Text.Encoding]::UTF8)
-    } -ArgumentList $exe, $tempPromptFile, $arguments, $tempOutputFile, $WorkingDirectory
-
-    try {
-        $completed = Wait-Job $job -Timeout $TimeoutSeconds
-        if (-not $completed -or $job.State -eq "Running") {
-            Stop-Job $job -ErrorAction SilentlyContinue
-            throw "Planner role timed out after $TimeoutSeconds seconds."
-        }
-
-        $jobErrors = Receive-Job $job 2>&1 | Out-String
-        if ($job.State -eq "Failed") {
-            throw "Planner role job failed: $jobErrors"
-        }
-
-        $raw = [System.IO.File]::ReadAllText($tempOutputFile, [System.Text.Encoding]::UTF8)
-        $parts = $raw -split "`n", 2
-        $exitCode = if ($parts.Count -ge 1 -and $parts[0] -match '^\d+$') { [int]$parts[0] } else { 99 }
-        $output = if ($parts.Count -ge 2) { $parts[1] } else { $raw }
-        return [pscustomobject]@{
-            exitCode = $exitCode
-            output = $output.Trim()
-            command = $exe
-            args = $arguments
-        }
-    } finally {
-        Remove-Job $job -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $tempPromptFile, $tempOutputFile -ErrorAction SilentlyContinue
-    }
-}
-
 $resolvedSolution = Get-CanonicalPath -Path $SolutionPath
 if (-not (Test-Path -LiteralPath $resolvedSolution)) {
     throw "Solution path not found: $SolutionPath"
@@ -251,8 +190,8 @@ $(($snapshot | ConvertTo-Json -Depth 24))
 $markdownContext
 "@
 
-$result = Invoke-ClaudePlanner -Prompt $prompt -RoleConfig $schedulerRole -WorkingDirectory $repoRoot -TimeoutSeconds $resolvedTimeoutSeconds
-if ($result.exitCode -ne 0) {
+$result = Invoke-AutoDevelopRole -Prompt $prompt -RoleConfig $schedulerRole -WorkingDirectory $repoRoot -TimeoutSeconds $resolvedTimeoutSeconds -DebugTempPrefix "autodev-planner"
+if (-not $result.success) {
     throw "Planner role failed with exit code $($result.exitCode): $($result.output)"
 }
 

@@ -8,6 +8,7 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - `/develop-prepare`
 - `/pipe-feedback [optional: path-to-run-dir or task-id]`
 - `/autodev-config [show|set|init-example|validate]`
+- `/autodev-session [show|use <profile>|clear]`
 
 ## What V4 Does
 
@@ -15,8 +16,10 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - adds a prepare pass that reconciles queue state and cleans safe AutoDevelop-owned leftovers before new sessions
 - accepts either a direct task text or a file containing multiple tasks
 - uses the config-driven `scheduler` role to plan conservative execution waves
-- reads repo-local role config from `.claude/autodevelop.json`
-- resolves worker, reviewer, and scheduler runtime settings per role
+- reads repo-local execution profile config from `.claude/autodevelop.json`
+- resolves the active session execution profile from `.claude-develop-logs/session.json` or the repo default
+- resolves worker, reviewer, and scheduler runtime settings per role from shipped CLI profiles plus repo execution profiles
+- aggregates usage checks across all active CLI/provider/model-class combinations
 - starts multiple worker pipes asynchronously when their likely edit scopes are disjoint
 - lets `scheduler.ps1` wait for queue changes after launches instead of relying on external sleep-based polling
 - leaves successful worker changes on normal branches for later merge preparation
@@ -29,12 +32,18 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - `skills/develop-prepare/SKILL.md` — Explicit prepare and hygiene command
 - `skills/pipe-feedback/SKILL.md` — Post-run pipeline feedback and friction analysis
 - `skills/autodev-config/SKILL.md` — Repo-local AutoDevelop config inspector/editor
+- `skills/autodev-session/SKILL.md` — Session-local execution profile selector
 - `agents/scheduler-agent.md` — Scheduler prompt template body
 - `agents/reviewer.md` — Reviewer prompt template body
 - `scripts/scheduler.ps1` — Durable repo-local queue engine
 - `scripts/auto-develop.ps1` — Worker pipeline engine
 - `scripts/planner-runner.ps1` — Config-driven scheduler role runner
 - `scripts/autodevelop-config.ps1` — Shared AutoDevelop config and role resolution helpers
+- `scripts/autodevelop-role-runner.ps1` — Shared CLI-family role runner
+- `scripts/autodevelop-session.ps1` — Session-local execution profile state helper
+- `scripts/autodevelop-usage-gate.ps1` — Aggregated usage gate for all active CLI/profile/model combinations
+- `scripts/cli-profiles/*.json` — Shipped supported CLI profile manifests
+- `scripts/providers/*.ps1` — CLI-family adapters
 - `scripts/claude-usage-gate.ps1` — 5h usage probe helper
 - `scripts/preflight.ps1` — Deterministic validation checks
 
@@ -57,7 +66,12 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - AutoDevelop reads optional repo-local config from `.claude/autodevelop.json`
 - missing config falls back to built-in defaults
 - plugin updates do not overwrite repo config
-- role settings can explicitly define `command`, `model`, `reasoningEffort`, `maxTurns`, and `allowedTools`
-- an explicit role `model` pins that role to the configured model
-- if a role omits `model`, the existing runtime heuristics may still choose the fast or full model dynamically
+- config version `4` defines repo-local `executionProfiles`
+- shipped `cliProfile` manifests define which CLIs, providers, model classes, options, and usage probes are supported by this plugin build
+- an execution profile selects `cliProfile`, `provider`, `modelClass`, and options per role
+- a session-local selection in `.claude-develop-logs/session.json` can activate a different execution profile for the current Claude conversation
+- if no session profile is active, AutoDevelop uses `defaultExecutionProfile`
+- an explicit role `modelClass` pins that role to the configured model class
+- if a role omits `modelClass`, the built-in default or runtime override can still decide the effective model token
 - invalid config values fall back to built-in defaults with warnings instead of crashing the pipeline
+- unsupported CLI profiles are rejected; only shipped supported profiles may be used

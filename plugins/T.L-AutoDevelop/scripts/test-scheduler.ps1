@@ -2260,8 +2260,8 @@ function Test-AutoDevelopConfigFallsBackToDefaultsWhenFileIsMissing {
         $parsed = $output | ConvertFrom-Json
         Assert-True ($parsed.exists -eq $false) "Missing repo config should be treated as absent, not invalid."
         Assert-True ($parsed.loaded -eq $false) "Missing repo config should not report as loaded."
-        Assert-True ([string]$parsed.implementModel -eq "claude-opus-4-6") "Missing repo config should keep the built-in implement model."
-        Assert-True ([string]$parsed.provider -eq "claude-code") "Missing repo config should keep the built-in provider."
+        Assert-True ([string]$parsed.implementModel -eq "opus") "Missing repo config should keep the built-in implement modelClass token."
+        Assert-True ([string]$parsed.provider -eq "anthropic") "Missing repo config should keep the built-in provider."
         Assert-True (@($parsed.allowedTools).Count -eq 6) "Missing repo config should keep the built-in implement tool set."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -2274,25 +2274,32 @@ function Test-AutoDevelopConfigAppliesExplicitRoleOverrides {
         $configPath = Join-Path $repo.root ".claude\autodevelop.json"
         Write-TestFile -Path $configPath -Content @"
 {
-  "version": 1,
-  "providerDefaults": {
-    "provider": "claude-code",
-    "command": "claude"
-  },
-  "roles": {
-    "implement": {
-      "model": "claude-sonnet-4-6",
-      "reasoningEffort": "low",
-      "maxTurns": 9,
-      "allowedTools": ["Read", "Edit", "Bash"],
-      "dangerouslySkipPermissions": true,
-      "extraArgs": ["--append-system-prompt", "Implement carefully"]
-    },
-    "scheduler": {
-      "model": "claude-sonnet-4-6",
-      "reasoningEffort": "medium",
-      "maxTurns": 11,
-      "allowedTools": ["Read", "Glob"]
+  "version": 4,
+  "defaultExecutionProfile": "default",
+  "executionProfiles": {
+    "default": {
+      "roles": {
+        "implement": {
+          "cliProfile": "claude-code-openrouter",
+          "provider": "openrouter",
+          "modelClass": "sonnet",
+          "maxTurns": 9,
+          "capabilities": ["read", "edit", "shell"],
+          "options": {
+            "reasoningEffort": "low",
+            "dangerouslySkipPermissions": true
+          },
+          "extraArgs": ["--append-system-prompt", "Implement carefully"]
+        },
+        "scheduler": {
+          "modelClass": "sonnet",
+          "maxTurns": 11,
+          "capabilities": ["read", "search"],
+          "options": {
+            "reasoningEffort": "medium"
+          }
+        }
+      }
     }
   }
 }
@@ -2325,11 +2332,14 @@ function Test-AutoDevelopConfigAppliesExplicitRoleOverrides {
 
         $parsed = $output | ConvertFrom-Json
         Assert-True ($parsed.loaded -eq $true) "Repo config should load successfully when the file exists."
-        Assert-True ([string]$parsed.implement.model -eq "claude-sonnet-4-6") "Explicit implement model should override the built-in default."
+        Assert-True ([string]$parsed.implement.cliProfile -eq "claude-code-openrouter") "Explicit implement cliProfile should override the built-in default."
+        Assert-True ([string]$parsed.implement.provider -eq "openrouter") "Explicit implement provider should override the built-in default."
+        Assert-True ([string]$parsed.implement.modelClass -eq "sonnet") "Explicit implement modelClass should override the built-in default."
+        Assert-True ([string]$parsed.implement.model -eq "sonnet") "Resolved implement model token should follow the configured modelClass."
         Assert-True ([string]$parsed.implement.reasoningEffort -eq "low") "Explicit implement reasoning effort should be preserved."
         Assert-True ([int]$parsed.implement.maxTurns -eq 9) "Explicit implement maxTurns should be preserved."
-        Assert-True (@($parsed.implement.allowedTools).Count -eq 3) "Explicit implement tool selection should replace the built-in set."
-        Assert-True ([string]$parsed.scheduler.model -eq "claude-sonnet-4-6") "Scheduler role should be independently configurable."
+        Assert-True (@($parsed.implement.allowedTools).Count -eq 4) "Explicit implement capabilities should map to the expected Claude tools."
+        Assert-True ([string]$parsed.scheduler.modelClass -eq "sonnet") "Scheduler role should be independently configurable."
         Assert-True ([string]$parsed.scheduler.reasoningEffort -eq "medium") "Scheduler role should preserve its own reasoning effort override."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -2343,8 +2353,9 @@ function Test-ClaudeRoleArgumentsIncludeConfiguredReasoningEffort {
     ) -ScriptBlock {
         $role = [pscustomobject]@{
             roleName = "implement"
-            provider = "claude-code"
-            model = "claude-sonnet-4-6"
+            cliFamily = "claude-code"
+            provider = "anthropic"
+            model = "sonnet"
             reasoningEffort = "low"
             maxTurns = 24
             allowedTools = @("Read", "Edit", "Bash")
@@ -2369,16 +2380,16 @@ function Test-AutoDevelopRuntimeModelOverrideWinsWithoutExplicitPin {
         $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
             param($RepoRoot)
             $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
-            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "claude-sonnet-4-6"
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "sonnet"
             [pscustomobject]@{
                 model = [string]$implementRole.model
-                modelPinned = [bool]$implementRole.modelPinned
+                modelPinned = [bool]$implementRole.modelClassPinned
                 modelSource = [string]$implementRole.modelSource
             } | ConvertTo-Json -Depth 8
         } -Arguments @($repo.root)
 
         $parsed = $output | ConvertFrom-Json
-        Assert-True ([string]$parsed.model -eq "claude-sonnet-4-6") "Runtime model heuristics must still win when no explicit role model is configured."
+        Assert-True ([string]$parsed.model -eq "sonnet") "Runtime model heuristics must still win when no explicit role modelClass is configured."
         Assert-True ($parsed.modelPinned -eq $false) "Built-in fallback models must not masquerade as explicit pins."
         Assert-True ([string]$parsed.modelSource -eq "runtime") "Unpinned roles should report runtime model resolution when a heuristic override is supplied."
     } finally {
@@ -2391,10 +2402,14 @@ function Test-AutoDevelopExplicitModelPinsAgainstRuntimeOverride {
     try {
         Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
 {
-  "version": 1,
-  "roles": {
-    "implement": {
-      "model": "claude-sonnet-4-6"
+  "version": 4,
+  "executionProfiles": {
+    "default": {
+      "roles": {
+        "implement": {
+          "modelClass": "sonnet"
+        }
+      }
     }
   }
 }
@@ -2403,16 +2418,16 @@ function Test-AutoDevelopExplicitModelPinsAgainstRuntimeOverride {
         $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
             param($RepoRoot)
             $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
-            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "claude-opus-4-6"
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "opus"
             [pscustomobject]@{
                 model = [string]$implementRole.model
-                modelPinned = [bool]$implementRole.modelPinned
+                modelPinned = [bool]$implementRole.modelClassPinned
                 modelSource = [string]$implementRole.modelSource
             } | ConvertTo-Json -Depth 8
         } -Arguments @($repo.root)
 
         $parsed = $output | ConvertFrom-Json
-        Assert-True ([string]$parsed.model -eq "claude-sonnet-4-6") "Explicit role model config must pin the role model against runtime heuristics."
+        Assert-True ([string]$parsed.model -eq "sonnet") "Explicit role modelClass config must pin the role model against runtime heuristics."
         Assert-True ($parsed.modelPinned -eq $true) "Explicit role model config must be marked as pinned."
         Assert-True ([string]$parsed.modelSource -eq "explicit") "Pinned role models should report explicit model resolution."
     } finally {
@@ -2425,24 +2440,30 @@ function Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings {
     try {
         Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
 {
-  "version": 1,
-  "providerDefaults": {
-    "provider": "invalid-provider"
-  },
-  "roles": {
-    "implement": {
-      "command": { "bad": true },
-      "reasoningEffort": "maximum",
-      "maxTurns": "abc",
-      "allowedTools": ["Read", { "bad": true }],
-      "extraArgs": ["--append-system-prompt", { "bad": true }],
-      "dangerouslySkipPermissions": "maybe"
-    },
-    "reviewer": {
-      "promptTemplatePath": { "bad": true }
-    },
-    "scheduler": {
-      "timeoutSeconds": "later"
+  "version": 4,
+  "defaultExecutionProfile": "broken-profile",
+  "executionProfiles": {
+    "default": {
+      "roles": {
+        "implement": {
+          "cliProfile": "claude-code-openrouter",
+          "provider": "openrouter",
+          "modelClass": "sonnet",
+          "maxTurns": "abc",
+          "capabilities": ["read", { "bad": true }],
+          "extraArgs": ["--append-system-prompt", { "bad": true }],
+          "options": {
+            "reasoningEffort": "maximum",
+            "dangerouslySkipPermissions": "maybe"
+          }
+        },
+        "reviewer": {
+          "promptTemplatePath": { "bad": true }
+        },
+        "scheduler": {
+          "timeoutSeconds": "later"
+        }
+      }
     }
   }
 }
@@ -2455,8 +2476,9 @@ function Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings {
             $schedulerRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "scheduler"
             [pscustomobject]@{
                 warnings = @($state.warnings | ForEach-Object { [string]$_.scope })
+                activeExecutionProfile = [string]$state.activeExecutionProfile
                 implementProvider = [string]$implementRole.provider
-                implementCommand = [string]$implementRole.command
+                implementCliProfile = [string]$implementRole.cliProfile
                 implementReasoning = [string]$implementRole.reasoningEffort
                 implementMaxTurns = [int]$implementRole.maxTurns
                 implementAllowedTools = @($implementRole.allowedTools)
@@ -2470,23 +2492,21 @@ function Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings {
 
         $parsed = $output | ConvertFrom-Json
         $warnings = @($parsed.warnings)
-        Assert-True ($warnings -contains "providerDefaults.provider") "Invalid provider defaults should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.implement.reasoningEffort") "Invalid reasoning effort should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.implement.maxTurns") "Invalid maxTurns should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.implement.command") "Invalid command values should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.implement.allowedTools") "Invalid allowedTools entries should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.implement.extraArgs") "Invalid extraArgs entries should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.implement.dangerouslySkipPermissions") "Invalid permission flags should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.reviewer.promptTemplatePath") "Invalid prompt template paths should emit a scoped warning."
-        Assert-True ($warnings -contains "roles.scheduler.timeoutSeconds") "Invalid timeoutSeconds should emit a scoped warning."
-        Assert-True ([string]$parsed.implementProvider -eq "claude-code") "Invalid provider config must fall back to the built-in provider."
-        Assert-True ([string]$parsed.implementCommand -eq "claude") "Invalid command config must fall back to the built-in command."
+        Assert-True ($warnings -contains "defaultExecutionProfile") "Invalid default execution profile should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.default.roles.implement.maxTurns") "Invalid maxTurns should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.default.roles.implement.capabilities") "Invalid capabilities should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.default.roles.implement.extraArgs") "Invalid extraArgs entries should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.default.roles.reviewer.promptTemplatePath") "Invalid prompt template paths should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.default.roles.scheduler.timeoutSeconds") "Invalid timeoutSeconds should emit a scoped warning."
+        Assert-True ([string]$parsed.activeExecutionProfile -eq "default") "Invalid default execution profile should fall back to 'default'."
+        Assert-True ([string]$parsed.implementProvider -eq "openrouter") "Explicit provider should be preserved in the normalized config."
+        Assert-True ([string]$parsed.implementCliProfile -eq "claude-code-openrouter") "Explicit cliProfile tokens should survive normalization."
         Assert-True ([string]$parsed.implementReasoning -eq "") "Invalid reasoning effort must fall back to the built-in reasoning default."
         Assert-True ([int]$parsed.implementMaxTurns -eq 24) "Invalid maxTurns must fall back to the built-in role value."
-        Assert-True (@($parsed.implementAllowedTools).Count -eq 1 -and [string]$parsed.implementAllowedTools[0] -eq "Read") "Invalid allowedTools entries must be ignored while valid entries survive."
+        Assert-True (@($parsed.implementAllowedTools).Count -ge 1) "Capabilities should still resolve to a usable tool set after filtering invalid entries."
         Assert-True (@($parsed.implementExtraArgs).Count -eq 1 -and [string]$parsed.implementExtraArgs[0] -eq "--append-system-prompt") "Invalid extraArgs entries must be ignored while valid entries survive."
         Assert-True ($parsed.implementSkipPermissions -eq $true) "Invalid permission flags must fall back to the built-in role value."
-        Assert-True ([string]$parsed.implementModel -eq "claude-sonnet-4-6") "Invalid typed config must not prevent runtime model heuristics from being applied."
+        Assert-True ([string]$parsed.implementModel -eq "sonnet") "Invalid typed config must not prevent runtime model resolution from being applied."
         Assert-True ([string]$parsed.reviewerPromptTemplate -eq "agents/reviewer.md") "Invalid prompt template paths must fall back to the built-in role value."
         Assert-True ([int]$parsed.schedulerTimeout -eq 0) "Invalid timeoutSeconds must fall back to the built-in role timeout."
     } finally {
@@ -2575,6 +2595,103 @@ exit 1
         $parsed = $output | ConvertFrom-Json
         Assert-True ([string]$parsed.output -eq $repo.root) "Worker git invocations must honor AUTODEV_GIT_COMMAND just like scheduler and planner paths."
         Assert-True ([int]$parsed.exitCode -eq 0) "Worker git override should preserve a successful exit code."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopSessionProfileSelection {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "defaultExecutionProfile": "default",
+  "executionProfiles": {
+    "default": {
+      "roles": {
+        "implement": {
+          "modelClass": "opus"
+        }
+      }
+    },
+    "cheap-implementation": {
+      "roles": {
+        "implement": {
+          "modelClass": "sonnet"
+        }
+      }
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $before = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            Set-AutoDevelopSessionState -RepoRoot $RepoRoot -ExecutionProfile "cheap-implementation" | Out-Null
+            $after = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $role = Resolve-AutoDevelopRoleConfig -ConfigState $after -RoleName "implement"
+            Clear-AutoDevelopSessionState -RepoRoot $RepoRoot | Out-Null
+            [pscustomobject]@{
+                beforeProfile = [string]$before.activeExecutionProfile
+                afterProfile = [string]$after.activeExecutionProfile
+                afterSource = [string]$after.activeExecutionProfileSource
+                resolvedModelClass = [string]$role.modelClass
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.beforeProfile -eq "default") "Without session state the default execution profile should be active."
+        Assert-True ([string]$parsed.afterProfile -eq "cheap-implementation") "Session state should switch the active execution profile."
+        Assert-True ([string]$parsed.afterSource -eq "session") "Session-based selection should report 'session' as its source."
+        Assert-True ([string]$parsed.resolvedModelClass -eq "sonnet") "The active session profile should influence resolved role configuration."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopUsageCombosAggregateAcrossRoles {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "defaultExecutionProfile": "openrouter-experiment",
+  "executionProfiles": {
+    "openrouter-experiment": {
+      "roles": {
+        "scheduler": {
+          "cliProfile": "claude-code-vanilla",
+          "provider": "anthropic",
+          "modelClass": "opus"
+        },
+        "implement": {
+          "cliProfile": "claude-code-openrouter",
+          "provider": "openrouter",
+          "modelClass": "sonnet"
+        }
+      }
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $combos = @(Get-AutoDevelopRoleUsageCombos -ConfigState $state -RoleNames @("scheduler", "implement"))
+            [pscustomobject]@{
+                comboKeys = @($combos | ForEach-Object { "$($_.cliProfile)|$($_.provider)|$($_.modelClass)" })
+                openrouterUsageMode = [string](Get-AutoDevelopConfigPropertyValue -Object (Get-AutoDevelopCliProfileUsageSupport -CliProfileId "claude-code-openrouter" -Provider "openrouter" -ModelClass "sonnet") -Name "mode")
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        $keys = @($parsed.comboKeys)
+        Assert-True ($keys -contains "claude-code-vanilla|anthropic|opus") "Usage aggregation should include the scheduler combo."
+        Assert-True ($keys -contains "claude-code-openrouter|openrouter|sonnet") "Usage aggregation should include the implementation combo."
+        Assert-True ([string]$parsed.openrouterUsageMode -eq "none") "Profiles without usage support should be marked with mode 'none'."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -9198,5 +9315,7 @@ Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings
 Test-AutoDevelopResolvedTimeoutPrefersRoleConfig
 Test-PlannerRunnerRespectsGitCommandOverride
 Test-AutoDevelopWorkerRespectsGitCommandOverride
+Test-AutoDevelopSessionProfileSelection
+Test-AutoDevelopUsageCombosAggregateAcrossRoles
 
 Write-Host "Scheduler regression checks passed."

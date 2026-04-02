@@ -43,7 +43,7 @@ From this point on, always work with the absolute solution path.
 Find `scheduler.ps1` from the installed plugin and derive:
 - `scheduler.ps1`
 - `planner-runner.ps1`
-- `claude-usage-gate.ps1`
+- `autodevelop-usage-gate.ps1`
 
 If `scheduler.ps1` cannot be found, stop.
 
@@ -142,10 +142,18 @@ Use this initial probe only to:
 - show the current 5h status to the user
 - confirm whether a fresh usage state can be retrieved
 
+The usage gate must resolve the active execution profile for this repository session first:
+- if `.claude-develop-logs/session.json` selects a valid execution profile, use that
+- otherwise use `defaultExecutionProfile` from `.claude/autodevelop.json`
+
+It must then aggregate all distinct CLI/provider/modelClass combinations used by that active execution profile.
+
 Interpret the initial probe strictly:
 - `processStatus == "fatal"`: stop and show the error.
 - `ok == true`: continue to queue planning.
 - `ok == false` or the script is unavailable: continue to queue planning, but do not treat the gate as launchable until a later fresh probe succeeds.
+
+If some combinations report `usage_not_supported`, surface that fact clearly but do not treat it as fatal by itself.
 
 Important:
 - Do not treat this initial probe as sufficient for the rest of the session.
