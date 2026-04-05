@@ -1,7 +1,7 @@
 {
   "name": "T.L-Claude-Code-Custom",
-  "version": "1.0.3",
-  "description": "Launch Claude Code with custom OpenRouter models and provider routing. Skill: /init-add-claude-code-custom.",
+  "version": "2.0.1",
+  "description": "Launch Claude Code with custom OpenRouter models and provider routing via claude-custom-proxy. Shared daemon proxy serves N concurrent sessions. Skills: /init-add-claude-code-custom, /proxy-up, /proxy-down.",
   "author": {
     "name": "TLeiott"
   }

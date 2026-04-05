@@ -1,42 +1,110 @@
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
-var builder = WebApplication.CreateBuilder(args);
-
+// --- Configuration ---
 var openRouterApiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")
     ?? throw new InvalidOperationException("OPENROUTER_API_KEY environment variable is not set.");
 
 var upstreamBase = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL")
     ?? "https://openrouter.ai/api";
 
-var defaultProvider = Environment.GetEnvironmentVariable("DEFAULT_PROVIDER") ?? "";
-var defaultAllowFallbacks = Environment.GetEnvironmentVariable("DEFAULT_ALLOW_FALLBACKS") != "false";
+var port = ResolvePort(args);
+
+// --- Builder ---
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+builder.Logging.SetMinimumLevel(LogLevel.Warning);
+builder.Logging.AddFilter("OpenRouterProxy", LogLevel.Information);
+
+builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+
+builder.Services.AddHttpClient("upstream", client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(10);
+});
 
 var app = builder.Build();
 
-app.UseMiddleware<OpenRouterProxyMiddleware>(openRouterApiKey, upstreamBase, defaultProvider, defaultAllowFallbacks);
+// --- Health endpoint (before middleware) ---
+app.MapGet("/health", () => Results.Ok(new { status = "ok", version = 2, port }));
+
+// --- Proxy middleware ---
+app.UseMiddleware<OpenRouterProxyMiddleware>(openRouterApiKey, upstreamBase);
+
+// --- Lock file lifecycle ---
+var lockFilePath = GetLockFilePath();
+var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+
+lifetime.ApplicationStarted.Register(() =>
+{
+    WriteLockFile(lockFilePath, port);
+    Console.Error.WriteLine($"OpenRouterProxy daemon listening on http://127.0.0.1:{port}");
+});
+
+lifetime.ApplicationStopping.Register(() => DeleteLockFile(lockFilePath));
+AppDomain.CurrentDomain.ProcessExit += (_, _) => DeleteLockFile(lockFilePath);
 
 app.Run();
+
+// --- Helpers ---
+
+static int ResolvePort(string[] args)
+{
+    for (int i = 0; i < args.Length - 1; i++)
+    {
+        if (args[i] == "--port" && int.TryParse(args[i + 1], out var p))
+            return p;
+    }
+    var envPort = Environment.GetEnvironmentVariable("PROXY_PORT");
+    if (envPort != null && int.TryParse(envPort, out var ep))
+        return ep;
+    return 18080;
+}
+
+static string GetLockFilePath()
+{
+    var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    var dir = Path.Combine(home, ".claude", "claude-custom");
+    Directory.CreateDirectory(dir);
+    return Path.Combine(dir, "proxy.lock");
+}
+
+static void WriteLockFile(string path, int port)
+{
+    var tmpPath = path + ".tmp";
+    var content = $"pid={Environment.ProcessId}\nport={port}\nstarted={DateTime.UtcNow:o}\nversion=2\n";
+    File.WriteAllText(tmpPath, content);
+    File.Move(tmpPath, path, overwrite: true);
+}
+
+static void DeleteLockFile(string path)
+{
+    try { File.Delete(path); } catch { }
+}
+
+// --- Middleware ---
 
 public class OpenRouterProxyMiddleware
 {
     private readonly RequestDelegate _next;
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly string _openRouterApiKey;
     private readonly string _upstreamBase;
-    private readonly string? _defaultProvider;
-    private readonly bool _defaultAllowFallbacks;
 
-    public OpenRouterProxyMiddleware(RequestDelegate next, string openRouterApiKey, string upstreamBase, string? defaultProvider, bool defaultAllowFallbacks)
+    public OpenRouterProxyMiddleware(RequestDelegate next, IHttpClientFactory httpClientFactory, string openRouterApiKey, string upstreamBase)
     {
         _next = next;
+        _httpClientFactory = httpClientFactory;
         _openRouterApiKey = openRouterApiKey;
         _upstreamBase = upstreamBase;
-        _defaultProvider = defaultProvider;
-        _defaultAllowFallbacks = defaultAllowFallbacks;
     }
 
     public async Task InvokeAsync(HttpContext context)
     {
-        var requestPath = context.Request.Path.Value ?? "/";
+        var rawPath = context.Request.Path.Value ?? "/";
+        var queryString = context.Request.QueryString.Value ?? "";
         var method = context.Request.Method;
 
         if (method == "OPTIONS")
@@ -47,10 +115,48 @@ public class OpenRouterProxyMiddleware
             return;
         }
 
-        var targetUri = new Uri(new Uri(_upstreamBase), requestPath.TrimStart('/'));
+        // --- Extract provider from URL path ---
+        string? provider = null;
+        string upstreamPath;
 
+        if (rawPath.StartsWith("/route/", StringComparison.OrdinalIgnoreCase))
+        {
+            var afterRoute = rawPath["/route/".Length..];
+            var slashIdx = afterRoute.IndexOf('/');
+            if (slashIdx < 0)
+            {
+                provider = Uri.UnescapeDataString(afterRoute);
+                upstreamPath = "/";
+            }
+            else
+            {
+                provider = Uri.UnescapeDataString(afterRoute[..slashIdx]);
+                upstreamPath = afterRoute[slashIdx..];
+            }
+
+            if (string.IsNullOrWhiteSpace(provider))
+            {
+                context.Response.StatusCode = 502;
+                context.Response.ContentType = "application/json";
+                var error = JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    error = "empty_provider",
+                    detail = "Provider extracted from /route/ prefix was empty."
+                });
+                await context.Response.Body.WriteAsync(error);
+                return;
+            }
+        }
+        else
+        {
+            upstreamPath = rawPath;
+        }
+
+        var targetUri = new Uri(new Uri(_upstreamBase), upstreamPath.TrimStart('/') + queryString);
+
+        // --- Read and optionally modify body ---
         byte[]? originalBody = null;
-        if (method == "POST" && requestPath.Contains("/v1/messages", StringComparison.OrdinalIgnoreCase))
+        if (method == "POST" && upstreamPath.Contains("/v1/messages", StringComparison.OrdinalIgnoreCase))
         {
             originalBody = await ReadBodyAsync(context.Request.Body);
         }
@@ -62,7 +168,7 @@ public class OpenRouterProxyMiddleware
             byte[] modifiedBody;
             try
             {
-                modifiedBody = InjectProviderRouting(originalBody, _defaultProvider, _defaultAllowFallbacks);
+                modifiedBody = InjectProviderRouting(originalBody, provider);
             }
             catch (Exception ex)
             {
@@ -72,7 +178,7 @@ public class OpenRouterProxyMiddleware
                 {
                     error = "provider_routing_failed",
                     detail = ex.Message,
-                    requested_provider = _defaultProvider
+                    requested_provider = provider
                 });
                 await context.Response.Body.WriteAsync(error);
                 return;
@@ -88,6 +194,7 @@ public class OpenRouterProxyMiddleware
                 upstreamRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(context.Request.ContentType);
         }
 
+        // --- Forward headers ---
         foreach (var header in context.Request.Headers)
         {
             var key = header.Key;
@@ -99,9 +206,8 @@ public class OpenRouterProxyMiddleware
 
         upstreamRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _openRouterApiKey);
 
-        using var httpClient = new HttpClient();
-        httpClient.Timeout = TimeSpan.FromMinutes(10);
-
+        // --- Send upstream ---
+        using var httpClient = _httpClientFactory.CreateClient("upstream");
         using var upstreamResponse = await httpClient.SendAsync(upstreamRequest, HttpCompletionOption.ResponseHeadersRead);
 
         context.Response.StatusCode = (int)upstreamResponse.StatusCode;
@@ -125,6 +231,10 @@ public class OpenRouterProxyMiddleware
             context.Response.ContentLength = null;
         }
 
+        // --- Post-flight: best-effort provider mismatch warning ---
+        // TODO: Check x-openrouter-provider response header when OpenRouter adds it
+        // For now, pre-flight provider.only + allow_fallbacks=false is the real defense.
+
         await upstreamResponse.Content.CopyToAsync(context.Response.Body);
     }
 
@@ -135,7 +245,7 @@ public class OpenRouterProxyMiddleware
         return ms.ToArray();
     }
 
-    private static byte[] InjectProviderRouting(byte[] originalBody, string? provider, bool allowFallbacks)
+    private static byte[] InjectProviderRouting(byte[] originalBody, string? provider)
     {
         if (string.IsNullOrEmpty(provider))
         {
@@ -148,7 +258,7 @@ public class OpenRouterProxyMiddleware
         var providerObj = new Dictionary<string, object?>
         {
             ["only"] = new[] { provider },
-            ["allow_fallbacks"] = allowFallbacks
+            ["allow_fallbacks"] = false
         };
 
         var output = new Dictionary<string, object?>();

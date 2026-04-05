@@ -28,4 +28,6 @@ if (-not $Model) {
     exit 1
 }
 
-Write-Output "$Model|$Provider"
+$port = if ($c.proxy -and $c.proxy.port) { $c.proxy.port } else { "18080" }
+
+Write-Output "$Model|$Provider|$port"

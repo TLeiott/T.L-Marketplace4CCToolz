@@ -4,17 +4,17 @@ Launch Claude Code with custom OpenRouter models and provider routing.
 
 ## What it does
 
-This plugin installs a user-global `claude-custom` command that:
+This plugin installs a user-global `claude-custom-proxy` command that:
 
-1. Starts a local proxy that speaks the Anthropic Messages API
+1. Runs a **shared proxy daemon** that speaks the Anthropic Messages API
 2. Routes requests to OpenRouter's Anthropic-compatible endpoint
-3. Injects OpenRouter provider routing (`provider.only`) into each request
-4. Launches stock `claude` pointed at the local proxy
+3. Injects OpenRouter provider routing (`provider.only`) per-request via URL path
+4. Launches stock `claude` pointed at the proxy
 
-This enables the exact UX you want:
+Multiple concurrent sessions share one daemon — 5 terminals, 1 proxy process.
 
 ```bash
-claude-custom --model minimax/minimax-m2.7 --provider minimax/fp8
+claude-custom-proxy --model minimax/minimax-m2.7 --provider minimax/fp8
 ```
 
 ## Why a proxy is needed
@@ -22,9 +22,28 @@ claude-custom --model minimax/minimax-m2.7 --provider minimax/fp8
 Claude Code supports custom gateways via `ANTHROPIC_BASE_URL`, but it has no built-in way to express OpenRouter provider-routing preferences like `minimax/fp8`. OpenRouter provider selection is a request-body concern (`provider.only`, `provider.order`), not a Claude CLI flag.
 
 The bundled proxy bridges this gap:
-- Claude Code talks Anthropic protocol to `127.0.0.1:<port>`
-- The proxy forwards to `https://openrouter.ai/api`
+- Claude Code talks Anthropic protocol to `127.0.0.1:{port}`
 - The proxy injects `provider.only: ["minimax/fp8"]` into each `/v1/messages` request body
+- Provider is encoded per-session in the URL path: `/route/minimax%2Ffp8/v1/messages`
+
+## Architecture (v2 — shared daemon)
+
+```
+Terminal 1 (minimax)  ─── ANTHROPIC_BASE_URL=.../route/minimax%2Ffp8 ───┐
+Terminal 2 (anthropic) ── ANTHROPIC_BASE_URL=.../route/anthropic ────────┤
+Terminal 3 (no provider) ─ ANTHROPIC_BASE_URL=.../ ─────────────────────┤
+                                                                        ▼
+                                                          ┌─────────────────────┐
+                                                          │  Shared Proxy :18080 │
+                                                          │  /health → 200       │
+                                                          │  /route/{prov}/...   │
+                                                          │  /v1/... (passthru)  │
+                                                          └──────────┬────────────┘
+                                                                     ▼
+                                                               OpenRouter API
+```
+
+The proxy writes a lock file at `~/.claude/claude-custom/proxy.lock` with PID, port, and start time. The launcher reads this to reuse a running daemon or detect stale state.
 
 ## Setup
 
@@ -32,7 +51,7 @@ The bundled proxy bridges this gap:
 
 - Claude Code installed (`claude` on PATH)
 - `OPENROUTER_API_KEY` environment variable set
-- .NET 9 runtime (for running the proxy from source) or use the prebuilt binaries
+- .NET 9 runtime (for building from source) or use the prebuilt binaries
 
 ### Install via the plugin skill
 
@@ -49,24 +68,52 @@ Then run:
 The skill will:
 1. Detect your OS
 2. Verify prerequisites
-3. Create `~/.claude/claude-custom.json` with defaults
+3. Create `~/.claude/claude-custom.json` with defaults (or migrate v1 config)
 4. Install the proxy binary to `~/.claude/claude-custom/`
-5. Install the launcher to `~/.local/bin/claude-custom`
+5. Install the launcher to `~/.local/bin/claude-custom-proxy`
 6. Verify PATH configuration
 
-### Manual setup
-
-**1. Set the API key** (add to your shell profile):
+## Usage
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-..."
+# Use default profile from config
+claude-custom-proxy
+
+# Explicit model and provider
+claude-custom-proxy --model minimax/minimax-m2.7 --provider minimax/fp8
+
+# Use a named profile
+claude-custom-proxy --profile minimax-fast
+
+# Override model on a named profile
+claude-custom-proxy --profile minimax-fast --model minimax/minimax-m2.7
+
+# Pass-through arguments to claude
+claude-custom-proxy --model minimax/minimax-m2.7 --provider minimax/fp8 -- -p "summarize this repo"
+
+# Stop the proxy daemon
+claude-custom-proxy --stop-proxy
 ```
 
-**2. Create the config file** at `~/.claude/claude-custom.json`:
+### Proxy lifecycle
+
+The proxy daemon starts automatically on first `claude-custom-proxy` invocation. You can also manage it explicitly:
+
+```
+/proxy-up         Start the daemon (or check status if running)
+/proxy-down       Stop the daemon
+```
+
+## Config file
+
+`~/.claude/claude-custom.json`
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "proxy": {
+    "port": 18080
+  },
   "defaultProfile": "default",
   "profiles": {
     "default": {
@@ -83,44 +130,10 @@ export OPENROUTER_API_KEY="sk-or-..."
 }
 ```
 
-**3. Install the proxy binary**:
-
-- Windows: copy `bin/win-x64/OpenRouterProxy.exe` to `~/.claude/claude-custom/`
-- Linux: copy `bin/linux-x64/OpenRouterProxy` to `~/.claude/claude-custom/` and `chmod +x`
-
-**4. Install the launcher**:
-
-- Windows: copy `scripts/launchers/claude-custom.cmd` to `~/.local/bin/`
-- Linux: copy `scripts/launchers/claude-custom` to `~/.local/bin/` and `chmod +x`
-
-**5. Ensure `~/.local/bin` is on PATH**.
-
-## Usage
-
-```bash
-# Use default profile from config
-claude-custom
-
-# Explicit model and provider
-claude-custom --model minimax/minimax-m2.7 --provider minimax/fp8
-
-# Use a named profile
-claude-custom --profile minimax-fast
-
-# Override model on a named profile
-claude-custom --profile minimax-fast --model minimax/minimax-m2.7
-
-# Pass-through arguments to claude
-claude-custom --model minimax/minimax-m2.7 --provider minimax/fp8 -- -p "summarize this repo"
-```
-
-## Config file
-
-`~/.claude/claude-custom.json`
-
 | Field | Description |
 |-------|-------------|
-| `version` | Config schema version (currently `1`) |
+| `version` | Config schema version (currently `2`) |
+| `proxy.port` | Port for the shared daemon (default: `18080`) |
 | `defaultProfile` | Profile name used when no `--profile` or `--model` is given |
 | `profiles.<name>.model` | OpenRouter model slug (e.g. `minimax/minimax-m2.7`) |
 | `profiles.<name>.provider` | OpenRouter provider slug (e.g. `minimax/fp8`) |
@@ -128,7 +141,7 @@ claude-custom --model minimax/minimax-m2.7 --provider minimax/fp8 -- -p "summari
 
 ## Provider routing
 
-The proxy injects this into every `/v1/messages` request body when a provider is configured:
+The proxy injects this into every `/v1/messages` request body when a provider is in the URL path:
 
 ```json
 {
@@ -140,6 +153,17 @@ The proxy injects this into every `/v1/messages` request body when a provider is
 ```
 
 This uses OpenRouter's documented `provider.only` field for strict single-provider selection. See [OpenRouter provider routing docs](https://openrouter.ai/docs/guides/routing/provider-selection).
+
+## Error handling
+
+The proxy **fails loud** — it never silently forwards an unrouted request that was meant to be routed:
+
+| Scenario | Behavior |
+|---|---|
+| Provider in URL, injection succeeds | Forward to OpenRouter |
+| Provider in URL, injection fails | **502** with error JSON |
+| Empty provider in URL | **502** with error JSON |
+| No provider in URL | Pure passthrough |
 
 ## Security
 
@@ -154,7 +178,9 @@ This uses OpenRouter's documented `provider.only` field for strict single-provid
 
 **`claude` not found**: Install Claude Code first. See [Claude Code docs](https://code.claude.com/docs/en/overview).
 
-**Proxy won't start**: Ensure the binary is executable. On Linux, run `chmod +x ~/.claude/claude-custom/OpenRouterProxy`.
+**Proxy won't start**: Check if port 18080 is in use. Change the port in `~/.claude/claude-custom.json` under `proxy.port`, or set `PROXY_PORT=NNNN` environment variable.
+
+**Stale lock file**: If the proxy crashed, the launcher auto-detects stale lock files and restarts. You can also manually run `claude-custom-proxy --stop-proxy` then retry.
 
 **Model not found**: Verify the model slug is valid on [OpenRouter's model list](https://openrouter.ai/models).
 
