@@ -82,7 +82,7 @@ The plugin ships prebuilt proxy binaries under `${CLAUDE_PLUGIN_ROOT}/bin/`.
    Create it if missing.
 
 2. Copy the correct binary:
-   - Windows: `bin/win-x64/OpenRouterProxy.exe` → target dir
+   - Windows: `bin/win-x64/OpenRouterProxy.exe` and `scripts/launchers/resolve-config.ps1` → target dir
    - Linux: `bin/linux-x64/OpenRouterProxy` → target dir, then `chmod +x`
 
 3. Verify the binary is executable by running it with `--help` or `--version` if supported.
@@ -96,8 +96,8 @@ Target:
 If a file already exists at the target path and it does not look like it was installed by this plugin, warn the user and ask for confirmation before overwriting.
 
 Write the launcher content from the plugin's `scripts/launchers/` directory:
-- Windows: copy `scripts/launchers/claude-custom.cmd`
-- Linux: copy `scripts/launchers/claude-custom` and `chmod +x`
+- Windows: copy `scripts/launchers/claude-custom.cmd` to `%USERPROFILE%\.local\bin\`
+- Linux: copy `scripts/launchers/claude-custom` to `~/.local/bin/` and `chmod +x`
 
 ### Step 6: Verify PATH
 

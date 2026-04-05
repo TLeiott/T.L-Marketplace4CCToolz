@@ -59,7 +59,24 @@ public class OpenRouterProxyMiddleware
 
         if (originalBody != null)
         {
-            var modifiedBody = InjectProviderRouting(originalBody, _defaultProvider, _defaultAllowFallbacks);
+            byte[] modifiedBody;
+            try
+            {
+                modifiedBody = InjectProviderRouting(originalBody, _defaultProvider, _defaultAllowFallbacks);
+            }
+            catch (Exception ex)
+            {
+                context.Response.StatusCode = 502;
+                context.Response.ContentType = "application/json";
+                var error = JsonSerializer.SerializeToUtf8Bytes(new
+                {
+                    error = "provider_routing_failed",
+                    detail = ex.Message,
+                    requested_provider = _defaultProvider
+                });
+                await context.Response.Body.WriteAsync(error);
+                return;
+            }
             upstreamRequest.Content = new ByteArrayContent(modifiedBody);
             upstreamRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
         }
@@ -125,42 +142,34 @@ public class OpenRouterProxyMiddleware
             return originalBody;
         }
 
-        try
-        {
-            using var doc = JsonDocument.Parse(originalBody);
-            var root = doc.RootElement.Clone();
+        using var doc = JsonDocument.Parse(originalBody);
+        var root = doc.RootElement.Clone();
 
-            var providerObj = new Dictionary<string, object?>
+        var providerObj = new Dictionary<string, object?>
+        {
+            ["only"] = new[] { provider },
+            ["allow_fallbacks"] = allowFallbacks
+        };
+
+        var output = new Dictionary<string, object?>();
+
+        foreach (var prop in root.EnumerateObject())
+        {
+            output[prop.Name] = prop.Value.ValueKind switch
             {
-                ["only"] = new[] { provider },
-                ["allow_fallbacks"] = allowFallbacks
+                JsonValueKind.String => prop.Value.GetString(),
+                JsonValueKind.Number => prop.Value.GetDouble(),
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Null => null,
+                JsonValueKind.Object => JsonSerializer.Deserialize<Dictionary<string, object?>>(prop.Value.GetRawText()),
+                JsonValueKind.Array => JsonSerializer.Deserialize<List<object?>>(prop.Value.GetRawText()),
+                _ => prop.Value.GetRawText()
             };
-
-            var output = new Dictionary<string, object?>();
-
-            foreach (var prop in root.EnumerateObject())
-            {
-                output[prop.Name] = prop.Value.ValueKind switch
-                {
-                    JsonValueKind.String => prop.Value.GetString(),
-                    JsonValueKind.Number => prop.Value.GetDouble(),
-                    JsonValueKind.True => true,
-                    JsonValueKind.False => false,
-                    JsonValueKind.Null => null,
-                    JsonValueKind.Object => JsonSerializer.Deserialize<Dictionary<string, object?>>(prop.Value.GetRawText()),
-                    JsonValueKind.Array => JsonSerializer.Deserialize<List<object?>>(prop.Value.GetRawText()),
-                    _ => prop.Value.GetRawText()
-                };
-            }
-
-            output["provider"] = providerObj;
-
-            var resultBytes = JsonSerializer.SerializeToUtf8Bytes(output);
-            return resultBytes;
         }
-        catch
-        {
-            return originalBody;
-        }
+
+        output["provider"] = providerObj;
+
+        return JsonSerializer.SerializeToUtf8Bytes(output);
     }
 }

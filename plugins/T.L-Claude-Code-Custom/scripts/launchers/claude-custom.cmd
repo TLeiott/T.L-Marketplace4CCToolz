@@ -63,7 +63,7 @@ echo Unknown argument: %~1
 exit /b 1
 :after_parse
 
-for /f "tokens=*" %%i in ('powershell -Command "$p='%PROFILE%'; $m='%MODEL%'; $pr='%PROVIDER%'; $c=Get-Content '%CONFIG_FILE%' -Raw ^| ConvertFrom-Json; if($p){ $prof=$c.profiles.$p; if(-not $prof){ Write-Error 'Profile not found: $p'; exit 1 }; $m=if($m){$m}else{$prof.model}; $pr=if($pr){$pr}else{$prof.provider} }; if(-not $m){ $def=$c.profiles.$($c.defaultProfile); $m=$def.model; $pr=$def.provider }; Write-Output \"$m^|$pr\""') do (
+for /f "tokens=*" %%i in ('powershell -ExecutionPolicy Bypass -File "%PROXY_DIR%\resolve-config.ps1" -ConfigFile "%CONFIG_FILE%" -Profile "%PROFILE%" -Model "%MODEL%" -Provider "%PROVIDER%"') do (
     set "RESOLVED=%%i"
 )
 
