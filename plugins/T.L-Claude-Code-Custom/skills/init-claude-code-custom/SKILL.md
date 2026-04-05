@@ -1,33 +1,30 @@
 ---
-name: init-add-claude-code-custom
-description: Install a user-global `claude-custom-proxy` launcher that routes Claude Code through OpenRouter with explicit provider routing (e.g. `claude-custom-proxy --model minimax/minimax-m2.7 --provider minimax/fp8`). Cross-platform: Windows and Linux.
+name: init-claude-code-custom
+description: Install `claude-custom` (direct API) and `claude-custom-proxy` (shared daemon) launchers, config, and proxy binary. Cross-platform: Windows and Linux.
 argument-hint: [install|show|validate|uninstall]
 disable-model-invocation: true
 ---
 
-# /init-add-claude-code-custom
+# /init-claude-code-custom
 
-Install, inspect, validate, or remove the user-global `claude-custom-proxy` launcher.
+Install, inspect, validate, or remove both `claude-custom` (direct) and `claude-custom-proxy` (daemon) launchers, the shared config, and the proxy daemon binary.
 
 ## Supported actions
 
 Interpret `$ARGUMENTS` like this:
 - empty or `install`: perform the full setup flow
-- `show`: display the current config, launcher location, and proxy daemon status
-- `validate`: check the config file, launcher, and proxy daemon for correctness
-- `uninstall`: remove the launcher, proxy, and config from the user's home
+- `show`: display the current config, launcher locations, and proxy daemon status
+- `validate`: check the config file, launchers, proxy binary, and daemon for correctness
+- `uninstall`: remove launchers, proxy binary, config, and lock file from the user's home
 
-## Architecture (v2 — shared daemon model)
+## Architecture
 
-This plugin ships three things:
+This plugin provides two launcher commands that share the same config file (`~/.claude/claude-custom.json`):
 
-1. **A local proxy daemon** (`OpenRouterProxy`) that speaks the Anthropic Messages API and forwards to OpenRouter, injecting `provider.only` into each request body. One shared daemon serves all concurrent Claude Code sessions.
-2. **A launcher script** (`claude-custom-proxy`) that ensures the daemon is running, then launches stock `claude` pointed at it with provider routing encoded in the URL path.
-3. **A user config file** (`~/.claude/claude-custom.json`) that stores profiles and proxy settings.
+1. **`claude-custom`** — connects directly to OpenRouter. No daemon, no proxy. The `OPENROUTER_API_KEY` env var is passed as `ANTHROPIC_API_KEY` directly to `claude`.
+2. **`claude-custom-proxy`** — ensures the OpenRouterProxy daemon is running, then launches stock `claude` through the local proxy with provider routing encoded in the URL path.
 
 The proxy daemon writes a lock file at `~/.claude/claude-custom/proxy.lock` containing its PID, port, and start time. The launcher reads this to reuse a running daemon or detect stale state.
-
-Provider routing is per-request via the URL path: `http://127.0.0.1:{port}/route/{url-encoded-provider}/v1/messages`. This allows different sessions to use different providers through the same proxy.
 
 The OpenRouter API key is read from the `OPENROUTER_API_KEY` environment variable. It is never written to disk by this plugin.
 
@@ -93,7 +90,7 @@ If migrating from v1, kill any running `OpenRouterProxy` processes that were sta
 
 Delete any stale lock files.
 
-### Step 4: Install the proxy binary
+### Step 4: Install the proxy binary and helpers
 
 The plugin ships prebuilt proxy binaries under `${CLAUDE_PLUGIN_ROOT}/bin/`.
 
@@ -106,30 +103,21 @@ The plugin ships prebuilt proxy binaries under `${CLAUDE_PLUGIN_ROOT}/bin/`.
    - Windows: `bin/win-x64/OpenRouterProxy.exe` and `scripts/launchers/resolve-config.ps1` → target dir
    - Linux: `bin/linux-x64/OpenRouterProxy` → target dir, then `chmod +x`
 
-3. Verify the binary is executable by running it with `--help` or `--version` if supported.
+3. Verify the binary exists after copy.
 
-### Step 5: Install the launcher
+### Step 5: Install both launchers
 
-Target:
-- Windows: `%USERPROFILE%\.local\bin\claude-custom-proxy.cmd`
-- Linux: `~/.local/bin/claude-custom-proxy`
+**`claude-custom-proxy` launcher:**
+- Windows: copy `scripts/launchers/claude-custom-proxy.cmd` to `%USERPROFILE%\.local\bin\claude-custom-proxy.cmd`
+- Linux: copy `scripts/launchers/claude-custom-proxy` to `~/.local/bin/claude-custom-proxy` and `chmod +x`
 
-If a file already exists at the target path and it does not look like it was installed by this plugin, warn the user and ask for confirmation before overwriting.
+If the file already exists and was not installed by this plugin, warn the user and ask for confirmation before overwriting.
 
-Write the launcher content from the plugin's `scripts/launchers/` directory:
-- Windows: copy `scripts/launchers/claude-custom-proxy.cmd` to `%USERPROFILE%\.local\bin\`
-- Linux: copy `scripts/launchers/claude-custom-proxy` to `~/.local/bin/` and `chmod +x`
+**`claude-custom` launcher:**
+- Windows: copy `scripts/launchers/claude-custom.cmd` to `%USERPROFILE%\.local\bin\claude-custom.cmd`
+- Linux: copy `scripts/launchers/claude-custom` to `~/.local/bin/claude-custom` and `chmod +x`
 
-The launcher invokes `claude --dangerously-skip-permissions` by default so that proxy-routed sessions run without interactive permission prompts.
-
-#### Step 5b: Remove old launcher (rename migration)
-
-The command was renamed from `claude-custom` to `claude-custom-proxy`. If the old launcher exists, delete it:
-
-- Windows: delete `%USERPROFILE%\.local\bin\claude-custom.cmd` if it exists
-- Linux: delete `~/.local/bin/claude-custom` if it exists
-
-Report the removal to the user. If it does not exist, skip silently.
+If the file already exists and was not installed by this plugin, warn the user and ask for confirmation before overwriting.
 
 ### Step 6: Verify PATH
 
@@ -144,15 +132,17 @@ If not, print instructions for adding it to PATH. On most modern Linux distros, 
 After successful install, print:
 
 ```
-claude-custom-proxy v2.0.1 installed successfully (shared daemon model).
+claude-custom v2.2.2 installed successfully. Both launchers configured.
 
-Examples:
+Proxy launcher (strict provider routing):
   claude-custom-proxy
   claude-custom-proxy --model minimax/minimax-m2.7 --provider minimax/fp8
   claude-custom-proxy --profile default
-  claude-custom-proxy --model anthropic/claude-sonnet-4.6 --provider anthropic
-  claude-custom-proxy --model minimax/minimax-m2.7 --provider minimax/fp8 -- -p "summarize this repo"
-  claude-custom-proxy --stop-proxy
+
+Direct launcher (simple API routing):
+  claude-custom
+  claude-custom --model anthropic/claude-sonnet-4.6
+  claude-custom --profile default
 
 Proxy lifecycle:
   /proxy-up         Start the proxy daemon
@@ -162,7 +152,6 @@ Proxy lifecycle:
 Config file: ~/.claude/claude-custom.json
 Proxy dir:   ~/.claude/claude-custom/
 Lock file:   ~/.claude/claude-custom/proxy.lock
-Launcher:    ~/.local/bin/claude-custom-proxy
 
 Required env: OPENROUTER_API_KEY
 ```
@@ -176,7 +165,7 @@ When showing status, surface:
 - Config file location, version, and current `defaultProfile`
 - Configured proxy port
 - Defined profiles and their model/provider
-- Launcher file location
+- Both launcher file locations (proxy + direct)
 - Proxy binary location
 - **Proxy daemon status**: running/stopped, PID, port, uptime (read from lock file + health check)
 
@@ -185,19 +174,20 @@ When showing status, surface:
 Run these checks:
 1. Config file is valid JSON and has `version: 2`.
 2. Each profile has `model` and `provider` fields.
-3. Launcher file exists and is executable.
-4. Proxy binary exists and is executable.
-5. `claude` resolves on PATH.
-6. `OPENROUTER_API_KEY` is set.
-7. **Proxy health**: `GET http://127.0.0.1:{port}/health` returns 200.
-8. **Lock file**: exists, PID matches a running process.
+3. Both launcher files exist and are executable.
+4. Proxy binary exists.
+5. `resolve-config.ps1` exists.
+6. `claude` resolves on PATH.
+7. `OPENROUTER_API_KEY` is set.
+8. **Proxy health**: if running, `GET http://127.0.0.1:{port}/health` returns 200.
+9. **Lock file**: if exists, PID matches a running process.
 
-Report each check as pass/fail with a clear message.
+Report each check as pass/fail or N/A (if proxy not running) with a clear message.
 
 ## Uninstall flow
 
 1. Stop the proxy daemon (read lock file, kill PID, delete lock file).
-2. Remove the launcher file.
+2. Remove both launcher files.
 3. Remove the proxy install dir (`~/.claude/claude-custom/`).
 4. Optionally remove the config file (ask the user).
 5. Print a confirmation message.

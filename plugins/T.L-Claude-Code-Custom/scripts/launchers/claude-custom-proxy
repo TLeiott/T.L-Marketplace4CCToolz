@@ -76,20 +76,20 @@ if [ "$STOP_PROXY" -eq 1 ]; then
 fi
 
 # --- Resolve config ---
-RESOLVED=$(python3 -c "
-import json, sys
-with open('$CONFIG_FILE') as f:
+RESOLVED=$(PROFILE="$PROFILE" MODEL="$MODEL" PROVIDER="$PROVIDER" python3 -c "
+import json, os, sys
+prof = os.environ.get('PROFILE', '')
+model = os.environ.get('MODEL', '')
+provider = os.environ.get('PROVIDER', '')
+with open(os.path.expanduser('~/.claude/claude-custom.json')) as f:
     c = json.load(f)
-profile = '$PROFILE'
-model = '$MODEL'
-provider = '$PROVIDER'
-if profile:
-    prof = c.get('profiles', {}).get(profile)
-    if not prof:
-        print(f'Profile not found: {profile}', file=sys.stderr)
+if prof:
+    p = c.get('profiles', {}).get(prof)
+    if not p:
+        print(f'Profile not found: {prof}', file=sys.stderr)
         sys.exit(1)
-    model = model or prof.get('model')
-    provider = provider or prof.get('provider')
+    model = model or p.get('model')
+    provider = provider or p.get('provider')
 if not model:
     default = c.get('defaultProfile', 'default')
     def_prof = c.get('profiles', {}).get(default, {})

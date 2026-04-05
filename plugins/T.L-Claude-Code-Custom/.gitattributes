@@ -4,6 +4,7 @@
 
 # Linux scripts: LF
 scripts/launchers/claude-custom-proxy text eol=lf
+scripts/launchers/claude-custom text eol=lf
 
 # Everything else: auto
 * text=auto

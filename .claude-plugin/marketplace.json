@@ -22,6 +22,12 @@
       "source": "./plugins/T.L-Claude-Code-Custom",
       "description": "Launch Claude Code with custom OpenRouter models and provider routing. Skill: /init-add-claude-code-custom.",
       "version": "1.0.0"
+    },
+    {
+      "name": "T.L-Benchmark",
+      "source": "./plugins/T.L-Benchmark",
+      "description": "Benchmark orchestrator — runs benchmark suites against CLI+model combos (claude/opencode). Skills: quick or full mode.",
+      "version": "1.0.0"
     }
   ]
 }
