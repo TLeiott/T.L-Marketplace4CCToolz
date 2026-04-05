@@ -1,0 +1,8 @@
+{
+  "name": "T.L-Benchmark",
+  "version": "1.0.0",
+  "description": "Benchmark orchestrator — runs benchmark suites against CLI+model combos. Supports claude and opencode CLIs with quick (12 tasks) or full mode.",
+  "author": {
+    "name": "TLeiott"
+  }
+}
