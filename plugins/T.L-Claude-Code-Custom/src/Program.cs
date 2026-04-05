@@ -8,7 +8,7 @@ var openRouterApiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")
 var upstreamBase = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL")
     ?? "https://openrouter.ai/api";
 
-var defaultProvider = Environment.GetEnvironmentVariable("DEFAULT_PROVIDER");
+var defaultProvider = Environment.GetEnvironmentVariable("DEFAULT_PROVIDER") ?? "";
 var defaultAllowFallbacks = Environment.GetEnvironmentVariable("DEFAULT_ALLOW_FALLBACKS") != "false";
 
 var app = builder.Build();
