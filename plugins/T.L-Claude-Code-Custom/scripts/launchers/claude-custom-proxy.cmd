@@ -29,23 +29,12 @@ set "MODEL="
 set "PROVIDER="
 set "PROFILE="
 set "PASSTHROUGH="
-set "IN_PASSTHROUGH=0"
 set "STOP_PROXY=0"
 
 :parse
 if "%~1"=="" goto :after_parse
 if "%~1"=="--stop-proxy" (
     set "STOP_PROXY=1"
-    shift
-    goto :parse
-)
-if "%~1"=="--" (
-    set "IN_PASSTHROUGH=1"
-    shift
-    goto :parse
-)
-if !IN_PASSTHROUGH!==1 (
-    set "PASSTHROUGH=!PASSTHROUGH! %~1"
     shift
     goto :parse
 )
@@ -67,8 +56,9 @@ if "%~1"=="--profile" (
     shift
     goto :parse
 )
-echo Unknown argument: %~1
-exit /b 1
+set "PASSTHROUGH=!PASSTHROUGH! %1"
+shift
+goto :parse
 :after_parse
 
 REM --- Handle --stop-proxy ---

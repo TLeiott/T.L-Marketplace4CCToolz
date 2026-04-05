@@ -33,17 +33,12 @@ MODEL=""
 PROVIDER=""
 PROFILE=""
 PASSTHROUGH=()
-IN_PASSTHROUGH=0
 STOP_PROXY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stop-proxy)
             STOP_PROXY=1
-            shift
-            ;;
-        --)
-            IN_PASSTHROUGH=1
             shift
             ;;
         --model)
@@ -59,12 +54,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            if [[ "$IN_PASSTHROUGH" == "1" ]]; then
-                PASSTHROUGH+=("$1")
-            else
-                echo "Unknown argument: $1"
-                exit 1
-            fi
+            PASSTHROUGH+=("$1")
             shift
             ;;
     esac
