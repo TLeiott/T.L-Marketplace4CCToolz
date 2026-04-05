@@ -165,6 +165,10 @@ The proxy **fails loud** — it never silently forwards an unrouted request that
 | Empty provider in URL | **502** with error JSON |
 | No provider in URL | Pure passthrough |
 
+## Permissions
+
+The launcher passes `--dangerously-skip-permissions` to `claude` by default, so proxy-routed sessions run without interactive permission prompts. To override this, pass `-- --no-dangerously-skip-permissions` via the passthrough args.
+
 ## Security
 
 - The OpenRouter API key is read from the `OPENROUTER_API_KEY` environment variable only

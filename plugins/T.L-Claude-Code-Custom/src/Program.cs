@@ -6,7 +6,11 @@ var openRouterApiKey = Environment.GetEnvironmentVariable("OPENROUTER_API_KEY")
     ?? throw new InvalidOperationException("OPENROUTER_API_KEY environment variable is not set.");
 
 var upstreamBase = Environment.GetEnvironmentVariable("OPENROUTER_BASE_URL")
-    ?? "https://openrouter.ai/api";
+    ?? "https://openrouter.ai/api/";
+
+// Ensure trailing slash — Uri relative resolution requires it
+if (!upstreamBase.EndsWith('/'))
+    upstreamBase += '/';
 
 var port = ResolvePort(args);
 
@@ -218,9 +222,14 @@ public class OpenRouterProxyMiddleware
 
         context.Response.StatusCode = (int)upstreamResponse.StatusCode;
 
+        // Filter hop-by-hop headers — HttpClient already decoded Transfer-Encoding
         foreach (var header in upstreamResponse.Headers)
         {
-            context.Response.Headers.Append(header.Key, header.Value.ToArray());
+            var key = header.Key;
+            if (key.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase)) continue;
+            if (key.Equals("Connection", StringComparison.OrdinalIgnoreCase)) continue;
+            if (key.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase)) continue;
+            context.Response.Headers.Append(key, header.Value.ToArray());
         }
 
         if (upstreamResponse.Content.Headers.ContentType != null)

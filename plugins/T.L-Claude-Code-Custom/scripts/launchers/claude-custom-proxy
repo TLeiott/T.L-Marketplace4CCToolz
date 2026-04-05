@@ -178,4 +178,4 @@ fi
 export ANTHROPIC_AUTH_TOKEN="local"
 export ANTHROPIC_API_KEY=""
 
-claude --model "$RESOLVED_MODEL" "${PASSTHROUGH[@]}"
+claude --dangerously-skip-permissions --model "$RESOLVED_MODEL" "${PASSTHROUGH[@]}"

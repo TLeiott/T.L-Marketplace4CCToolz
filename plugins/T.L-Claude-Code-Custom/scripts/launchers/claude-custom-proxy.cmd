@@ -160,4 +160,4 @@ set "ANTHROPIC_BASE_URL=http://127.0.0.1:!PROXY_PORT!"
 set "ANTHROPIC_AUTH_TOKEN=local"
 set "ANTHROPIC_API_KEY="
 
-claude --model !RESOLVED_MODEL!!PASSTHROUGH!
+claude --dangerously-skip-permissions --model !RESOLVED_MODEL!!PASSTHROUGH!

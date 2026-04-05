@@ -120,6 +120,17 @@ Write the launcher content from the plugin's `scripts/launchers/` directory:
 - Windows: copy `scripts/launchers/claude-custom-proxy.cmd` to `%USERPROFILE%\.local\bin\`
 - Linux: copy `scripts/launchers/claude-custom-proxy` to `~/.local/bin/` and `chmod +x`
 
+The launcher invokes `claude --dangerously-skip-permissions` by default so that proxy-routed sessions run without interactive permission prompts.
+
+#### Step 5b: Remove old launcher (rename migration)
+
+The command was renamed from `claude-custom` to `claude-custom-proxy`. If the old launcher exists, delete it:
+
+- Windows: delete `%USERPROFILE%\.local\bin\claude-custom.cmd` if it exists
+- Linux: delete `~/.local/bin/claude-custom` if it exists
+
+Report the removal to the user. If it does not exist, skip silently.
+
 ### Step 6: Verify PATH
 
 Check whether the user bin dir is on PATH:
