@@ -107,6 +107,12 @@ public class OpenRouterProxyMiddleware
         var queryString = context.Request.QueryString.Value ?? "";
         var method = context.Request.Method;
 
+        if (rawPath.Equals("/health", StringComparison.OrdinalIgnoreCase))
+        {
+            await _next(context);
+            return;
+        }
+
         if (method == "OPTIONS")
         {
             context.Response.Headers.Append("Access-Control-Allow-Origin", "*");
