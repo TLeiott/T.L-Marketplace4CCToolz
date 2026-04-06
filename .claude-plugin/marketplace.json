@@ -28,6 +28,12 @@
       "source": "./plugins/T.L-Benchmark",
       "description": "Benchmark orchestrator — runs benchmark suites against CLI+model combos (claude/opencode). Skills: quick or full mode.",
       "version": "1.0.0"
+    },
+    {
+      "name": "T.L-Stats-Pro",
+      "source": "./plugins/T.L-Stats-Pro",
+      "description": "Install and manage CCMeter (Claude Code usage statistics TUI) with a custom launch alias. Skill: /init-T.L-Stats-Pro.",
+      "version": "1.0.0"
     }
   ]
 }
