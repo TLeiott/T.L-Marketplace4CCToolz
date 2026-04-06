@@ -19,9 +19,11 @@ var port = ResolvePort(args);
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Logging.ClearProviders();
-builder.Logging.AddConsole();
-builder.Logging.SetMinimumLevel(LogLevel.Warning);
-builder.Logging.AddFilter("OpenRouterProxy", LogLevel.Information);
+builder.Logging.AddConsole(options =>
+{
+    options.LogToStandardErrorThreshold = LogLevel.Trace;
+});
+builder.Logging.SetMinimumLevel(LogLevel.Information);
 
 builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
 
@@ -97,13 +99,15 @@ public class OpenRouterProxyMiddleware
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly string _openRouterApiKey;
     private readonly string _upstreamBase;
+    private readonly ILogger<OpenRouterProxyMiddleware> _logger;
 
-    public OpenRouterProxyMiddleware(RequestDelegate next, IHttpClientFactory httpClientFactory, string openRouterApiKey, string upstreamBase)
+    public OpenRouterProxyMiddleware(RequestDelegate next, IHttpClientFactory httpClientFactory, string openRouterApiKey, string upstreamBase, ILogger<OpenRouterProxyMiddleware> logger)
     {
         _next = next;
         _httpClientFactory = httpClientFactory;
         _openRouterApiKey = openRouterApiKey;
         _upstreamBase = upstreamBase;
+        _logger = logger;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -165,16 +169,60 @@ public class OpenRouterProxyMiddleware
 
         var targetUri = new Uri(new Uri(_upstreamBase), upstreamPath.TrimStart('/') + queryString);
 
-        // --- Read and optionally modify body ---
+        // --- Log incoming request ---
+        _logger.LogInformation("======== REQUEST ========");
+        _logger.LogInformation(">> {Method} {Path} -> {TargetUri}", method, rawPath, targetUri);
+        _logger.LogInformation(">> Provider: {Provider}", provider ?? "(none)");
+        _logger.LogInformation(">> Client headers:");
+        foreach (var h in context.Request.Headers)
+        {
+            var val = h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)
+                   || h.Key.Equals("x-api-key", StringComparison.OrdinalIgnoreCase)
+                ? $"{h.Value.ToString()[..Math.Min(16, h.Value.ToString().Length)]}..." : h.Value.ToString();
+            _logger.LogInformation(">>   {Key}: {Value}", h.Key, val);
+        }
+
+        // --- Read body for ALL POST requests (not just /v1/messages) ---
         byte[]? originalBody = null;
-        if (method == "POST" && upstreamPath.Contains("/v1/messages", StringComparison.OrdinalIgnoreCase))
+        if (method == "POST" || method == "PUT" || method == "PATCH")
         {
             originalBody = await ReadBodyAsync(context.Request.Body);
+            // Log body details
+            if (originalBody.Length > 0)
+            {
+                try
+                {
+                    using var bodyDoc = JsonDocument.Parse(originalBody);
+                    var bodyRoot = bodyDoc.RootElement;
+                    var model = bodyRoot.TryGetProperty("model", out var m) ? m.GetString() : null;
+                    var msgCount = bodyRoot.TryGetProperty("messages", out var msgs) ? msgs.GetArrayLength() : -1;
+                    var stream = bodyRoot.TryGetProperty("stream", out var s) && s.GetBoolean();
+                    var maxTokens = bodyRoot.TryGetProperty("max_tokens", out var mt) ? mt.GetInt32() : -1;
+
+                    _logger.LogInformation(">> Body ({Bytes} bytes):", originalBody.Length);
+                    if (model != null) _logger.LogInformation(">>   model: {Model}", model);
+                    if (msgCount >= 0) _logger.LogInformation(">>   messages: {Count}", msgCount);
+                    if (maxTokens >= 0) _logger.LogInformation(">>   max_tokens: {MaxTokens}", maxTokens);
+                    _logger.LogInformation(">>   stream: {Stream}", stream);
+
+                    // Log all top-level keys
+                    var keys = new List<string>();
+                    foreach (var prop in bodyRoot.EnumerateObject())
+                        keys.Add(prop.Name);
+                    _logger.LogInformation(">>   all keys: [{Keys}]", string.Join(", ", keys));
+                }
+                catch
+                {
+                    // Not JSON — log raw preview
+                    _logger.LogInformation(">> Body ({Bytes} bytes, non-JSON): {Preview}",
+                        originalBody.Length, Encoding.UTF8.GetString(originalBody[..Math.Min(200, originalBody.Length)]));
+                }
+            }
         }
 
         using var upstreamRequest = new HttpRequestMessage(new HttpMethod(method), targetUri);
 
-        if (originalBody != null)
+        if (originalBody != null && upstreamPath.Contains("/v1/messages", StringComparison.OrdinalIgnoreCase))
         {
             byte[] modifiedBody;
             try
@@ -197,6 +245,13 @@ public class OpenRouterProxyMiddleware
             upstreamRequest.Content = new ByteArrayContent(modifiedBody);
             upstreamRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
         }
+        else if (originalBody != null && originalBody.Length > 0)
+        {
+            // POST/PUT/PATCH to non-messages endpoint — forward body as-is
+            upstreamRequest.Content = new ByteArrayContent(originalBody);
+            if (context.Request.ContentType != null)
+                upstreamRequest.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(context.Request.ContentType);
+        }
         else if (context.Request.ContentLength > 0)
         {
             var bodyBytes = await ReadBodyAsync(context.Request.Body);
@@ -217,11 +272,44 @@ public class OpenRouterProxyMiddleware
 
         upstreamRequest.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _openRouterApiKey);
 
+        // Log outgoing upstream headers
+        _logger.LogInformation(">> Upstream headers:");
+        foreach (var h in upstreamRequest.Headers)
+        {
+            var val = h.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase)
+                ? $"{string.Join(",", h.Value)[..Math.Min(20, string.Join(",", h.Value).Length)]}..."
+                : string.Join(",", h.Value);
+            _logger.LogInformation(">>   {Key}: {Value}", h.Key, val);
+        }
+
         // --- Send upstream ---
         using var httpClient = _httpClientFactory.CreateClient("upstream");
         using var upstreamResponse = await httpClient.SendAsync(upstreamRequest, HttpCompletionOption.ResponseHeadersRead);
 
-        context.Response.StatusCode = (int)upstreamResponse.StatusCode;
+        var statusCode = (int)upstreamResponse.StatusCode;
+        _logger.LogInformation("======== RESPONSE ========");
+        _logger.LogInformation("<< {StatusCode} {ContentType}",
+            statusCode,
+            upstreamResponse.Content.Headers.ContentType?.MediaType ?? "(none)");
+        foreach (var h in upstreamResponse.Headers)
+            _logger.LogInformation("<<   {Key}: {Value}", h.Key, string.Join(",", h.Value));
+
+        // --- Translate non-2xx errors into Anthropic format so Claude Code shows the real message ---
+        if (statusCode >= 400)
+        {
+            var errorBody = await TranslateErrorResponseAsync(upstreamResponse, statusCode);
+            if (errorBody != null)
+            {
+                _logger.LogInformation("<< Translated error: {Error}", Encoding.UTF8.GetString(errorBody));
+                context.Response.StatusCode = statusCode;
+                context.Response.ContentType = "application/json";
+                context.Response.ContentLength = errorBody.Length;
+                await context.Response.Body.WriteAsync(errorBody);
+                return;
+            }
+        }
+
+        context.Response.StatusCode = statusCode;
 
         // Filter hop-by-hop headers — HttpClient already decoded Transfer-Encoding
         foreach (var header in upstreamResponse.Headers)
@@ -317,6 +405,57 @@ public class OpenRouterProxyMiddleware
         return JsonSerializer.SerializeToUtf8Bytes(output);
     }
 
+    // --- Error translation ---
+
+    /// Translates OpenRouter error responses into Anthropic API format
+    /// so Claude Code can parse and display the actual error message.
+    private static async Task<byte[]?> TranslateErrorResponseAsync(
+        HttpResponseMessage response, int statusCode)
+    {
+        try
+        {
+            var bytes = await response.Content.ReadAsByteArrayAsync();
+            var json = Encoding.UTF8.GetString(bytes);
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            // Extract message from OpenRouter format: {"error":{"message":"...","code":N,"metadata":{...}}}
+            string? message = null;
+            if (root.TryGetProperty("error", out var errorObj) && errorObj.ValueKind == JsonValueKind.Object)
+            {
+                if (errorObj.TryGetProperty("message", out var msg))
+                    message = msg.GetString();
+                // Include metadata.raw if present (has the real upstream error)
+                if (errorObj.TryGetProperty("metadata", out var meta) && meta.TryGetProperty("raw", out var raw))
+                    message = raw.GetString() ?? message;
+            }
+
+            if (message == null) return null;
+
+            // Map status code to Anthropic error type
+            var errorType = statusCode switch
+            {
+                401 => "authentication_error",
+                403 => "permission_error",
+                404 => "not_found_error",
+                429 => "rate_limit_error",
+                >= 500 => "api_error",
+                _ => "api_error"
+            };
+
+            // Return Anthropic-format error: {"type":"error","error":{"type":"...","message":"..."}}
+            return JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                type = "error",
+                error = new { type = errorType, message }
+            });
+        }
+        catch
+        {
+            return null; // If parsing fails, let the original response through
+        }
+    }
+
     // --- Usage normalization ---
 
     /// Reads SSE line-by-line, forwarding non-target events immediately.
@@ -327,7 +466,7 @@ public class OpenRouterProxyMiddleware
         var lineBuffer = new StringBuilder();
         var dataLines = new List<string>();
         var eventLines = new List<string>();
-        await using var writer = new StreamWriter(dest, Encoding.UTF8, 1024, leaveOpen: true);
+        await using var writer = new StreamWriter(dest, new UTF8Encoding(false), 1024, leaveOpen: true);
         writer.AutoFlush = true;
 
         var buffer = new byte[1];
@@ -349,7 +488,7 @@ public class OpenRouterProxyMiddleware
                 if (string.IsNullOrEmpty(line))
                 {
                     await ProcessSseEventAsync(dataLines, eventLines, writer, ct);
-                    await writer.WriteLineAsync();
+                    await writer.WriteAsync("\n");
                     dataLines.Clear();
                     eventLines.Clear();
                 }
@@ -372,7 +511,7 @@ public class OpenRouterProxyMiddleware
                     if (string.IsNullOrEmpty(line))
                     {
                         await ProcessSseEventAsync(dataLines, eventLines, writer, ct);
-                        await writer.WriteLineAsync();
+                        await writer.WriteAsync("\n");
                         dataLines.Clear();
                         eventLines.Clear();
                     }
@@ -389,7 +528,7 @@ public class OpenRouterProxyMiddleware
                     if (string.IsNullOrEmpty(line))
                     {
                         await ProcessSseEventAsync(dataLines, eventLines, writer, ct);
-                        await writer.WriteLineAsync();
+                        await writer.WriteAsync("\n");
                         dataLines.Clear();
                         eventLines.Clear();
                     }
@@ -421,7 +560,7 @@ public class OpenRouterProxyMiddleware
         if (dataLines.Count == 0)
         {
             foreach (var line in eventLines)
-                await writer.WriteLineAsync(line);
+                await writer.WriteAsync(line + "\n");
             return;
         }
 
@@ -437,12 +576,13 @@ public class OpenRouterProxyMiddleware
                 var modified = NormalizeMessageDeltaUsage(fullPayload);
                 if (modified != null)
                 {
-                    await writer.WriteLineAsync("data: " + modified);
+                    // Emit non-data lines first (event: type, etc.), then data
                     foreach (var line in eventLines)
                     {
                         if (!line.StartsWith("data: "))
-                            await writer.WriteLineAsync(line);
+                            await writer.WriteAsync(line + "\n");
                     }
+                    await writer.WriteAsync("data: " + modified + "\n");
                     return;
                 }
                 break;
@@ -450,7 +590,7 @@ public class OpenRouterProxyMiddleware
         }
 
         foreach (var line in eventLines)
-            await writer.WriteLineAsync(line);
+            await writer.WriteAsync(line + "\n");
     }
 
     /// Normalizes the usage field in a message_delta SSE event payload.

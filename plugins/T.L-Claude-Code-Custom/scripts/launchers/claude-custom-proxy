@@ -137,7 +137,7 @@ fi
 
 # --- Start proxy if not running ---
 if [ "$PROXY_RUNNING" -eq 0 ]; then
-    "$PROXY_BIN" --port "$PROXY_PORT" >/dev/null 2>&1 &
+    "$PROXY_BIN" --port "$PROXY_PORT" >/dev/null 2>"$PROXY_DIR/proxy.log" &
     disown
 
     RETRIES=0

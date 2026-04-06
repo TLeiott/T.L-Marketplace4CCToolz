@@ -118,7 +118,7 @@ del "%LOCK_FILE%" 2>nul
 REM --- Start proxy if not running ---
 if !PROXY_RUNNING!==1 goto :proxy_ready
 
-start /b "" "%PROXY_EXE%" --port !PROXY_PORT! >nul 2>&1
+start /b "" "%PROXY_EXE%" --port !PROXY_PORT! >nul 2>"%PROXY_DIR%\proxy.log"
 set "RETRIES=0"
 
 :health_loop

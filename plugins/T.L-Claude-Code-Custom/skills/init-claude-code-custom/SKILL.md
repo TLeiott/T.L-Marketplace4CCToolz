@@ -1,13 +1,13 @@
 ---
 name: init-claude-code-custom
-description: Install `claude-custom` (direct API) and `claude-custom-proxy` (shared daemon) launchers, config, and proxy binary. Cross-platform: Windows and Linux.
-argument-hint: [install|show|validate|uninstall]
+description: Fresh-install `claude-custom` and `claude-custom-proxy` launchers, config, and proxy binary. Use `/update-claude-code-custom` to update after a plugin version bump.
+argument-hint: [install|show|validate]
 disable-model-invocation: true
 ---
 
 # /init-claude-code-custom
 
-Install, inspect, validate, or remove both `claude-custom` (direct) and `claude-custom-proxy` (daemon) launchers, the shared config, and the proxy daemon binary.
+Fresh-install both launchers, shared config, and proxy daemon binary. **Refuses to run if already installed** — use `/update-claude-code-custom` to update, or `/cleanup` then re-init for a fresh start.
 
 ## Supported actions
 
@@ -15,7 +15,6 @@ Interpret `$ARGUMENTS` like this:
 - empty or `install`: perform the full setup flow
 - `show`: display the current config, launcher locations, and proxy daemon status
 - `validate`: check the config file, launchers, proxy binary, and daemon for correctness
-- `uninstall`: remove launchers, proxy binary, config, and lock file from the user's home
 
 ## Architecture
 
@@ -40,7 +39,17 @@ Determine the current OS. Use `Bash` to run:
 
 Set a variable `osKind` to `windows` or `linux`.
 
-### Step 2: Verify prerequisites
+### Step 2: Guard — already installed?
+
+Check if `~/.claude/claude-custom.json` exists. If it does, **abort** with this message:
+
+```
+Already installed. Use /update-claude-code-custom to update after a plugin version bump, or /cleanup then /init-claude-code-custom for a fresh install.
+```
+
+Do NOT proceed with the install flow.
+
+### Step 3: Verify prerequisites
 
 Run these checks and abort with actionable messages if any fail:
 
@@ -51,11 +60,11 @@ Run these checks and abort with actionable messages if any fail:
    - Linux: `~/.local/bin`
    Create it if missing.
 
-### Step 3: Create or migrate the config file
+### Step 4: Create the config file
 
 Target: `~/.claude/claude-custom.json`
 
-**If it does not exist**, create it with this content:
+Create it with this content:
 
 ```json
 {
@@ -74,23 +83,7 @@ Target: `~/.claude/claude-custom.json`
 }
 ```
 
-**If it exists with `version: 1`** (or no version field), migrate it:
-1. Add the `proxy` section with default port `18080`.
-2. Set `version` to `2`.
-3. Preserve all existing profiles unchanged.
-4. Report the migration to the user.
-
-**If it exists with `version: 2`**, read it and report the current `defaultProfile` and defined profiles. Do not overwrite without explicit user confirmation.
-
-### Step 3b: Kill orphan proxies (migration only)
-
-If migrating from v1, kill any running `OpenRouterProxy` processes that were started by the old per-session model:
-- Windows: `taskkill /IM OpenRouterProxy.exe /F`
-- Linux: `pkill -f OpenRouterProxy`
-
-Delete any stale lock files.
-
-### Step 4: Install the proxy binary and helpers
+### Step 5: Install the proxy binary and helpers
 
 The plugin ships prebuilt proxy binaries under `${CLAUDE_PLUGIN_ROOT}/bin/`.
 
@@ -105,21 +98,17 @@ The plugin ships prebuilt proxy binaries under `${CLAUDE_PLUGIN_ROOT}/bin/`.
 
 3. Verify the binary exists after copy.
 
-### Step 5: Install both launchers
+### Step 6: Install both launchers
 
 **`claude-custom-proxy` launcher:**
 - Windows: copy `scripts/launchers/claude-custom-proxy.cmd` to `%USERPROFILE%\.local\bin\claude-custom-proxy.cmd`
 - Linux: copy `scripts/launchers/claude-custom-proxy` to `~/.local/bin/claude-custom-proxy` and `chmod +x`
 
-If the file already exists and was not installed by this plugin, warn the user and ask for confirmation before overwriting.
-
 **`claude-custom` launcher:**
 - Windows: copy `scripts/launchers/claude-custom.cmd` to `%USERPROFILE%\.local\bin\claude-custom.cmd`
 - Linux: copy `scripts/launchers/claude-custom` to `~/.local/bin/claude-custom` and `chmod +x`
 
-If the file already exists and was not installed by this plugin, warn the user and ask for confirmation before overwriting.
-
-### Step 6: Verify PATH
+### Step 7: Verify PATH
 
 Check whether the user bin dir is on PATH:
 - Windows: `%USERPROFILE%\.local\bin`
@@ -127,12 +116,12 @@ Check whether the user bin dir is on PATH:
 
 If not, print instructions for adding it to PATH. On most modern Linux distros, `~/.local/bin` is auto-added by `~/.profile` if it exists.
 
-### Step 7: Print usage examples
+### Step 8: Print usage examples
 
 After successful install, print:
 
 ```
-claude-custom v2.2.2 installed successfully. Both launchers configured.
+claude-custom v{VERSION} installed successfully. Both launchers configured.
 
 Proxy launcher (strict provider routing):
   claude-custom-proxy
@@ -184,20 +173,8 @@ Run these checks:
 
 Report each check as pass/fail or N/A (if proxy not running) with a clear message.
 
-## Uninstall flow
-
-1. Stop the proxy daemon (read lock file, kill PID, delete lock file).
-2. Remove both launcher files.
-3. Remove the proxy install dir (`~/.claude/claude-custom/`).
-4. Optionally remove the config file (ask the user).
-5. Print a confirmation message.
-
 ## Rules
 
 Use `Read`, `Glob`, `Grep`, `Bash`, `Write`, `Edit`.
 
 Do not write the OpenRouter API key to any file. It must come from the environment.
-
-Do not overwrite an existing config file without explicit user confirmation (except for v1→v2 migration which preserves profiles).
-
-Do not overwrite an existing launcher file that was not installed by this plugin without explicit user confirmation.

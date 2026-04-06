@@ -1,78 +1,88 @@
 ---
 name: cleanup
-description: Remove stale artifacts — old launchers, orphan proxy processes, dead lock files.
+description: Full uninstall — remove all installed files (binary, launchers, config, proxy dir). After cleanup, /init-claude-code-custom can do a fresh install.
 disable-model-invocation: true
 ---
 
 # /cleanup
 
-Remove stale artifacts left by previous versions or unclean shutdowns.
+Fully remove everything installed by `/init-claude-code-custom`. After cleanup, the system is as if the init was never run.
 
-## Behavior
+## Flow
+
+Run these steps in order.
 
 ### Step 1: Detect OS
 
 Determine the current OS:
-- Windows: check `$env:OS` or `$IsWindows`
+- Windows: check for Windows-style paths or `$env:OS`
 - Linux: `uname -s`
 
 Set `osKind` to `windows` or `linux`.
 
-### Step 2: Remove old launchers (rename migration)
+### Step 2: Stop proxy daemon
 
-The command was renamed from `claude-custom` to `claude-custom-proxy`. Delete the old launcher if it exists:
+Read `~/.claude/claude-custom/proxy.lock`. If it exists:
 
-- Windows: `%USERPROFILE%\.local\bin\claude-custom.cmd`
-- Linux: `~/.local/bin/claude-custom`
-
-If the file exists and is deleted, report it. If it does not exist, skip silently.
-
-### Step 3: Clean stale lock file
-
-Read `~/.claude/claude-custom/proxy.lock`. If the file exists:
-
-1. Extract `pid` from the lock file.
-2. Check if the PID is alive and belongs to `OpenRouterProxy`:
-   - Windows: `tasklist /FI "PID eq {pid}" /NH` — look for `OpenRouterProxy`
-   - Linux: `ps -p {pid} -o comm=` — check output contains `OpenRouterProxy`
-3. If the PID is **dead** or not an `OpenRouterProxy` process, delete the lock file and report it.
-4. If the PID is **alive** and matches, leave it alone (healthy daemon).
-
-### Step 4: Kill orphan proxy processes
-
-Find all `OpenRouterProxy` processes not tracked by a valid lock file:
-
-- Windows: `tasklist /FI "IMAGENAME eq OpenRouterProxy.exe" /FO CSV /NH` — parse each PID
-- Linux: `pgrep -f OpenRouterProxy` — list all PIDs
-
-For each discovered PID:
-1. If a valid lock file exists (survived Step 3) and its `pid` matches, skip it (active daemon).
-2. Otherwise, kill the process:
+1. Extract `pid`.
+2. Kill the process:
    - Windows: `taskkill /PID {pid} /F`
    - Linux: `kill {pid}`
-3. Report each killed orphan with its PID.
+3. Report: "Stopped proxy (PID {pid})."
 
-### Step 5: Report summary
+Also kill any orphan `OpenRouterProxy` processes:
+- Windows: `taskkill /IM OpenRouterProxy.exe /F`
+- Linux: `pkill -f OpenRouterProxy`
 
-Print a summary:
+### Step 3: Remove launcher scripts
+
+Remove these files from the user bin dir. Report each removal. Skip silently if a file doesn't exist.
+
+- Windows (`%USERPROFILE%\.local\bin\`):
+  - `claude-custom-proxy.cmd`
+  - `claude-custom.cmd`
+- Linux (`~/.local/bin/`):
+  - `claude-custom-proxy`
+  - `claude-custom`
+
+### Step 4: Remove proxy directory
+
+Remove the entire directory and all its contents:
+- Windows: `%USERPROFILE%\.claude\claude-custom\`
+- Linux: `~/.claude/claude-custom/`
+
+This removes: `OpenRouterProxy.exe` (or `OpenRouterProxy`), `resolve-config.ps1`, `proxy.lock`, `proxy.log`, `web.config`, `.pdb`, and any other files.
+
+Report: "Removed proxy directory."
+
+### Step 5: Remove config file
+
+Remove `~/.claude/claude-custom.json`.
+
+Report: "Removed config file."
+
+### Step 6: Report summary
+
+Print:
 
 ```
-Cleanup complete.
-  Old launchers removed: {n}
-  Stale lock files removed: {n}
-  Orphan processes killed: {n}
+Cleanup complete — full uninstall.
+  Proxy stopped: {yes/no}
+  Launchers removed: {list}
+  Proxy directory removed: {yes/no}
+  Config file removed: {yes/no}
+
+Run /init-claude-code-custom to reinstall.
 ```
 
-If nothing was found, print:
+## What is NOT removed
 
-```
-Nothing to clean up. Environment is clean.
-```
+- `~/.claude/` directory (shared by Claude Code)
+- `~/.local/bin/` directory (may contain other tools)
+- Any other Claude Code settings or data
 
 ## Rules
 
 Use `Bash`, `Read`.
 
-Do not stop a proxy process that is tracked by a valid (live-PID) lock file.
-
-Do not modify config files, the proxy binary, or the current launcher.
+Do not remove anything outside of the directories listed above.
