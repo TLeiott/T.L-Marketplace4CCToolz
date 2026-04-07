@@ -1,0 +1,8 @@
+{
+  "name": "T.L-Stats-Pro",
+  "version": "1.0.0",
+  "description": "Install and manage CCMeter (Claude Code usage statistics TUI) with a custom alias. Skill: /init-T.L-Stats-Pro.",
+  "author": {
+    "name": "TLeiott"
+  }
+}

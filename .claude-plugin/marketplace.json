@@ -8,14 +8,32 @@
     {
       "name": "T.L-AutoDevelop",
       "source": "./plugins/T.L-AutoDevelop",
-      "description": "Interactive queue-aware .NET dev orchestration. Skills: /develop, /develop-prepare, and /pipe-feedback. Task text and task files share one scheduler-driven queue.",
-      "version": "4.2.22"
+      "description": "Interactive queue-aware .NET dev orchestration. Skills: /develop, /develop-prepare, /pipe-feedback, and /autodev-config. Task text and task files share one scheduler-driven queue.",
+      "version": "4.4.0"
     },
     {
       "name": "T.L-AutoDevelop-Pro",
       "source": "./plugins/T.L-AutoDevelop-Pro",
       "description": "Autonomous addon for T.L-AutoDevelop. Skill: /TLA-develop. Uses the same prepare-aware queue scheduler and auto-commits prepared merges. Requires T.L-AutoDevelop.",
       "version": "4.2.12"
+    },
+    {
+      "name": "T.L-Claude-Code-Custom",
+      "source": "./plugins/T.L-Claude-Code-Custom",
+      "description": "Launch Claude Code with custom OpenRouter models and provider routing. Skill: /init-add-claude-code-custom.",
+      "version": "1.0.0"
+    },
+    {
+      "name": "T.L-Benchmark",
+      "source": "./plugins/T.L-Benchmark",
+      "description": "Benchmark orchestrator — runs benchmark suites against CLI+model combos (claude/opencode). Skills: quick or full mode.",
+      "version": "1.0.0"
+    },
+    {
+      "name": "T.L-Stats-Pro",
+      "source": "./plugins/T.L-Stats-Pro",
+      "description": "Install and manage CCMeter (Claude Code usage statistics TUI) with a custom launch alias. Skill: /init-T.L-Stats-Pro.",
+      "version": "1.0.0"
     }
   ]
 }

@@ -1,0 +1,10 @@
+# Windows scripts: CRLF
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Linux scripts: LF
+scripts/launchers/claude-custom-proxy text eol=lf
+scripts/launchers/claude-custom text eol=lf
+
+# Everything else: auto
+* text=auto

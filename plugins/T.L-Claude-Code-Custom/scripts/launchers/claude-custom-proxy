@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.claude"
+CONFIG_FILE="$CONFIG_DIR/claude-custom.json"
+PROXY_DIR="$CONFIG_DIR/claude-custom"
+PROXY_BIN="$PROXY_DIR/OpenRouterProxy"
+LOCK_FILE="$PROXY_DIR/proxy.lock"
+
+if [ ! -f "$PROXY_BIN" ]; then
+    echo "Error: Proxy binary not found at $PROXY_BIN"
+    echo "Run the init skill to install: claude --plugin-dir path/to/T.L-Claude-Code-Custom"
+    exit 1
+fi
+
+if [ ! -x "$PROXY_BIN" ]; then
+    chmod +x "$PROXY_BIN"
+fi
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Error: Config file not found at $CONFIG_FILE"
+    echo "Run the init skill to install."
+    exit 1
+fi
+
+if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "Error: OPENROUTER_API_KEY environment variable is not set."
+    exit 1
+fi
+
+# --- Parse arguments ---
+MODEL=""
+PROVIDER=""
+PROFILE=""
+PASSTHROUGH=()
+STOP_PROXY=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --stop-proxy)
+            STOP_PROXY=1
+            shift
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --provider)
+            PROVIDER="$2"
+            shift 2
+            ;;
+        --profile)
+            PROFILE="$2"
+            shift 2
+            ;;
+        *)
+            PASSTHROUGH+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# --- Handle --stop-proxy ---
+if [ "$STOP_PROXY" -eq 1 ]; then
+    if [ -f "$LOCK_FILE" ]; then
+        LOCK_PID=$(grep '^pid=' "$LOCK_FILE" | cut -d= -f2)
+        if [ -n "$LOCK_PID" ]; then
+            kill "$LOCK_PID" 2>/dev/null || true
+        fi
+        rm -f "$LOCK_FILE"
+        echo "Proxy stopped."
+    else
+        echo "Proxy is not running."
+    fi
+    exit 0
+fi
+
+# --- Resolve config ---
+RESOLVED=$(PROFILE="$PROFILE" MODEL="$MODEL" PROVIDER="$PROVIDER" python3 -c "
+import json, os, sys
+prof = os.environ.get('PROFILE', '')
+model = os.environ.get('MODEL', '')
+provider = os.environ.get('PROVIDER', '')
+with open(os.path.expanduser('~/.claude/claude-custom.json')) as f:
+    c = json.load(f)
+if prof:
+    p = c.get('profiles', {}).get(prof)
+    if not p:
+        print(f'Profile not found: {prof}', file=sys.stderr)
+        sys.exit(1)
+    model = model or p.get('model')
+    provider = provider or p.get('provider')
+if not model:
+    default = c.get('defaultProfile', 'default')
+    def_prof = c.get('profiles', {}).get(default, {})
+    model = def_prof.get('model')
+    provider = provider or def_prof.get('provider')
+if not model:
+    print('Could not resolve model from config.', file=sys.stderr)
+    sys.exit(1)
+port = '18080'
+proxy = c.get('proxy')
+if proxy and proxy.get('port'):
+    port = str(proxy['port'])
+print(f'{model}|{provider}|{port}')
+" 2>&1) || { echo "$RESOLVED"; exit 1; }
+
+RESOLVED_MODEL="${RESOLVED%%|*}"
+REST="${RESOLVED#*|}"
+RESOLVED_PROVIDER="${REST%%|*}"
+PROXY_PORT="${REST#*|}"
+
+if [ -z "$RESOLVED_MODEL" ]; then
+    echo "Error: Could not resolve model from config."
+    exit 1
+fi
+
+PROXY_PORT="${PROXY_PORT:-18080}"
+
+# --- Check if proxy daemon is running ---
+PROXY_RUNNING=0
+
+if [ -f "$LOCK_FILE" ]; then
+    LOCK_PID=$(grep '^pid=' "$LOCK_FILE" | cut -d= -f2)
+    PROXY_PORT=$(grep '^port=' "$LOCK_FILE" | cut -d= -f2)
+
+    if kill -0 "$LOCK_PID" 2>/dev/null; then
+        if curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+            PROXY_RUNNING=1
+        fi
+    fi
+
+    if [ "$PROXY_RUNNING" -eq 0 ]; then
+        rm -f "$LOCK_FILE"
+    fi
+fi
+
+# --- Start proxy if not running ---
+if [ "$PROXY_RUNNING" -eq 0 ]; then
+    "$PROXY_BIN" --port "$PROXY_PORT" >/dev/null 2>"$PROXY_DIR/proxy.log" &
+    disown
+
+    RETRIES=0
+    while [ "$RETRIES" -lt 50 ]; do
+        if curl -sf "http://127.0.0.1:${PROXY_PORT}/health" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+        RETRIES=$((RETRIES + 1))
+    done
+
+    if [ "$RETRIES" -ge 50 ]; then
+        echo "Error: Proxy failed to start within 10 seconds."
+        echo "Check if port ${PROXY_PORT} is in use. Set PROXY_PORT=NNNN for a different port."
+        exit 1
+    fi
+fi
+
+# --- Build ANTHROPIC_BASE_URL with provider routing ---
+ENCODED_PROVIDER="${RESOLVED_PROVIDER//\//%2F}"
+
+if [ -n "$ENCODED_PROVIDER" ]; then
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}/route/${ENCODED_PROVIDER}"
+else
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}"
+fi
+
+export ANTHROPIC_AUTH_TOKEN="local"
+export ANTHROPIC_API_KEY=""
+
+claude --dangerously-skip-permissions --model "$RESOLVED_MODEL" "${PASSTHROUGH[@]}"

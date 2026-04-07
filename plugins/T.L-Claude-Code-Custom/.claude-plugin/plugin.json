@@ -1,0 +1,8 @@
+{
+  "name": "T.L-Claude-Code-Custom",
+  "version": "2.5.0",
+  "description": "Launch Claude Code with custom OpenRouter models via two modes: claude-custom-proxy (shared daemon) and claude-custom (direct API). Skills: /init-claude-code-custom, /update-claude-code-custom, /proxy-up, /proxy-down, /cleanup.",
+  "author": {
+    "name": "TLeiott"
+  }
+}

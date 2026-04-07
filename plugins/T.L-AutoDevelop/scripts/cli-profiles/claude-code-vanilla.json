@@ -1,0 +1,72 @@
+{
+  "id": "claude-code-vanilla",
+  "family": "claude-code",
+  "command": "claude",
+  "interaction": {
+    "promptInput": "stdin",
+    "output": "stdout",
+    "nonInteractive": true
+  },
+  "supportedProviders": [
+    "anthropic"
+  ],
+  "supportedModelClasses": [
+    "opus",
+    "sonnet",
+    "haiku"
+  ],
+  "supportedOptions": {
+    "reasoningEffort": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "maxTurns": true,
+    "dangerouslySkipPermissions": true,
+    "extraArgs": true
+  },
+  "supportedCapabilities": [
+    "read",
+    "search",
+    "edit",
+    "write",
+    "shell"
+  ],
+  "capabilityToolMap": {
+    "read": [
+      "Read"
+    ],
+    "search": [
+      "Glob",
+      "Grep"
+    ],
+    "edit": [
+      "Edit"
+    ],
+    "write": [
+      "Write"
+    ],
+    "shell": [
+      "Bash"
+    ]
+  },
+  "modelResolution": {
+    "anthropic": {
+      "opus": "opus",
+      "sonnet": "sonnet",
+      "haiku": "haiku"
+    }
+  },
+  "usageSupport": {
+    "anthropic:opus": {
+      "mode": "claude-oauth"
+    },
+    "anthropic:sonnet": {
+      "mode": "claude-oauth"
+    },
+    "anthropic:haiku": {
+      "mode": "claude-oauth"
+    }
+  },
+  "fallbackCliProfiles": []
+}
