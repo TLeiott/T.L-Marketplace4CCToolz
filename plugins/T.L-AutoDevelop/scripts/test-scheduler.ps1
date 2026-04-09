@@ -5,6 +5,7 @@ $ErrorActionPreference = "Stop"
 $script:SchedulerPath = Join-Path $PSScriptRoot "scheduler.ps1"
 $script:PreflightPath = Join-Path $PSScriptRoot "preflight.ps1"
 $script:AutoDevelopConfigPath = Join-Path $PSScriptRoot "autodevelop-config.ps1"
+$script:RoleRunnerPath = Join-Path $PSScriptRoot "autodevelop-role-runner.ps1"
 $script:PlannerRunnerPath = Join-Path $PSScriptRoot "planner-runner.ps1"
 
 function Assert-True {
@@ -58,6 +59,10 @@ function Write-TestFile {
 }
 
 function New-TestBlazorRepo {
+    param(
+        [switch]$SkipRestore
+    )
+
     $root = Join-Path $env:TEMP ("autodev-preflight-test-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     Push-Location $root
@@ -108,9 +113,11 @@ export function boot() {
 }
 "@
         Write-TestFile -Path (Join-Path $root ".gitignore") -Content ".claude-develop-logs/"
-        $restore = & dotnet restore $projectPath 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to restore the Blazor test project: $restore"
+        if (-not $SkipRestore) {
+            $restore = & dotnet restore $projectPath 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to restore the Blazor test project: $restore"
+            }
         }
         git add . | Out-Null
         git commit -m "init" | Out-Null
@@ -131,12 +138,30 @@ export function boot() {
 function Invoke-PreflightJson {
     param(
         [string]$RepoRoot,
-        [string]$SolutionPath
+        [string]$SolutionPath,
+        [switch]$SkipBuild,
+        [switch]$SkipTests
     )
     Push-Location $RepoRoot
     try {
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script:PreflightPath -SolutionPath $SolutionPath -SkipRun
-        return ($raw | Out-String | ConvertFrom-Json)
+        $arguments = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:PreflightPath,
+            "-SolutionPath", $SolutionPath,
+            "-SkipRun"
+        )
+        if ($SkipBuild) {
+            $arguments += "-SkipBuild"
+        }
+        if ($SkipTests) {
+            $arguments += "-SkipTests"
+        }
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList $arguments -WorkingDirectory $RepoRoot
+        if ($process.exitCode -ne 0) {
+            throw "Preflight returned exit code $($process.exitCode): $($process.stderr)$($process.stdout)"
+        }
+        return ($process.stdout | ConvertFrom-Json)
     } finally {
         Pop-Location
     }
@@ -178,10 +203,10 @@ function Invoke-UsageGateJson {
         $arguments += @("-MockUsageSequencePath", $MockUsageSequencePath)
     }
 
-    $raw = & powershell.exe @arguments
-    $rawText = ($raw | Out-String).Trim()
+    $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList $arguments
+    $rawText = ([string]$process.stdout).Trim()
     if (-not $rawText) {
-        throw "Usage gate returned no JSON output. Args: $($arguments -join ' ')"
+        throw "Usage gate returned no JSON output. Args: $($arguments -join ' ')`nSTDERR:`n$([string]$process.stderr)"
     }
 
     try {
@@ -283,8 +308,51 @@ function Invoke-SchedulerJson {
     if ($WaitTimeoutSeconds -gt 0) { $arguments += @("-WaitTimeoutSeconds", [string]$WaitTimeoutSeconds) }
     if ($IdlePollSeconds -gt 0) { $arguments += @("-IdlePollSeconds", [string]$IdlePollSeconds) }
 
-    $raw = & powershell.exe @arguments
-    return ($raw | Out-String | ConvertFrom-Json)
+    $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList $arguments
+    if ($process.exitCode -ne 0) {
+        throw "Scheduler command failed with exit code $($process.exitCode). STDERR:`n$([string]$process.stderr)`nSTDOUT:`n$([string]$process.stdout)"
+    }
+    return ($process.stdout | ConvertFrom-Json)
+}
+
+function Invoke-CapturedProcess {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$WorkingDirectory = ""
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    if ($WorkingDirectory) {
+        $startInfo.WorkingDirectory = $WorkingDirectory
+    }
+    $startInfo.Arguments = ((@($ArgumentList) | ForEach-Object {
+        $argumentText = [string]$_
+        if ($argumentText -match '[\s"]') {
+            '"' + ($argumentText -replace '"', '\"') + '"'
+        } else {
+            $argumentText
+        }
+    }) -join ' ')
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            exitCode = [int]$process.ExitCode
+            stdout = $stdout
+            stderr = $stderr
+        }
+    } finally {
+        $process.Dispose()
+    }
 }
 
 function Get-TestGitDir {
@@ -357,7 +425,8 @@ function Invoke-AutoDevelopConfigHelperFunctions {
     param(
         [string[]]$FunctionNames,
         [scriptblock]$ScriptBlock,
-        [object[]]$Arguments = @()
+        [object[]]$Arguments = @(),
+        [string]$PowerShellCommand = "powershell.exe"
     )
 
     $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
@@ -373,8 +442,42 @@ $($ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("autodev-config-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
-        return ($raw | Out-String).Trim()
+        $process = Invoke-CapturedProcess -FilePath $PowerShellCommand -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tempScript)
+        if ($process.exitCode -ne 0) {
+            throw "Helper execution failed with exit code $($process.exitCode). STDERR:`n$([string]$process.stderr)`nSTDOUT:`n$([string]$process.stdout)"
+        }
+        return ([string]$process.stdout).Trim()
+    } finally {
+        Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-RoleRunnerHelperFunctions {
+    param(
+        [scriptblock]$ScriptBlock,
+        [object[]]$Arguments = @(),
+        [string]$PowerShellCommand = "powershell.exe"
+    )
+
+    $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
+    $wrapped = @"
+. (Resolve-Path '$script:AutoDevelopConfigPath')
+. (Resolve-Path '$script:RoleRunnerPath')
+`$__roleRunnerArgs = ConvertFrom-Json @'
+$argumentsJson
+'@
+& {
+$($ScriptBlock.ToString())
+} @`$__roleRunnerArgs
+"@
+    $tempScript = Join-Path $env:TEMP ("role-runner-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
+    try {
+        [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
+        $process = Invoke-CapturedProcess -FilePath $PowerShellCommand -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tempScript)
+        if ($process.exitCode -ne 0) {
+            throw "Role runner helper execution failed with exit code $($process.exitCode). STDERR:`n$([string]$process.stderr)`nSTDOUT:`n$([string]$process.stdout)"
+        }
+        return ([string]$process.stdout).Trim()
     } finally {
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
@@ -403,8 +506,11 @@ $($ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("planner-runner-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
-        return ($raw | Out-String).Trim()
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tempScript)
+        if ($process.exitCode -ne 0) {
+            throw "Planner helper execution failed with exit code $($process.exitCode). STDERR:`n$([string]$process.stderr)`nSTDOUT:`n$([string]$process.stdout)"
+        }
+        return ([string]$process.stdout).Trim()
     } finally {
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
@@ -432,8 +538,11 @@ $($ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("scheduler-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
-        return ($raw | Out-String).Trim()
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tempScript)
+        if ($process.exitCode -ne 0) {
+            throw "Scheduler helper execution failed with exit code $($process.exitCode). STDERR:`n$([string]$process.stderr)`nSTDOUT:`n$([string]$process.stdout)"
+        }
+        return ([string]$process.stdout).Trim()
     } finally {
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
@@ -1435,7 +1544,15 @@ function Test-RegisterTasksPreservesUnicodeTaskText {
             }
         ) | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
 
-        $null = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "register-tasks" -TasksFile $tasksFile
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "register-tasks",
+            "-SolutionPath", $repo.solution,
+            "-TasksFile", $tasksFile
+        )
+        Assert-True ($process.exitCode -eq 0) "register-tasks should succeed for Unicode task text."
         $state = Get-Content -LiteralPath $repo.stateFile -Raw | ConvertFrom-Json
         $task = @($state.tasks | Where-Object { [string]$_.taskId -eq "unicode-task" })[0]
 
@@ -1473,7 +1590,7 @@ function Test-PreflightWarnsOnUnboundEventCallback {
 }
 
 function Test-PreflightAcceptsExplicitEventCallbackBinding {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.childComponent -Content @"
 <button @onclick="TriggerSave">Save</button>
@@ -1498,7 +1615,7 @@ function Test-PreflightAcceptsExplicitEventCallbackBinding {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
         Assert-True ($result.passed -eq $true) "Bound EventCallback changes should pass preflight."
         Assert-True ($wiringWarnings.Count -eq 0) "Explicit parent callback bindings should satisfy the wiring check."
@@ -1508,7 +1625,7 @@ function Test-PreflightAcceptsExplicitEventCallbackBinding {
 }
 
 function Test-PreflightAcceptsBindSyntaxForChangedCallback {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.childComponent -Content @"
 <button @onclick="NotifyChange">Update</button>
@@ -1531,7 +1648,7 @@ function Test-PreflightAcceptsBindSyntaxForChangedCallback {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
         Assert-True ($result.passed -eq $true) "Component @bind wiring should pass preflight."
         Assert-True ($wiringWarnings.Count -eq 0) "@bind-X should satisfy the XChanged EventCallback requirement."
@@ -1541,7 +1658,7 @@ function Test-PreflightAcceptsBindSyntaxForChangedCallback {
 }
 
 function Test-PreflightSkipsPageComponentsForEventCallbackWiring {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.childComponent -Content @"
 @page "/child"
@@ -1558,7 +1675,7 @@ function Test-PreflightSkipsPageComponentsForEventCallbackWiring {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
         Assert-True ($result.passed -eq $true) "Page components should not fail preflight for parent-binding checks."
         Assert-True ($wiringWarnings.Count -eq 0) "Components with @page should be excluded from EventCallback parent-binding warnings."
@@ -1568,7 +1685,7 @@ function Test-PreflightSkipsPageComponentsForEventCallbackWiring {
 }
 
 function Test-PreflightBlocksMissingStaticJsInvokableTarget {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.scriptFile -Content @"
 export async function boot() {
@@ -1576,7 +1693,7 @@ export async function boot() {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringBlockers = @($result.blockers | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
         Assert-True ($result.passed -eq $false) "Missing local static JS interop targets should fail preflight."
         Assert-True ($wiringBlockers.Count -eq 1) "Preflight should block unresolved local static JS interop calls."
@@ -1587,7 +1704,7 @@ export async function boot() {
 }
 
 function Test-PreflightAcceptsAliasedStaticJsInvokableTarget {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.interopBridge -Content @"
 using System.Threading.Tasks;
@@ -1610,7 +1727,7 @@ export async function boot() {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringBlockers = @($result.blockers | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
         Assert-True ($result.passed -eq $true) "Matching aliased static JS interop targets should pass preflight."
         Assert-True ($wiringBlockers.Count -eq 0) "[JSInvokable(\"Alias\")] should satisfy the static JS interop wiring check."
@@ -1620,7 +1737,7 @@ export async function boot() {
 }
 
 function Test-PreflightWarnsOnMissingInstanceJsInvokableTarget {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.scriptFile -Content @"
 export async function boot(dotNetHelper) {
@@ -1628,7 +1745,7 @@ export async function boot(dotNetHelper) {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
         Assert-True ($result.passed -eq $true) "Missing instance JS interop targets should warn but not fail preflight."
         Assert-True ($wiringWarnings.Count -eq 1) "Preflight should warn on unresolved instance JS interop calls."
@@ -1639,7 +1756,7 @@ export async function boot(dotNetHelper) {
 }
 
 function Test-PreflightIgnoresNonDotNetInvokeMethodPatterns {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.scriptFile -Content @"
 export async function boot(widget) {
@@ -1647,7 +1764,7 @@ export async function boot(widget) {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "jsinterop_wiring" })
         Assert-True ($result.passed -eq $true) "Non-.NET JS invokeMethodAsync patterns should not fail preflight."
         Assert-True ($wiringWarnings.Count -eq 0) "Arbitrary JS objects should not be treated as DotNetObjectReference helpers."
@@ -1657,7 +1774,7 @@ export async function boot(widget) {
 }
 
 function Test-PreflightDoesNotCrossWireDuplicateComponentNames {
-    $repo = New-TestBlazorRepo
+    $repo = New-TestBlazorRepo -SkipRestore
     try {
         Write-TestFile -Path $repo.childComponent -Content @"
 <button @onclick="TriggerSave">Save</button>
@@ -1698,7 +1815,7 @@ function Test-PreflightDoesNotCrossWireDuplicateComponentNames {
 }
 "@
 
-        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution
+        $result = Invoke-PreflightJson -RepoRoot $repo.root -SolutionPath $repo.solution -SkipBuild -SkipTests
         $wiringWarnings = @($result.warnings | Where-Object { [string]$_.check -eq "eventcallback_wiring" })
         Assert-True ($result.passed -eq $true) "Duplicate component names in other namespaces should not fail preflight."
         Assert-True ($wiringWarnings.Count -eq 1) "Bindings for a different namespace-qualified component should not suppress the root component warning."
@@ -2697,6 +2814,406 @@ function Test-AutoDevelopUsageCombosAggregateAcrossRoles {
     }
 }
 
+function Test-RegisterTasksWarnsWhenTaskTextDiffersFromPromptFile {
+    $repo = New-TestRepo
+    try {
+        $promptFile = Join-Path $repo.root "mismatch-task.md"
+        [System.IO.File]::WriteAllText($promptFile, "## Task`nOriginal prompt task text.`n`n## Solution`n$($repo.solution)", [System.Text.Encoding]::UTF8)
+
+        $tasksFile = Join-Path $repo.root "mismatch-tasks.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            [ordered]@{
+                taskId = "task-mismatch"
+                taskText = "Changed registration task text."
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                promptFile = $promptFile
+                resultFile = (Join-Path $repo.tasksDir "mismatch-result.json")
+                solutionPath = $repo.solution
+                allowNuget = $false
+            }
+        ) | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        $null = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "register-tasks" -TasksFile $tasksFile
+        $snapshot = Invoke-SchedulerJson -RepoSolution $repo.solution -Mode "snapshot-queue"
+        $task = @($snapshot.tasks | Where-Object { [string]$_.taskId -eq "task-mismatch" })[0]
+
+        Assert-True (@($task.integrityWarnings) -contains "taskText does not match promptFile content.") "Task snapshots should warn when taskText diverges from the prompt file content."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopExplicitModelPinsAgainstRuntimeOverride {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "executionProfiles": {
+    "default": {
+      "roles": {
+        "implement": {
+          "cliProfile": "opencode",
+          "provider": "openai",
+          "model": "openai/gpt-5.4"
+        }
+      }
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $implementRole = Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" -ModelOverride "opus"
+            [pscustomobject]@{
+                cliProfile = [string]$implementRole.cliProfile
+                cliFamily = [string]$implementRole.cliFamily
+                provider = [string]$implementRole.provider
+                model = [string]$implementRole.model
+                configuredModel = [string]$implementRole.configuredModel
+                modelPinned = [bool]$implementRole.modelPinned
+                modelClass = [string]$implementRole.modelClass
+                modelSource = [string]$implementRole.modelSource
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.cliProfile -eq "opencode") "Explicit OpenCode roles should resolve to the opencode cliProfile."
+        Assert-True ([string]$parsed.cliFamily -eq "opencode") "Explicit OpenCode roles should report the opencode cliFamily."
+        Assert-True ([string]$parsed.provider -eq "openai") "Explicit provider values must be preserved for OpenCode roles."
+        Assert-True ([string]$parsed.model -eq "openai/gpt-5.4") "Explicit model tokens must win over runtime model overrides."
+        Assert-True ([string]$parsed.configuredModel -eq "openai/gpt-5.4") "Resolved roles should surface the configured explicit model token."
+        Assert-True ($parsed.modelPinned -eq $true) "Explicit model config must be marked as pinned."
+        Assert-True ([string]$parsed.modelSource -eq "explicit-model") "Explicit model config should report explicit-model as its source."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-OpenCodeInvocationIncludesModelAgentAndConfigEnv {
+    $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+        $env:AUTODEV_OPENCODE_COMMAND = "powershell.exe"
+        $role = [pscustomobject]@{
+            roleName = "implement"
+            command = "opencode"
+            model = "openai/gpt-5.4"
+            maxTurns = 17
+            reasoningEffort = "high"
+            capabilities = @("read", "search", "edit", "write", "shell")
+            extraArgs = @("--format", "json")
+        }
+        $invocation = Get-OpenCodeInvocationForRole -RoleConfig $role
+        [pscustomobject]@{
+            executable = [string]$invocation.executable
+            args = @($invocation.arguments)
+            promptInput = [string]$invocation.promptInput
+            configJson = [string]$invocation.configJson
+            envKeys = @($invocation.env.Keys)
+            envConfig = [string]$invocation.env.OPENCODE_CONFIG_CONTENT
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    $argList = @($parsed.args)
+    Assert-True ($argList[0] -eq "run") "OpenCode invocation should use 'run' as the entry command."
+    Assert-True (($argList -join " ") -match [regex]::Escape("--model openai/gpt-5.4")) "OpenCode invocation must forward the explicit model token."
+    Assert-True (($argList -join " ") -match [regex]::Escape("--agent autodev-role")) "OpenCode invocation must select the generated AutoDevelop agent."
+    Assert-True (($argList -join " ") -match [regex]::Escape("--format json")) "OpenCode invocation must preserve configured extra arguments."
+    Assert-True ([string]$parsed.promptInput -eq "argument") "OpenCode invocation should pass prompts as the positional message argument."
+    Assert-True (@($parsed.envKeys) -contains "OPENCODE_CONFIG_CONTENT") "OpenCode invocation must inject the generated config via OPENCODE_CONFIG_CONTENT."
+    Assert-True ([string]$parsed.envConfig -match '"default_agent":"autodev-role"') "Generated OpenCode config should set the AutoDevelop agent as default."
+    Assert-True ([string]$parsed.envConfig -match '"steps":17') "Generated OpenCode config should map maxTurns to agent steps."
+    Assert-True ([string]$parsed.envConfig -match '"reasoningEffort":"high"') "Generated OpenCode config should carry provider-specific reasoning effort."
+}
+
+function Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary {
+    $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
+        $captureScript = Join-Path $env:TEMP ("role-runner-args-" + [guid]::NewGuid().ToString("N") + ".ps1")
+        [System.IO.File]::WriteAllText($captureScript, '[Console]::Out.Write(($args | ForEach-Object { "[" + $_ + "]" }) -join "")', [System.Text.Encoding]::UTF8)
+
+        function Get-AutoDevelopResolvedTimeoutSeconds {
+            param($RoleConfig, [int]$FallbackTimeoutSeconds)
+            return $FallbackTimeoutSeconds
+        }
+
+        function Get-AutoDevelopFallbackCliProfiles {
+            param($RoleConfig)
+            return @()
+        }
+
+        function Get-AutoDevelopRoleInvocation {
+            param($RoleConfig)
+
+            return [pscustomobject]@{
+                executable = "pwsh.exe"
+                arguments = @("-NoProfile", "-File", $captureScript, "run", "--model", "openai/gpt-5.4", "--agent", "autodev-role")
+                promptInput = "argument"
+                output = "stdout"
+                env = $null
+            }
+        }
+
+        try {
+            $result = Invoke-AutoDevelopRole -Prompt "prompt payload" -RoleConfig ([pscustomobject]@{ roleName = "reviewer"; cliProfile = "opencode" }) -WorkingDirectory $env:TEMP -TimeoutSeconds 15
+            [pscustomobject]@{
+                success = [bool]$result.success
+                output = [string]$result.output
+            } | ConvertTo-Json -Compress
+        } finally {
+            Remove-Item -LiteralPath $captureScript -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.success -eq $true) "Invoke-AutoDevelopRole should preserve native argument execution across the job boundary."
+    Assert-True ([string]$parsed.output -eq '[-NoProfile][-File][run][--model][openai/gpt-5.4][--agent][autodev-role][prompt payload]') "Invoke-AutoDevelopRole should keep each native argument separate and append the prompt as the final positional argument."
+}
+
+function Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary {
+    $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
+        $captureScript = Join-Path $env:TEMP ("role-runner-env-" + [guid]::NewGuid().ToString("N") + ".ps1")
+        [System.IO.File]::WriteAllText($captureScript, '[Console]::Out.Write($env:OPENCODE_CONFIG_CONTENT)', [System.Text.Encoding]::UTF8)
+
+        function Get-AutoDevelopResolvedTimeoutSeconds {
+            param($RoleConfig, [int]$FallbackTimeoutSeconds)
+            return $FallbackTimeoutSeconds
+        }
+
+        function Get-AutoDevelopFallbackCliProfiles {
+            param($RoleConfig)
+            return @()
+        }
+
+        function Get-AutoDevelopRoleInvocation {
+            param($RoleConfig)
+
+            return [pscustomobject]@{
+                executable = "pwsh.exe"
+                arguments = @("-NoProfile", "-File", $captureScript)
+                promptInput = "argument"
+                output = "stdout"
+                env = [ordered]@{
+                    "OPENCODE_CONFIG_CONTENT" = '{"default_agent":"autodev-role","reasoningEffort":"high","steps":17}'
+                }
+            }
+        }
+
+        try {
+            $result = Invoke-AutoDevelopRole -Prompt "ignored prompt" -RoleConfig ([pscustomobject]@{ roleName = "discover"; cliProfile = "opencode" }) -WorkingDirectory $env:TEMP -TimeoutSeconds 15
+            [pscustomobject]@{
+                success = [bool]$result.success
+                exitCode = [int]$result.exitCode
+                output = [string]$result.output
+            } | ConvertTo-Json -Compress
+        } finally {
+            Remove-Item -LiteralPath $captureScript -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.success -eq $true) "Invoke-AutoDevelopRole should succeed when env overrides cross the pwsh Start-Job boundary."
+    Assert-True ([int]$parsed.exitCode -eq 0) "Invoke-AutoDevelopRole should return exit code 0 when the child process succeeds."
+    Assert-True ([string]$parsed.output -eq '{"default_agent":"autodev-role","reasoningEffort":"high","steps":17}') "Env overrides should survive Start-Job serialization under pwsh exactly."
+}
+
+function Test-InvokeAutoDevelopRoleHandlesEmptyEnvironmentOverrides {
+    $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
+        $captureScript = Join-Path $env:TEMP ("role-runner-ok-" + [guid]::NewGuid().ToString("N") + ".ps1")
+        [System.IO.File]::WriteAllText($captureScript, '[Console]::Out.Write("ok")', [System.Text.Encoding]::UTF8)
+
+        function Get-AutoDevelopResolvedTimeoutSeconds {
+            param($RoleConfig, [int]$FallbackTimeoutSeconds)
+            return $FallbackTimeoutSeconds
+        }
+
+        function Get-AutoDevelopFallbackCliProfiles {
+            param($RoleConfig)
+            return @()
+        }
+
+        function Get-AutoDevelopRoleInvocation {
+            param($RoleConfig)
+
+            return [pscustomobject]@{
+                executable = "pwsh.exe"
+                arguments = @("-NoProfile", "-File", $captureScript)
+                promptInput = "argument"
+                output = "stdout"
+                env = $null
+            }
+        }
+
+        try {
+            $result = Invoke-AutoDevelopRole -Prompt "ignored prompt" -RoleConfig ([pscustomobject]@{ roleName = "discover"; cliProfile = "claude-code-vanilla" }) -WorkingDirectory $env:TEMP -TimeoutSeconds 15
+            [pscustomobject]@{
+                success = [bool]$result.success
+                output = [string]$result.output
+            } | ConvertTo-Json -Compress
+        } finally {
+            Remove-Item -LiteralPath $captureScript -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.success -eq $true) "Invoke-AutoDevelopRole should still work when no env overrides are present."
+    Assert-True ([string]$parsed.output -eq "ok") "Invoke-AutoDevelopRole should preserve the no-env execution path."
+}
+
+function Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh {
+    $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @("Test-AutoDevelopConfigObject") -PowerShellCommand "pwsh.exe" -ScriptBlock {
+        $parsed = '{"executionProfiles":{"default":{"roles":{"discover":{"model":"openai/gpt-5.4-mini"}}}}}' | ConvertFrom-Json
+        [pscustomobject]@{
+            executionProfiles = [bool](Test-AutoDevelopConfigObject -Value $parsed.executionProfiles)
+            roles = [bool](Test-AutoDevelopConfigObject -Value $parsed.executionProfiles.default.roles)
+            discover = [bool](Test-AutoDevelopConfigObject -Value $parsed.executionProfiles.default.roles.discover)
+        } | ConvertTo-Json -Compress
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.executionProfiles -eq $true) "ConvertFrom-Json executionProfiles objects from pwsh should be recognized as config objects."
+    Assert-True ($parsed.roles -eq $true) "ConvertFrom-Json role maps from pwsh should be recognized as config objects."
+    Assert-True ($parsed.discover -eq $true) "ConvertFrom-Json role definitions from pwsh should be recognized as config objects."
+}
+
+function Test-RegisterTasksAcceptsTasksJsonAlias {
+    $repo = New-TestRepo
+    try {
+        $tasksFile = Join-Path $repo.root "tasks-alias.json"
+        [System.IO.File]::WriteAllText($tasksFile, (@(
+            [ordered]@{
+                taskId = "task-alias"
+                taskText = "Alias registration"
+                sourceCommand = "develop"
+                sourceInputType = "inline"
+                promptFile = $repo.promptFile
+                resultFile = (Join-Path $repo.resultsDir "task-alias.json")
+                solutionPath = $repo.solution
+                allowNuget = $false
+            }
+        ) | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "register-tasks",
+            "-SolutionPath", $repo.solution,
+            "-TasksJson", $tasksFile,
+            "-Format", "Json"
+        )
+        $parsed = $process.stdout | ConvertFrom-Json
+
+        Assert-True ([int]$process.exitCode -eq 0) "register-tasks should accept the -TasksJson alias."
+        Assert-True (@($parsed.registered).Count -eq 1) "register-tasks should still register exactly one task when called via -TasksJson."
+        Assert-True ([string]$parsed.registered[0].taskId -eq "task-alias") "The -TasksJson alias should feed the normal registration path."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequested {
+    $repo = New-TestRepo
+    try {
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $script:SchedulerPath,
+            "-Mode", "snapshot-queue",
+            "-SolutionPath", $repo.solution,
+            "-Format", "Json"
+        )
+        $parsed = $process.stdout | ConvertFrom-Json
+
+        Assert-True ([int]$process.exitCode -eq 0) "snapshot-queue should succeed when -Format Json is requested explicitly."
+        Assert-True ([string]$parsed.repoRoot -eq $repo.root) "snapshot-queue should still emit the expected JSON payload to stdout."
+        Assert-True (-not [string]::IsNullOrWhiteSpace($process.stdout)) "snapshot-queue should produce JSON on stdout."
+        Assert-True ($process.stderr -notmatch "#< CLIXML") "snapshot-queue stderr should stay free of CLIXML decoration in JSON mode."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "defaultExecutionProfile": "hybrid",
+  "executionProfiles": {
+    "hybrid": {
+      "roles": {
+        "scheduler": {
+          "cliProfile": "claude-code-vanilla",
+          "provider": "anthropic",
+          "modelClass": "opus"
+        },
+        "implement": {
+          "cliProfile": "opencode",
+          "provider": "openai",
+          "model": "openai/gpt-5.4"
+        }
+      }
+    }
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            $combos = @(Get-AutoDevelopRoleUsageCombos -ConfigState $state -RoleNames @("scheduler", "implement"))
+            [pscustomobject]@{
+                comboKeys = @($combos | ForEach-Object { "$($_.cliProfile)|$($_.provider)|$($_.modelClass)" })
+                opencodeUsageMode = [string](Get-AutoDevelopConfigPropertyValue -Object (Get-AutoDevelopCliProfileUsageSupport -CliProfileId "opencode" -Provider "openai" -ModelClass "openai/gpt-5.4") -Name "mode")
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        $keys = @($parsed.comboKeys)
+        Assert-True ($keys -contains "claude-code-vanilla|anthropic|opus") "Hybrid usage aggregation should retain Claude Code role combos."
+        Assert-True ($keys -contains "opencode|openai|openai/gpt-5.4") "Hybrid usage aggregation should include explicit OpenCode model tokens."
+        Assert-True ([string]$parsed.opencodeUsageMode -eq "none") "OpenCode usage support should default to mode 'none'."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "executionProfiles": {
+    "default": {
+      "roles": {
+        "implement": {
+          "cliProfile": "opencode",
+          "provider": "openai",
+          "model": "openai/gpt-5.4",
+          "options": {
+            "dangerouslySkipPermissions": true
+          }
+        }
+      }
+    }
+  }
+}
+"@
+
+        Assert-Throws {
+            $state = Get-AutoDevelopConfigState -RepoRoot $repo.root
+            Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" | Out-Null
+        } "does not support dangerouslySkipPermissions"
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
 function Test-WriteWorkerBriefsFilePersistsAcceptedCompletedBriefs {
     $raw = Invoke-SchedulerHelperFunctions -FunctionNames @(
         "Get-Tasks",
@@ -3468,6 +3985,7 @@ function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
         "Clip-DiscoveryBriefText",
         "Get-RetryLessonComparisonText",
         "Get-ValidationIssuesFromResult",
+        "Get-RetryDirective",
         "Is-RetryContextSemanticCategory",
         "Get-RetryContextRelevantRuns",
         "Get-FallbackRetryLesson",
@@ -3574,6 +4092,7 @@ function Test-WriteRetryContextFileSkipsInfraOnlyHistory {
         "Clip-DiscoveryBriefText",
         "Get-RetryLessonComparisonText",
         "Get-ValidationIssuesFromResult",
+        "Get-RetryDirective",
         "Is-RetryContextSemanticCategory",
         "Get-RetryContextRelevantRuns",
         "Get-FallbackRetryLesson",
@@ -4093,21 +4612,17 @@ function Test-RegistrationRejectsMissingPromptFile {
             }
         ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
 
-        $stdout = Join-Path $repo.root "register-missing-prompt.stdout.txt"
-        $stderr = Join-Path $repo.root "register-missing-prompt.stderr.txt"
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", $script:SchedulerPath,
             "-Mode", "register-tasks",
             "-SolutionPath", $repo.solution,
             "-TasksFile", $tasksFile
-        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $combined = ""
-        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
-        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+        )
+        $combined = ([string]$process.stdout) + ([string]$process.stderr)
 
-        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile is missing."
+        Assert-True ($process.exitCode -ne 0) "register-tasks should fail when promptFile is missing."
         Assert-True ($combined -match "promptFile is missing") "register-tasks should explain the missing promptFile."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -4132,21 +4647,17 @@ function Test-RegistrationRejectsEmptyPromptFile {
             }
         ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
 
-        $stdout = Join-Path $repo.root "register-empty-prompt.stdout.txt"
-        $stderr = Join-Path $repo.root "register-empty-prompt.stderr.txt"
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", $script:SchedulerPath,
             "-Mode", "register-tasks",
             "-SolutionPath", $repo.solution,
             "-TasksFile", $tasksFile
-        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $combined = ""
-        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
-        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+        )
+        $combined = ([string]$process.stdout) + ([string]$process.stderr)
 
-        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile is empty."
+        Assert-True ($process.exitCode -ne 0) "register-tasks should fail when promptFile is empty."
         Assert-True ($combined -match "promptFile is empty") "register-tasks should explain the empty promptFile."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -4169,21 +4680,17 @@ function Test-RegistrationRejectsPromptDirectoryPath {
             }
         ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
 
-        $stdout = Join-Path $repo.root "register-directory-prompt.stdout.txt"
-        $stderr = Join-Path $repo.root "register-directory-prompt.stderr.txt"
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", $script:SchedulerPath,
             "-Mode", "register-tasks",
             "-SolutionPath", $repo.solution,
             "-TasksFile", $tasksFile
-        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $combined = ""
-        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
-        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+        )
+        $combined = ([string]$process.stdout) + ([string]$process.stderr)
 
-        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile points to a directory."
+        Assert-True ($process.exitCode -ne 0) "register-tasks should fail when promptFile points to a directory."
         Assert-True ($combined -match "promptFile is not a file") "register-tasks should explain that promptFile must be a file."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -4208,21 +4715,17 @@ function Test-RegistrationRejectsPromptWithoutReadableTaskLine {
             }
         ) | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
 
-        $stdout = Join-Path $repo.root "register-heading-only-prompt.stdout.txt"
-        $stderr = Join-Path $repo.root "register-heading-only-prompt.stderr.txt"
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", $script:SchedulerPath,
             "-Mode", "register-tasks",
             "-SolutionPath", $repo.solution,
             "-TasksFile", $tasksFile
-        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $combined = ""
-        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
-        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
+        )
+        $combined = ([string]$process.stdout) + ([string]$process.stderr)
 
-        Assert-True ($process.ExitCode -ne 0) "register-tasks should fail when promptFile has no readable task line."
+        Assert-True ($process.exitCode -ne 0) "register-tasks should fail when promptFile has no readable task line."
         Assert-True ($combined -match "promptFile has no readable task line") "register-tasks should explain the malformed prompt content."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -4446,11 +4949,9 @@ function Test-AutoDevelopInvalidPromptWritesStructuredErrorAndTimeline {
         $promptFile = Join-Path $repo.root "worker-invalid-prompt.md"
         [System.IO.File]::WriteAllText($promptFile, "## Task`n`n## Solution`n$($repo.solution)", [System.Text.Encoding]::UTF8)
         $resultFile = Join-Path $repo.root "worker-invalid-prompt-result.json"
-        $stdout = Join-Path $repo.root "worker-invalid-prompt.stdout.txt"
-        $stderr = Join-Path $repo.root "worker-invalid-prompt.stderr.txt"
         $autoDevelopPath = Join-Path $PSScriptRoot "auto-develop.ps1"
 
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", $autoDevelopPath,
@@ -4458,9 +4959,9 @@ function Test-AutoDevelopInvalidPromptWritesStructuredErrorAndTimeline {
             "-SolutionPath", $repo.solution,
             "-ResultFile", $resultFile,
             "-TaskName", "invalid-prompt-worker"
-        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        )
 
-        Assert-True ($process.ExitCode -ne 0) "auto-develop should fail fast on an invalid prompt file."
+        Assert-True ($process.exitCode -ne 0) "auto-develop should fail fast on an invalid prompt file."
         $result = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
         Assert-True ([string]$result.finalCategory -eq "INVALID_PROMPT_FILE") "auto-develop should emit INVALID_PROMPT_FILE."
         Assert-True ([string]$result.phase -eq "VALIDATE") "Invalid prompt failures should report the VALIDATE phase."
@@ -4651,21 +5152,17 @@ function Test-DeclaredDependencyValidation {
             )
         } | ConvertTo-Json -Depth 16), [System.Text.Encoding]::UTF8)
 
-        $stdout = Join-Path $repo.root "apply-plan.stdout.txt"
-        $stderr = Join-Path $repo.root "apply-plan.stderr.txt"
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
             "-NoProfile",
             "-ExecutionPolicy", "Bypass",
             "-File", $script:SchedulerPath,
             "-Mode", "apply-plan",
             "-SolutionPath", $repo.solution,
             "-PlanFile", $planFile
-        ) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        )
 
-        $combined = ""
-        if (Test-Path -LiteralPath $stdout) { $combined += (Get-Content -LiteralPath $stdout -Raw) }
-        if (Test-Path -LiteralPath $stderr) { $combined += (Get-Content -LiteralPath $stderr -Raw) }
-        Assert-True ($process.ExitCode -ne 0) "apply-plan should fail when declared dependencies are violated."
+        $combined = ([string]$process.stdout) + ([string]$process.stderr)
+        Assert-True ($process.exitCode -ne 0) "apply-plan should fail when declared dependencies are violated."
         Assert-True ($combined -match "does not respect declared dependency") "Dependency validation error should explain the violated declaration."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -9317,5 +9814,15 @@ Test-PlannerRunnerRespectsGitCommandOverride
 Test-AutoDevelopWorkerRespectsGitCommandOverride
 Test-AutoDevelopSessionProfileSelection
 Test-AutoDevelopUsageCombosAggregateAcrossRoles
+Test-RegisterTasksWarnsWhenTaskTextDiffersFromPromptFile
+Test-OpenCodeInvocationIncludesModelAgentAndConfigEnv
+Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary
+Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary
+Test-InvokeAutoDevelopRoleHandlesEmptyEnvironmentOverrides
+Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh
+Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel
+Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass
+Test-RegisterTasksAcceptsTasksJsonAlias
+Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequested
 
 Write-Host "Scheduler regression checks passed."

@@ -3,6 +3,8 @@ param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [string[]]$ChangedFiles,
     [switch]$SkipRun,
+    [switch]$SkipBuild,
+    [switch]$SkipTests,
     [switch]$AllowNuget,
     [string]$ProjectPath,
     [string]$DebugDir
@@ -52,6 +54,8 @@ $runSummary = [ordered]@{
     projectPath = $ProjectPath
     debugDir = (Ensure-DebugDir)
     skipRun = [bool]$SkipRun
+    skipBuild = [bool]$SkipBuild
+    skipTests = [bool]$SkipTests
     allowNuget = [bool]$AllowNuget
     startedAt = (Get-Date).ToString('o')
 }
@@ -595,17 +599,23 @@ function Invoke-WiringAnalysis {
 }
 
 # --- BLOCKER 1: Build ---
-$buildStarted = Get-Date
-$buildOutput = dotnet build $SolutionPath --no-restore 2>&1
-$buildExitCode = $LASTEXITCODE
-$runSummary.build = [ordered]@{
-    exitCode = $buildExitCode
-    elapsedSeconds = [math]::Round(((Get-Date) - $buildStarted).TotalSeconds, 2)
-}
-Save-DebugText -Name 'build-output.txt' -Content (($buildOutput | Out-String).Trim()) | Out-Null
-if ($buildExitCode -ne 0) {
-    $errLines = ($buildOutput | Select-String "error " | Select-Object -First 5) -join "`n"
-    Add-Blocker "build" $SolutionPath "Build failed: $errLines"
+if ($SkipBuild) {
+    $runSummary.build = [ordered]@{
+        skipped = $true
+    }
+} else {
+    $buildStarted = Get-Date
+    $buildOutput = dotnet build $SolutionPath --no-restore 2>&1
+    $buildExitCode = $LASTEXITCODE
+    $runSummary.build = [ordered]@{
+        exitCode = $buildExitCode
+        elapsedSeconds = [math]::Round(((Get-Date) - $buildStarted).TotalSeconds, 2)
+    }
+    Save-DebugText -Name 'build-output.txt' -Content (($buildOutput | Out-String).Trim()) | Out-Null
+    if ($buildExitCode -ne 0) {
+        $errLines = ($buildOutput | Select-String "error " | Select-Object -First 5) -join "`n"
+        Add-Blocker "build" $SolutionPath "Build failed: $errLines"
+    }
 }
 
 # Stop early after a build failure and skip the remaining checks
@@ -661,30 +671,37 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
 
 # Run dotnet test only when test projects are present
 $slnDir = Split-Path $SolutionPath -Parent
-$testProjects = @(Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue |
-    Where-Object {
-        $csprojContent = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
-        $csprojContent -match 'Microsoft\.NET\.Test\.Sdk|xunit|NUnit|MSTest'
-    })
-
-if ($testProjects.Count -gt 0) {
-    $testStarted = Get-Date
-    $testResult = Invoke-NativeCommand dotnet @("test",$SolutionPath,"--no-build","--verbosity","quiet")
-    $runSummary.tests = [ordered]@{
-        exitCode = $testResult.exitCode
-        elapsedSeconds = [math]::Round(((Get-Date) - $testStarted).TotalSeconds, 2)
-        discoveredProjects = $testProjects.Count
-    }
-    Save-DebugText -Name 'test-output.txt' -Content $testResult.output | Out-Null
-    if ($testResult.exitCode -ne 0) {
-        $failedTests = ($testResult.output -split "`n" | Select-String "Failed\s+" | Select-Object -First 5) -join "`n"
-        if (-not $failedTests) { $failedTests = ($testResult.output -split "`n" | Select-Object -Last 5) -join "`n" }
-        Add-Blocker "tests" $SolutionPath "Tests failed: $failedTests"
-    }
-} else {
+if ($SkipTests) {
     $runSummary.tests = [ordered]@{
         skipped = $true
         discoveredProjects = 0
+    }
+} else {
+    $testProjects = @(Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $csprojContent = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
+            $csprojContent -match 'Microsoft\.NET\.Test\.Sdk|xunit|NUnit|MSTest'
+        })
+
+    if ($testProjects.Count -gt 0) {
+        $testStarted = Get-Date
+        $testResult = Invoke-NativeCommand dotnet @("test",$SolutionPath,"--no-build","--verbosity","quiet")
+        $runSummary.tests = [ordered]@{
+            exitCode = $testResult.exitCode
+            elapsedSeconds = [math]::Round(((Get-Date) - $testStarted).TotalSeconds, 2)
+            discoveredProjects = $testProjects.Count
+        }
+        Save-DebugText -Name 'test-output.txt' -Content $testResult.output | Out-Null
+        if ($testResult.exitCode -ne 0) {
+            $failedTests = ($testResult.output -split "`n" | Select-String "Failed\s+" | Select-Object -First 5) -join "`n"
+            if (-not $failedTests) { $failedTests = ($testResult.output -split "`n" | Select-Object -Last 5) -join "`n" }
+            Add-Blocker "tests" $SolutionPath "Tests failed: $failedTests"
+        }
+    } else {
+        $runSummary.tests = [ordered]@{
+            skipped = $true
+            discoveredProjects = 0
+        }
     }
 }
 
