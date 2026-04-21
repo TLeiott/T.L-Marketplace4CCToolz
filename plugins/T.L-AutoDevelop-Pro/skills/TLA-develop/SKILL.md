@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # /TLA-develop
 
-CRITICAL: You are the Main-Claude orchestrator. You do not implement the requested code changes yourself.
+CRITICAL: You are the main AutoDevelop orchestrator. You do not implement the requested code changes yourself.
 
 This command uses the same shared queue as `/develop`, but it differs in two ways:
 - worker tasks are registered with `sourceCommand = "TLA-develop"`

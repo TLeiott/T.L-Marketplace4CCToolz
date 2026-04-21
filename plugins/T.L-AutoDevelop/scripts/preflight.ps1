@@ -12,6 +12,58 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function ConvertTo-WindowsProcessArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) { $Argument = '' }
+    if ($Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+
+    $quote = [char]34
+    $slash = [char]92
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append($quote)
+    $backslashCount = 0
+
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq $slash) {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq $quote) {
+            if ($backslashCount -gt 0) {
+                [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+                $backslashCount = 0
+            }
+
+            [void]$builder.Append($slash)
+            [void]$builder.Append($quote)
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append(([string]$slash) * $backslashCount)
+            $backslashCount = 0
+        }
+
+        [void]$builder.Append($character)
+    }
+
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+    }
+
+    [void]$builder.Append($quote)
+    return $builder.ToString()
+}
+
+function ConvertTo-WindowsProcessArgumentString {
+    param([AllowEmptyCollection()][string[]]$Arguments)
+
+    return ([string]::Join(' ', @($Arguments | ForEach-Object { ConvertTo-WindowsProcessArgument -Argument $_ })))
+}
+
 function Ensure-DebugDir {
     if (-not $DebugDir) { return $null }
     if (-not (Test-Path $DebugDir)) { New-Item -ItemType Directory -Path $DebugDir -Force | Out-Null }
@@ -35,9 +87,15 @@ function Save-DebugJson {
 
 function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments)
+    $invocationCommand = $Command
+    $invocationArguments = @($Arguments)
+    if ($Command -and [System.IO.Path]::GetExtension([string]$Command).ToLowerInvariant() -eq '.ps1') {
+        $invocationCommand = 'powershell.exe'
+        $invocationArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', [string]$Command) + @($Arguments)
+    }
     $output = & {
         $ErrorActionPreference = 'Continue'
-        & $Command @Arguments 2>&1
+        & $invocationCommand @invocationArguments 2>&1
     }
     return @{ output = ($output | Out-String).Trim(); exitCode = $LASTEXITCODE }
 }
@@ -639,7 +697,8 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
     $runStarted = Get-Date
     $runErrPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stderr.txt' } else { "$env:TEMP\preflight-runerr.txt" }
     $runOutPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stdout.txt' } else { "$env:TEMP\preflight-runout.txt" }
-    $runProc = Start-Process dotnet -ArgumentList "run","--project",$ProjectPath,"--no-build" `
+    $runArguments = @("run", "--project", $ProjectPath, "--no-build")
+    $runProc = Start-Process dotnet -ArgumentList (ConvertTo-WindowsProcessArgumentString -Arguments $runArguments) `
         -PassThru -NoNewWindow -RedirectStandardError $runErrPath -RedirectStandardOutput $runOutPath 2>$null
     Start-Sleep -Seconds 5
     $runErrText = (Get-Content $runErrPath -ErrorAction SilentlyContinue | Out-String).Trim()

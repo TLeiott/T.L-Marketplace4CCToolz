@@ -17,9 +17,9 @@ This state is transient and must not be committed.
 ## Supported actions
 
 Interpret `$ARGUMENTS` like this:
-- empty or `show`: show the active execution profile, its source, and the available execution profiles
+- empty or `show`: show the active execution profile, its source, the detected host, and the available execution profiles
 - `use <profile>`: set the active session execution profile to the named profile
-- `clear`: remove the session override so AutoDevelop falls back to `defaultExecutionProfile`
+- `clear`: remove the session override so AutoDevelop falls back to the detected host default or `defaultExecutionProfile`
 
 ## Rules
 

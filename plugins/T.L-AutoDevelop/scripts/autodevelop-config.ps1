@@ -1,4 +1,6 @@
 . (Join-Path $PSScriptRoot "providers\provider-claude-code.ps1")
+. (Join-Path $PSScriptRoot "providers\provider-codex.ps1")
+. (Join-Path $PSScriptRoot "providers\provider-opencode.ps1")
 
 $script:AutoDevelopCliProfileCache = $null
 
@@ -14,6 +16,86 @@ function Get-AutoDevelopSessionStatePath {
 
     if (-not $RepoRoot) { return "" }
     return (Join-Path $RepoRoot ".claude-develop-logs\session.json")
+}
+
+function Get-AutoDevelopSupportedEditorHosts {
+    return @("claude-code", "codex")
+}
+
+function Get-DefaultAutoDevelopHostDefaults {
+    return [pscustomobject]@{
+        "claude-code" = "claude-full"
+        codex = "codex-full"
+    }
+}
+
+function Normalize-AutoDevelopEditorHost {
+    param([string]$Host)
+
+    $text = Get-AutoDevelopTrimmedString -Value $Host
+    if (-not $text) { return "" }
+
+    switch -Regex ($text.ToLowerInvariant()) {
+        '^(claude|claude-code)$' { return "claude-code" }
+        '^(codex|codex-desktop|codex desktop)$' { return "codex" }
+        default { return "" }
+    }
+}
+
+function Resolve-AutoDevelopDetectedHost {
+    param(
+        [System.Collections.ArrayList]$Warnings = $null,
+        [string]$ConfigPath = ""
+    )
+
+    $override = Get-AutoDevelopTrimmedString -Value $env:AUTODEV_EDITOR_HOST
+    if ($override) {
+        $normalizedOverride = Normalize-AutoDevelopEditorHost -Host $override
+        if ($normalizedOverride) {
+            return [pscustomobject]@{
+                host = $normalizedOverride
+                source = "AUTODEV_EDITOR_HOST"
+            }
+        }
+
+        if ($Warnings) {
+            Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "hostDetection" -Message "AUTODEV_EDITOR_HOST '$override' is not supported. Ignoring the override."
+        }
+    }
+
+    if ($env:CODEX_THREAD_ID) {
+        return [pscustomobject]@{
+            host = "codex"
+            source = "CODEX_THREAD_ID"
+        }
+    }
+
+    $codexOriginator = Get-AutoDevelopTrimmedString -Value $env:CODEX_INTERNAL_ORIGINATOR_OVERRIDE
+    if ($codexOriginator -and $codexOriginator -match '(?i)codex') {
+        return [pscustomobject]@{
+            host = "codex"
+            source = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
+        }
+    }
+
+    if ($env:CODEX_SHELL) {
+        return [pscustomobject]@{
+            host = "codex"
+            source = "CODEX_SHELL"
+        }
+    }
+
+    if ($env:CLAUDECODE) {
+        return [pscustomobject]@{
+            host = "claude-code"
+            source = "CLAUDECODE"
+        }
+    }
+
+    return [pscustomobject]@{
+        host = ""
+        source = "none"
+    }
 }
 
 function ConvertTo-AutoDevelopStringArray {
@@ -41,7 +123,11 @@ function Test-AutoDevelopConfigObject {
 
     if ($null -eq $Value) { return $false }
     if ($Value -is [System.Collections.IDictionary]) { return $true }
-    return $Value -is [pscustomobject]
+    if ($Value -is [string] -or $Value -is [ValueType] -or $Value -is [System.Array]) { return $false }
+    if ($Value -is [System.Management.Automation.PSObject]) {
+        return @($Value.PSObject.Properties).Count -gt 0
+    }
+    return $false
 }
 
 function Get-AutoDevelopConfigPropertyNames {
@@ -329,6 +415,38 @@ function Resolve-AutoDevelopStringArrayValue {
     return @(ConvertTo-AutoDevelopStringArray -Value (Get-AutoDevelopConfigPropertyValue -Object $DefaultObject -Name $PropertyName))
 }
 
+function Resolve-AutoDevelopHostDefaultsValue {
+    param(
+        $OverrideConfig,
+        $DefaultObject,
+        [string]$ConfigPath,
+        [System.Collections.ArrayList]$Warnings
+    )
+
+    $defaultHostDefaults = Get-AutoDevelopConfigPropertyValue -Object $DefaultObject -Name "hostDefaults"
+    $explicitHostDefaultsValue = Get-AutoDevelopConfigPropertyValue -Object $OverrideConfig -Name "hostDefaults"
+    $explicitHostDefaultsDefined = Test-AutoDevelopConfigPropertyDefined -Object $OverrideConfig -Name "hostDefaults"
+    $explicitHostDefaultsIsObject = Test-AutoDevelopConfigObject -Value $explicitHostDefaultsValue
+    $explicitHostDefaults = if ($explicitHostDefaultsIsObject) { $explicitHostDefaultsValue } else { $null }
+    if ($explicitHostDefaultsDefined -and -not $explicitHostDefaultsIsObject) {
+        Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "hostDefaults" -Message "hostDefaults must be a JSON object. Falling back to the built-in host defaults."
+    }
+
+    $supportedHosts = @(Get-AutoDevelopSupportedEditorHosts)
+    foreach ($hostName in Get-AutoDevelopConfigPropertyNames -Object $explicitHostDefaults) {
+        if ($supportedHosts -notcontains $hostName) {
+            Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "hostDefaults.$hostName" -Message "Host '$hostName' is not supported. Supported hosts are: $($supportedHosts -join ', ')."
+        }
+    }
+
+    $resolved = [ordered]@{}
+    foreach ($hostName in $supportedHosts) {
+        $resolved[$hostName] = Resolve-AutoDevelopStringValue -ExplicitObject $explicitHostDefaults -DefaultObject $defaultHostDefaults -PropertyName $hostName -FallbackValue "" -Scope "hostDefaults" -ConfigPath $ConfigPath -Warnings $Warnings
+    }
+
+    return [pscustomobject]$resolved
+}
+
 function Resolve-AutoDevelopPositiveIntValue {
     param(
         $ExplicitObject,
@@ -471,111 +589,237 @@ function Resolve-AutoDevelopUsageModelClassesValue {
     return @()
 }
 
+function New-AutoDevelopClaudeFullExecutionProfile {
+    return [pscustomobject]@{
+        roles = [pscustomobject]@{
+            discover = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus")
+                maxTurns = 12
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{}
+                extraArgs = @()
+            }
+            plan = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus", "sonnet")
+                maxTurns = 18
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{}
+                extraArgs = @()
+            }
+            fixPlan = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus", "sonnet")
+                maxTurns = 18
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{}
+                extraArgs = @()
+            }
+            directionCheck = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "sonnet"
+                usageModelClasses = @("sonnet")
+                maxTurns = 8
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{}
+                extraArgs = @()
+            }
+            investigate = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus", "sonnet")
+                maxTurns = 14
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{}
+                extraArgs = @()
+            }
+            reproduce = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus", "sonnet")
+                maxTurns = 24
+                capabilities = @("read", "search", "edit", "write", "shell")
+                options = [pscustomobject]@{
+                    dangerouslySkipPermissions = $true
+                }
+                extraArgs = @()
+            }
+            implement = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus", "sonnet")
+                maxTurns = 24
+                capabilities = @("read", "search", "edit", "write", "shell")
+                options = [pscustomobject]@{
+                    dangerouslySkipPermissions = $true
+                }
+                extraArgs = @()
+            }
+            reviewer = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus", "sonnet")
+                maxTurns = 12
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{}
+                promptTemplatePath = "agents/reviewer.md"
+                extraArgs = @()
+            }
+            scheduler = [pscustomobject]@{
+                cliProfile = "claude-code-vanilla"
+                provider = "anthropic"
+                modelClass = "opus"
+                usageModelClasses = @("opus")
+                maxTurns = 18
+                capabilities = @("read", "search", "shell")
+                options = [pscustomobject]@{}
+                promptTemplatePath = "agents/scheduler-agent.md"
+                extraArgs = @()
+            }
+        }
+    }
+}
+
+function New-AutoDevelopCodexFullExecutionProfile {
+    return [pscustomobject]@{
+        roles = [pscustomobject]@{
+            discover = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4-mini"
+                usageModelClasses = @("gpt-5.4-mini")
+                maxTurns = 12
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{
+                    reasoningEffort = "medium"
+                }
+                extraArgs = @()
+            }
+            plan = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 18
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                }
+                extraArgs = @()
+            }
+            fixPlan = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 18
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                }
+                extraArgs = @()
+            }
+            directionCheck = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4-mini"
+                usageModelClasses = @("gpt-5.4-mini")
+                maxTurns = 8
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{
+                    reasoningEffort = "medium"
+                }
+                extraArgs = @()
+            }
+            investigate = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 14
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                }
+                extraArgs = @()
+            }
+            reproduce = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 24
+                capabilities = @("read", "search", "edit", "write", "shell")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                    dangerouslySkipPermissions = $true
+                }
+                extraArgs = @()
+            }
+            implement = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 24
+                capabilities = @("read", "search", "edit", "write", "shell")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                    dangerouslySkipPermissions = $true
+                }
+                extraArgs = @()
+            }
+            reviewer = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 12
+                capabilities = @("read", "search")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                }
+                promptTemplatePath = "agents/reviewer.md"
+                extraArgs = @()
+            }
+            scheduler = [pscustomobject]@{
+                cliProfile = "codex"
+                provider = "openai"
+                model = "gpt-5.4"
+                usageModelClasses = @("gpt-5.4")
+                maxTurns = 18
+                capabilities = @("read", "search", "shell")
+                options = [pscustomobject]@{
+                    reasoningEffort = "xhigh"
+                }
+                promptTemplatePath = "agents/scheduler-agent.md"
+                extraArgs = @()
+            }
+        }
+    }
+}
+
 function Get-DefaultAutoDevelopConfig {
     return [pscustomobject]@{
         version = 4
         defaultExecutionProfile = "default"
+        hostDefaults = Get-DefaultAutoDevelopHostDefaults
         executionProfiles = [pscustomobject]@{
-            default = [pscustomobject]@{
-                roles = [pscustomobject]@{
-                    discover = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus")
-                        maxTurns = 12
-                        capabilities = @("read", "search")
-                        options = [pscustomobject]@{}
-                        extraArgs = @()
-                    }
-                    plan = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus", "sonnet")
-                        maxTurns = 18
-                        capabilities = @("read", "search")
-                        options = [pscustomobject]@{}
-                        extraArgs = @()
-                    }
-                    fixPlan = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus", "sonnet")
-                        maxTurns = 18
-                        capabilities = @("read", "search")
-                        options = [pscustomobject]@{}
-                        extraArgs = @()
-                    }
-                    directionCheck = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "sonnet"
-                        usageModelClasses = @("sonnet")
-                        maxTurns = 8
-                        capabilities = @("read", "search")
-                        options = [pscustomobject]@{}
-                        extraArgs = @()
-                    }
-                    investigate = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus", "sonnet")
-                        maxTurns = 14
-                        capabilities = @("read", "search")
-                        options = [pscustomobject]@{}
-                        extraArgs = @()
-                    }
-                    reproduce = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus", "sonnet")
-                        maxTurns = 24
-                        capabilities = @("read", "search", "edit", "write", "shell")
-                        options = [pscustomobject]@{
-                            dangerouslySkipPermissions = $true
-                        }
-                        extraArgs = @()
-                    }
-                    implement = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus", "sonnet")
-                        maxTurns = 24
-                        capabilities = @("read", "search", "edit", "write", "shell")
-                        options = [pscustomobject]@{
-                            dangerouslySkipPermissions = $true
-                        }
-                        extraArgs = @()
-                    }
-                    reviewer = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus", "sonnet")
-                        maxTurns = 12
-                        capabilities = @("read", "search")
-                        options = [pscustomobject]@{}
-                        promptTemplatePath = "agents/reviewer.md"
-                        extraArgs = @()
-                    }
-                    scheduler = [pscustomobject]@{
-                        cliProfile = "claude-code-vanilla"
-                        provider = "anthropic"
-                        modelClass = "opus"
-                        usageModelClasses = @("opus")
-                        maxTurns = 18
-                        capabilities = @("read", "search", "shell")
-                        options = [pscustomobject]@{}
-                        promptTemplatePath = "agents/scheduler-agent.md"
-                        extraArgs = @()
-                    }
-                }
-            }
+            default = New-AutoDevelopClaudeFullExecutionProfile
+            "claude-full" = New-AutoDevelopClaudeFullExecutionProfile
+            "codex-full" = New-AutoDevelopCodexFullExecutionProfile
         }
     }
 }
@@ -604,16 +848,21 @@ function Get-NormalizedAutoDevelopRoleConfig {
     )
 
     $scope = "executionProfiles.<active>.roles.$RoleName"
+    $model = Resolve-AutoDevelopStringValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "model" -FallbackValue "" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
     $modelClass = Resolve-AutoDevelopStringValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "modelClass" -FallbackValue "" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
     $cliProfile = Resolve-AutoDevelopStringValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "cliProfile" -FallbackValue "claude-code-vanilla" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
     $provider = Resolve-AutoDevelopStringValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "provider" -FallbackValue "anthropic" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
     $promptTemplatePath = Resolve-AutoDevelopStringValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "promptTemplatePath" -FallbackValue "" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
+    $explicitOptions = Get-AutoDevelopConfigPropertyValue -Object $ExplicitRole -Name "options"
+    $explicitOptionNames = if (Test-AutoDevelopConfigObject -Value $explicitOptions) { @(Get-AutoDevelopConfigPropertyNames -Object $explicitOptions) } else { @() }
 
     return [pscustomobject]@{
         roleName = $RoleName
         cliProfile = $cliProfile
         provider = $provider
+        model = $model
         modelClass = $modelClass
+        modelPinned = [bool](Test-AutoDevelopConfigPropertyDefined -Object $ExplicitRole -Name "model")
         modelClassPinned = [bool](Test-AutoDevelopConfigPropertyDefined -Object $ExplicitRole -Name "modelClass")
         maxTurns = Resolve-AutoDevelopPositiveIntValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "maxTurns" -FallbackValue 0 -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
         timeoutSeconds = Resolve-AutoDevelopPositiveIntValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "timeoutSeconds" -FallbackValue 0 -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings -AllowZero
@@ -623,6 +872,7 @@ function Get-NormalizedAutoDevelopRoleConfig {
         extraArgs = Resolve-AutoDevelopStringArrayValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "extraArgs" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
         fallbackCliProfiles = Resolve-AutoDevelopStringArrayValue -ExplicitObject $ExplicitRole -DefaultObject $DefaultRole -PropertyName "fallbackCliProfiles" -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
         options = Resolve-AutoDevelopOptionsValue -ExplicitRole $ExplicitRole -DefaultRole $DefaultRole -Scope $scope -ConfigPath $ConfigPath -Warnings $Warnings
+        explicitOptionNames = @($explicitOptionNames)
     }
 }
 
@@ -636,8 +886,11 @@ function Get-NormalizedAutoDevelopExecutionProfile {
     )
 
     $defaultRoles = Get-AutoDevelopConfigPropertyValue -Object $DefaultExecutionProfile -Name "roles"
-    $explicitRoles = if (Test-AutoDevelopConfigObject -Value (Get-AutoDevelopConfigPropertyValue -Object $ExplicitExecutionProfile -Name "roles")) { Get-AutoDevelopConfigPropertyValue -Object $ExplicitExecutionProfile -Name "roles" } else { $null }
-    if (Test-AutoDevelopConfigPropertyDefined -Object $ExplicitExecutionProfile -Name "roles" -and -not (Test-AutoDevelopConfigObject -Value (Get-AutoDevelopConfigPropertyValue -Object $ExplicitExecutionProfile -Name "roles"))) {
+    $explicitRolesValue = Get-AutoDevelopConfigPropertyValue -Object $ExplicitExecutionProfile -Name "roles"
+    $explicitRolesDefined = Test-AutoDevelopConfigPropertyDefined -Object $ExplicitExecutionProfile -Name "roles"
+    $explicitRolesIsObject = Test-AutoDevelopConfigObject -Value $explicitRolesValue
+    $explicitRoles = if ($explicitRolesIsObject) { $explicitRolesValue } else { $null }
+    if ($explicitRolesDefined -and -not $explicitRolesIsObject) {
         Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "executionProfiles.$ExecutionProfileName.roles" -Message "Roles must be a JSON object. Falling back to the default execution profile roles."
     }
 
@@ -689,13 +942,21 @@ function Get-NormalizedAutoDevelopConfig {
     }
 
     $defaultExecutionProfile = Resolve-AutoDevelopStringValue -ExplicitObject $OverrideConfig -DefaultObject $defaults -PropertyName "defaultExecutionProfile" -FallbackValue "default" -Scope "root" -ConfigPath $ConfigPath -Warnings $Warnings
-    $defaultProfileTemplate = Get-AutoDevelopConfigPropertyValue -Object (Get-AutoDevelopConfigPropertyValue -Object $defaults -Name "executionProfiles") -Name "default"
-    $explicitProfiles = if (Test-AutoDevelopConfigObject -Value (Get-AutoDevelopConfigPropertyValue -Object $OverrideConfig -Name "executionProfiles")) { Get-AutoDevelopConfigPropertyValue -Object $OverrideConfig -Name "executionProfiles" } else { $null }
-    if (Test-AutoDevelopConfigPropertyDefined -Object $OverrideConfig -Name "executionProfiles" -and -not (Test-AutoDevelopConfigObject -Value (Get-AutoDevelopConfigPropertyValue -Object $OverrideConfig -Name "executionProfiles"))) {
+    $defaultProfiles = Get-AutoDevelopConfigPropertyValue -Object $defaults -Name "executionProfiles"
+    $defaultProfileTemplate = Get-AutoDevelopConfigPropertyValue -Object $defaultProfiles -Name "default"
+    $hostDefaults = Resolve-AutoDevelopHostDefaultsValue -OverrideConfig $OverrideConfig -DefaultObject $defaults -ConfigPath $ConfigPath -Warnings $Warnings
+    $explicitProfilesValue = Get-AutoDevelopConfigPropertyValue -Object $OverrideConfig -Name "executionProfiles"
+    $explicitProfilesDefined = Test-AutoDevelopConfigPropertyDefined -Object $OverrideConfig -Name "executionProfiles"
+    $explicitProfilesIsObject = Test-AutoDevelopConfigObject -Value $explicitProfilesValue
+    $explicitProfiles = if ($explicitProfilesIsObject) { $explicitProfilesValue } else { $null }
+    if ($explicitProfilesDefined -and -not $explicitProfilesIsObject) {
         Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "executionProfiles" -Message "Execution profiles must be a JSON object. Falling back to the built-in profiles."
     }
 
-    $profileNames = [ordered]@{ default = $true }
+    $profileNames = [ordered]@{}
+    foreach ($profileName in Get-AutoDevelopConfigPropertyNames -Object $defaultProfiles) {
+        $profileNames[$profileName] = $true
+    }
     foreach ($profileName in Get-AutoDevelopConfigPropertyNames -Object $explicitProfiles) {
         $profileNames[$profileName] = $true
     }
@@ -707,7 +968,11 @@ function Get-NormalizedAutoDevelopConfig {
             Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "executionProfiles.$profileName" -Message "Execution profile must be a JSON object. Falling back to the built-in default profile."
             $explicitProfile = $null
         }
-        $normalizedProfiles[$profileName] = Get-NormalizedAutoDevelopExecutionProfile -ExecutionProfileName $profileName -ExplicitExecutionProfile $explicitProfile -DefaultExecutionProfile $defaultProfileTemplate -ConfigPath $ConfigPath -Warnings $Warnings
+        $defaultProfile = Get-AutoDevelopConfigPropertyValue -Object $defaultProfiles -Name $profileName
+        if (-not $defaultProfile) {
+            $defaultProfile = $defaultProfileTemplate
+        }
+        $normalizedProfiles[$profileName] = Get-NormalizedAutoDevelopExecutionProfile -ExecutionProfileName $profileName -ExplicitExecutionProfile $explicitProfile -DefaultExecutionProfile $defaultProfile -ConfigPath $ConfigPath -Warnings $Warnings
     }
 
     if (-not $normalizedProfiles.Contains($defaultExecutionProfile)) {
@@ -715,10 +980,48 @@ function Get-NormalizedAutoDevelopConfig {
         $defaultExecutionProfile = "default"
     }
 
+    $defaultHostDefaults = Get-AutoDevelopConfigPropertyValue -Object $defaults -Name "hostDefaults"
+    $normalizedHostDefaults = [ordered]@{}
+    foreach ($hostName in Get-AutoDevelopSupportedEditorHosts) {
+        $hostProfile = Get-AutoDevelopTrimmedString -Value (Get-AutoDevelopConfigPropertyValue -Object $hostDefaults -Name $hostName)
+        if ($hostProfile -and -not $normalizedProfiles.Contains($hostProfile)) {
+            Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $ConfigPath -Scope "hostDefaults.$hostName" -Message "Host default execution profile '$hostProfile' is not defined. Falling back to the built-in host default."
+            $hostProfile = Get-AutoDevelopTrimmedString -Value (Get-AutoDevelopConfigPropertyValue -Object $defaultHostDefaults -Name $hostName)
+        }
+        if ($hostProfile -and -not $normalizedProfiles.Contains($hostProfile)) {
+            $hostProfile = ""
+        }
+        $normalizedHostDefaults[$hostName] = $hostProfile
+    }
+
     return [pscustomobject]@{
         version = 4
         defaultExecutionProfile = $defaultExecutionProfile
+        hostDefaults = [pscustomobject]$normalizedHostDefaults
         executionProfiles = [pscustomobject]$normalizedProfiles
+    }
+}
+
+function Get-AutoDevelopDefaultExecutionProfileSelection {
+    param(
+        $Config,
+        [string]$DetectedHost = ""
+    )
+
+    $defaultExecutionProfile = [string](Get-AutoDevelopConfigPropertyValue -Object $Config -Name "defaultExecutionProfile")
+    $executionProfiles = Get-AutoDevelopConfigPropertyValue -Object $Config -Name "executionProfiles"
+    $hostDefaults = Get-AutoDevelopConfigPropertyValue -Object $Config -Name "hostDefaults"
+    $hostProfile = if ($DetectedHost) { Get-AutoDevelopTrimmedString -Value (Get-AutoDevelopConfigPropertyValue -Object $hostDefaults -Name $DetectedHost) } else { "" }
+    if ($hostProfile -and (Get-AutoDevelopConfigPropertyValue -Object $executionProfiles -Name $hostProfile)) {
+        return [pscustomobject]@{
+            activeExecutionProfile = $hostProfile
+            source = "host-default"
+        }
+    }
+
+    return [pscustomobject]@{
+        activeExecutionProfile = $defaultExecutionProfile
+        source = "default"
     }
 }
 
@@ -727,32 +1030,24 @@ function Resolve-AutoDevelopSessionSelection {
         $Config,
         $SessionState,
         [string]$SessionPath,
-        [System.Collections.ArrayList]$Warnings
+        [System.Collections.ArrayList]$Warnings,
+        [string]$DetectedHost = ""
     )
 
-    $defaultExecutionProfile = [string](Get-AutoDevelopConfigPropertyValue -Object $Config -Name "defaultExecutionProfile")
+    $defaultSelection = Get-AutoDevelopDefaultExecutionProfileSelection -Config $Config -DetectedHost $DetectedHost
     if (-not (Test-AutoDevelopConfigObject -Value $SessionState)) {
-        return [pscustomobject]@{
-            activeExecutionProfile = $defaultExecutionProfile
-            source = "default"
-        }
+        return $defaultSelection
     }
 
     $activeExecutionProfile = Get-AutoDevelopTrimmedString -Value (Get-AutoDevelopConfigPropertyValue -Object $SessionState -Name "activeExecutionProfile")
     if (-not $activeExecutionProfile) {
-        return [pscustomobject]@{
-            activeExecutionProfile = $defaultExecutionProfile
-            source = "default"
-        }
+        return $defaultSelection
     }
 
     $executionProfiles = Get-AutoDevelopConfigPropertyValue -Object $Config -Name "executionProfiles"
     if (-not (Get-AutoDevelopConfigPropertyValue -Object $executionProfiles -Name $activeExecutionProfile)) {
         Add-AutoDevelopConfigWarning -Warnings $Warnings -Path $SessionPath -Scope "session.activeExecutionProfile" -Message "Execution profile '$activeExecutionProfile' is not defined. Falling back to the default execution profile."
-        return [pscustomobject]@{
-            activeExecutionProfile = $defaultExecutionProfile
-            source = "default"
-        }
+        return $defaultSelection
     }
 
     return [pscustomobject]@{
@@ -777,7 +1072,8 @@ function Get-AutoDevelopConfigState {
     }
 
     $effectiveConfig = Get-NormalizedAutoDevelopConfig -OverrideConfig $configFileState.config -ConfigPath $configPath -Warnings $warnings
-    $sessionSelection = Resolve-AutoDevelopSessionSelection -Config $effectiveConfig -SessionState $sessionFileState.config -SessionPath $sessionPath -Warnings $warnings
+    $detectedHost = Resolve-AutoDevelopDetectedHost -Warnings $warnings -ConfigPath $configPath
+    $sessionSelection = Resolve-AutoDevelopSessionSelection -Config $effectiveConfig -SessionState $sessionFileState.config -SessionPath $sessionPath -Warnings $warnings -DetectedHost ([string]$detectedHost.host)
 
     return [pscustomobject]@{
         path = $configPath
@@ -785,6 +1081,8 @@ function Get-AutoDevelopConfigState {
         explicit = $configFileState.config
         sessionPath = $sessionPath
         sessionFile = $sessionFileState
+        detectedHost = [string]$detectedHost.host
+        detectedHostSource = [string]$detectedHost.source
         activeExecutionProfile = $sessionSelection.activeExecutionProfile
         activeExecutionProfileSource = $sessionSelection.source
         warnings = @($warnings.ToArray())
@@ -796,12 +1094,18 @@ function Get-AutoDevelopConfigState {
 function Resolve-AutoDevelopModelToken {
     param(
         $CliProfile,
+        [string]$Model,
         [string]$Provider,
         [string]$ModelClass,
         [string]$ConfigPath,
         [System.Collections.ArrayList]$Warnings,
         [string]$Scope
     )
+
+    $explicitModel = Get-AutoDevelopTrimmedString -Value $Model
+    if ($explicitModel) {
+        return $explicitModel
+    }
 
     if (-not $ModelClass) { return "" }
     $modelResolution = Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "modelResolution"
@@ -844,13 +1148,20 @@ function Test-AutoDevelopProfileSupportsRoleConfig {
     )
 
     $supportedProviders = @(ConvertTo-AutoDevelopStringArray -Value (Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "supportedProviders"))
-    if ($supportedProviders.Count -gt 0 -and $supportedProviders -notcontains [string]$RoleConfig.provider) {
+    if ($supportedProviders.Count -gt 0 -and [string]$RoleConfig.provider -and $supportedProviders -notcontains [string]$RoleConfig.provider) {
         $FailureReason.Value = "cliProfile '$([string](Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name 'id'))' does not support provider '$([string]$RoleConfig.provider)'."
         return $false
     }
 
+    $supportedOptions = Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "supportedOptions"
+    $explicitModel = Get-AutoDevelopTrimmedString -Value $RoleConfig.model
+    if ($explicitModel -and -not [bool](Get-AutoDevelopConfigPropertyValue -Object $supportedOptions -Name "explicitModel")) {
+        $FailureReason.Value = "cliProfile '$([string](Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name 'id'))' does not support an explicit model token."
+        return $false
+    }
+
     $supportedModelClasses = @(ConvertTo-AutoDevelopStringArray -Value (Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "supportedModelClasses"))
-    if ([string]$RoleConfig.modelClass -and $supportedModelClasses.Count -gt 0 -and $supportedModelClasses -notcontains [string]$RoleConfig.modelClass) {
+    if (-not $explicitModel -and [string]$RoleConfig.modelClass -and $supportedModelClasses.Count -gt 0 -and $supportedModelClasses -notcontains [string]$RoleConfig.modelClass) {
         $FailureReason.Value = "cliProfile '$([string](Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name 'id'))' does not support modelClass '$([string]$RoleConfig.modelClass)'."
         return $false
     }
@@ -863,7 +1174,6 @@ function Test-AutoDevelopProfileSupportsRoleConfig {
         }
     }
 
-    $supportedOptions = Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "supportedOptions"
     $reasoningEffort = [string]$RoleConfig.reasoningEffort
     if ($reasoningEffort) {
         $supportedReasoning = @(ConvertTo-AutoDevelopStringArray -Value (Get-AutoDevelopConfigPropertyValue -Object $supportedOptions -Name "reasoningEffort"))
@@ -912,10 +1222,12 @@ function ConvertTo-AutoDevelopResolvedRoleConfig {
         cliFamily = [string](Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "family")
         provider = $RoleConfig.provider
         command = [string](Get-AutoDevelopConfigPropertyValue -Object $CliProfile -Name "command")
+        configuredModel = $RoleConfig.model
         modelClass = $RoleConfig.modelClass
+        modelPinned = $RoleConfig.modelPinned
         modelClassPinned = $RoleConfig.modelClassPinned
         modelSource = $RoleConfig.modelSource
-        model = Resolve-AutoDevelopModelToken -CliProfile $CliProfile -Provider $RoleConfig.provider -ModelClass $RoleConfig.modelClass -ConfigPath "" -Warnings ([System.Collections.ArrayList]::new()) -Scope ""
+        model = Resolve-AutoDevelopModelToken -CliProfile $CliProfile -Model $RoleConfig.model -Provider $RoleConfig.provider -ModelClass $RoleConfig.modelClass -ConfigPath "" -Warnings ([System.Collections.ArrayList]::new()) -Scope ""
         reasoningEffort = $RoleConfig.reasoningEffort
         maxTurns = $RoleConfig.maxTurns
         timeoutSeconds = $RoleConfig.timeoutSeconds
@@ -979,17 +1291,26 @@ function Resolve-AutoDevelopRoleConfig {
     }
 
     $provider = [string](Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "provider")
+    $configuredModel = [string](Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "model")
     $modelClass = [string](Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "modelClass")
+    $modelPinned = [bool](Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "modelPinned")
     $modelClassPinned = [bool](Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "modelClassPinned")
-    $modelSource = if ($modelClassPinned) { "explicit" } elseif ($ModelOverride) { "runtime" } elseif ($modelClass) { "default" } else { "unset" }
-    if (-not $modelClassPinned -and $ModelOverride) {
+    $modelSource = if ($modelPinned -and $configuredModel) { "explicit-model" } elseif ($modelClassPinned) { "explicit" } elseif ($ModelOverride) { "runtime" } elseif ($modelClass) { "default" } else { "unset" }
+    if (-not $modelPinned -and -not $modelClassPinned -and $ModelOverride) {
         $modelClass = $ModelOverride
     }
 
     $options = Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "options"
+    $explicitOptionNames = @((Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "explicitOptionNames"))
+    $supportedOptions = Get-AutoDevelopConfigPropertyValue -Object $cliProfile -Name "supportedOptions"
     $reasoningEffort = Get-AutoDevelopTrimmedString -Value (Get-AutoDevelopConfigPropertyValue -Object $options -Name "reasoningEffort")
-    if ($reasoningEffort -and $reasoningEffort -notin @("low", "medium", "high")) {
+    $supportedReasoningEfforts = @(ConvertTo-AutoDevelopStringArray -Value (Get-AutoDevelopConfigPropertyValue -Object $supportedOptions -Name "reasoningEffort"))
+    if ($reasoningEffort -and $supportedReasoningEfforts.Count -gt 0 -and $supportedReasoningEfforts -notcontains $reasoningEffort) {
         $reasoningEffort = ""
+    }
+    $dangerouslySkipPermissions = [bool](Get-AutoDevelopConfigPropertyValue -Object $options -Name "dangerouslySkipPermissions")
+    if ($dangerouslySkipPermissions -and $explicitOptionNames -notcontains "dangerouslySkipPermissions" -and -not [bool](Get-AutoDevelopConfigPropertyValue -Object $supportedOptions -Name "dangerouslySkipPermissions")) {
+        $dangerouslySkipPermissions = $false
     }
 
     $baseRole = [pscustomobject]@{
@@ -998,7 +1319,9 @@ function Resolve-AutoDevelopRoleConfig {
         executionProfileSource = $ConfigState.activeExecutionProfileSource
         cliProfile = $cliProfileId
         provider = $provider
+        model = $configuredModel
         modelClass = $modelClass
+        modelPinned = $modelPinned
         modelClassPinned = $modelClassPinned
         modelSource = $modelSource
         reasoningEffort = $reasoningEffort
@@ -1010,7 +1333,8 @@ function Resolve-AutoDevelopRoleConfig {
         extraArgs = @((Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "extraArgs"))
         fallbackCliProfiles = @((Get-AutoDevelopConfigPropertyValue -Object $roleConfig -Name "fallbackCliProfiles"))
         options = $options
-        dangerouslySkipPermissions = [bool](Get-AutoDevelopConfigPropertyValue -Object $options -Name "dangerouslySkipPermissions")
+        explicitOptionNames = @($explicitOptionNames)
+        dangerouslySkipPermissions = $dangerouslySkipPermissions
     }
 
     return (ConvertTo-AutoDevelopResolvedRoleConfig -RoleConfig $baseRole -CliProfile $cliProfile)
@@ -1045,7 +1369,13 @@ function Get-AutoDevelopRoleUsageCombos {
     $combos = New-Object System.Collections.Generic.List[object]
     foreach ($roleName in @($RoleNames)) {
         $resolvedRole = Resolve-AutoDevelopRoleConfig -ConfigState $ConfigState -RoleName $roleName
-        $candidateModelClasses = if ($resolvedRole.modelClassPinned -or -not @($resolvedRole.usageModelClasses).Count) { @($resolvedRole.modelClass) } else { @($resolvedRole.usageModelClasses) }
+        $candidateModelClasses = if ($resolvedRole.modelPinned -and $resolvedRole.model) {
+            @($resolvedRole.model)
+        } elseif ($resolvedRole.modelClassPinned -or -not @($resolvedRole.usageModelClasses).Count) {
+            if ($resolvedRole.modelClass) { @($resolvedRole.modelClass) } elseif ($resolvedRole.model) { @($resolvedRole.model) } else { @() }
+        } else {
+            @($resolvedRole.usageModelClasses)
+        }
         foreach ($modelClass in @($candidateModelClasses | Where-Object { $_ })) {
             $key = "$($resolvedRole.cliProfile)|$($resolvedRole.provider)|$modelClass"
             if ($seen.Contains($key)) { continue }
@@ -1076,6 +1406,14 @@ function Get-AutoDevelopCliProfileUsageSupport {
     $usageEntry = Get-AutoDevelopConfigPropertyValue -Object $usageSupport -Name $usageKey
     if ($usageEntry) {
         return $usageEntry
+    }
+    $providerWildcardEntry = Get-AutoDevelopConfigPropertyValue -Object $usageSupport -Name "${Provider}:*"
+    if ($providerWildcardEntry) {
+        return $providerWildcardEntry
+    }
+    $globalWildcardEntry = Get-AutoDevelopConfigPropertyValue -Object $usageSupport -Name "*:*"
+    if ($globalWildcardEntry) {
+        return $globalWildcardEntry
     }
     return [pscustomobject]@{ mode = "none" }
 }

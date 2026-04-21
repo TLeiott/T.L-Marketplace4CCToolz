@@ -185,9 +185,15 @@ Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
 function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments)
     $resolvedCommand = Resolve-AutoDevelopNativeCommandName -Command $Command
+    $invocationCommand = $resolvedCommand
+    $invocationArguments = @($Arguments)
+    if ($resolvedCommand -and [System.IO.Path]::GetExtension([string]$resolvedCommand).ToLowerInvariant() -eq ".ps1") {
+        $invocationCommand = "powershell.exe"
+        $invocationArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", [string]$resolvedCommand) + @($Arguments)
+    }
     $output = & {
         $ErrorActionPreference = "Continue"
-        & $resolvedCommand @Arguments 2>&1
+        & $invocationCommand @invocationArguments 2>&1
     }
     return @{ output = ($output | Out-String).Trim(); exitCode = $LASTEXITCODE }
 }
@@ -365,6 +371,52 @@ function Get-RetryLessonsFromFeedbackHistory {
     }
 
     return @($lessons)
+}
+
+function Get-CurrentAttemptReviewBlockersText {
+    param(
+        [System.Collections.ArrayList]$History,
+        [int]$MaxEntries = 6,
+        [int]$MaxChars = 900
+    )
+
+    if (-not $History -or $History.Count -eq 0) { return "" }
+
+    $entries = [System.Collections.ArrayList]::new()
+    $seenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($History)) {
+        if (-not $entry) { continue }
+        if ([string]$entry.source -ne "REVIEW") { continue }
+        $category = ([string]$entry.category).Trim().ToUpperInvariant()
+        if ($category -notmatch '^REVIEW_DENIED_') { continue }
+
+        $feedbackText = [string]$entry.feedback
+        $firstLine = @($feedbackText -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1)[0]
+        if (-not $firstLine) {
+            $firstLine = $category
+        }
+
+        $dedupeKey = @(
+            $category,
+            (Get-RetryLessonComparisonText -Text $firstLine)
+        ) -join "|"
+        if (-not $dedupeKey.Trim('|')) { continue }
+        if (-not $seenKeys.Add($dedupeKey)) { continue }
+
+        [void]$entries.Add([pscustomobject]@{
+            attempt = if ($null -ne $entry.attempt) { [int]$entry.attempt } else { 0 }
+            category = $category
+            feedback = Clip-Text -Text $feedbackText -MaxChars 220 -Marker "Feedback trimmed"
+        })
+    }
+
+    if ($entries.Count -eq 0) { return "" }
+
+    $selected = @($entries | Select-Object -Last $MaxEntries | ForEach-Object {
+        "- Review $([int]$_.attempt) [$([string]$_.category)]: $([string]$_.feedback)"
+    })
+
+    return Clip-Text -Text ($selected -join "`n") -MaxChars $MaxChars -Marker "Review blockers trimmed"
 }
 
 function Get-RetryContextState {
@@ -1331,19 +1383,43 @@ function Format-RelevantList {
     return ($lines -join "`n")
 }
 
-function Get-CompactClaudeContext {
-    param([string]$RepoRoot)
-    $claudeMdPath = Join-Path $RepoRoot "CLAUDE.md"
-    if (-not (Test-Path $claudeMdPath)) { return "" }
+function Get-CompactInstructionFileSummary {
+    param(
+        [string]$RepoRoot,
+        [string]$FileName
+    )
+
+    $instructionPath = Join-Path $RepoRoot $FileName
+    if (-not (Test-Path $instructionPath)) { return "" }
     try {
-        $claudeText = [System.IO.File]::ReadAllText($claudeMdPath, [System.Text.Encoding]::UTF8)
+        $instructionText = [System.IO.File]::ReadAllText($instructionPath, [System.Text.Encoding]::UTF8)
     } catch {
         return ""
     }
-    $lines = @($claudeText -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
+
+    $lines = @($instructionText -split "`r?`n" | Where-Object { $_.Trim() -ne "" })
     $headings = @($lines | Where-Object { $_ -match '^\s*#' } | Select-Object -First 8)
     $body = @($lines | Where-Object { $_ -notmatch '^\s*#' } | Select-Object -First 14)
-    return Clip-Text -Text (($headings + $body) -join "`n") -MaxChars 1800 -Marker "CLAUDE.md trimmed"
+    return Clip-Text -Text (($headings + $body) -join "`n") -MaxChars 1800 -Marker "$FileName trimmed"
+}
+
+function Get-CompactWorkspaceInstructionContext {
+    param([string]$RepoRoot)
+
+    $sections = New-Object System.Collections.Generic.List[string]
+    foreach ($fileName in @("AGENTS.md", "CLAUDE.md")) {
+        $summary = Get-CompactInstructionFileSummary -RepoRoot $RepoRoot -FileName $fileName
+        if (-not $summary) { continue }
+
+        $label = ([System.IO.Path]::GetFileNameWithoutExtension($fileName) + "_MD_SUMMARY").ToUpperInvariant()
+        [void]$sections.Add("${label}:`n$summary")
+    }
+
+    if ($sections.Count -eq 0) {
+        return ""
+    }
+
+    return Clip-Text -Text (($sections.ToArray() -join "`n`n").Trim()) -MaxChars 2400 -Marker "Workspace instructions trimmed"
 }
 
 function Get-CodebaseInventory {
@@ -1365,7 +1441,7 @@ function Get-CodebaseInventory {
         Select-Object -Unique)
 
     return [ordered]@{
-        claudeContext = Get-CompactClaudeContext -RepoRoot $RepoRoot
+        workspaceInstructionContext = Get-CompactWorkspaceInstructionContext -RepoRoot $RepoRoot
         projects = @($projectLines)
         directories = @($directoryLines)
     }
@@ -1378,8 +1454,8 @@ function Build-CompactCodebaseContext {
         [string[]]$Targets = @()
     )
     $parts = [System.Collections.ArrayList]::new()
-    if ($Inventory.claudeContext) {
-        [void]$parts.Add("CLAUDE_MD_SUMMARY:`n$($Inventory.claudeContext)")
+    if ($Inventory.workspaceInstructionContext) {
+        [void]$parts.Add("WORKSPACE_INSTRUCTIONS:`n$($Inventory.workspaceInstructionContext)")
     }
     if ($Inventory.projects.Count -gt 0) {
         [void]$parts.Add("PROJECTS:`n" + (Format-RelevantList -Items $Inventory.projects -TaskText $TaskText -Targets $Targets -MaxChars 1200 -EmptyText "- No projects"))
@@ -3761,11 +3837,6 @@ try {
         Write-ResultJson -status "ERROR" -finalCategory "VALIDATION_ERROR" -summary "No git repository was found." -error "No git repository was found." -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
     }
-    $r = Invoke-NativeCommand git @("status", "--porcelain")
-    if ($r.output) {
-        Write-ResultJson -status "ERROR" -finalCategory "DIRTY_WORKTREE" -summary "The working tree is not clean." -error "The working tree is not clean.`nDirty files:`n$($r.output)" -phase "VALIDATE" -validationIssues $resultValidationIssues
-        exit 1
-    }
     if (-not (Test-Path $SolutionPath)) {
         Write-ResultJson -status "ERROR" -finalCategory "MISSING_SOLUTION" -summary "The solution was not found." -error "Solution not found: $SolutionPath" -phase "VALIDATE" -validationIssues $resultValidationIssues
         exit 1
@@ -3773,15 +3844,9 @@ try {
 
     Ensure-DebugDir | Out-Null
     $repoRoot = (Invoke-NativeCommand git @("rev-parse", "--show-toplevel")).output
-    $autoDevelopConfigState = Get-AutoDevelopConfigState -RepoRoot $repoRoot
     Ensure-ArtifactDir -Root $repoRoot | Out-Null
     Write-DebugManifest
     Write-TimelineArtifact
-    if (@($autoDevelopConfigState.warnings).Count -gt 0) {
-        Add-TimelineEvent -Phase "CONFIG" -Message "AutoDevelop-Konfiguration mit Warnungen geladen. Teilweise werden Defaults verwendet." -Category "CONFIG_WARNING" -Data @{ path = $autoDevelopConfigState.path; warnings = @($autoDevelopConfigState.warnings) }
-    } elseif ($autoDevelopConfigState.file.loaded) {
-        Add-TimelineEvent -Phase "CONFIG" -Message "AutoDevelop-Konfiguration aus dem Repository geladen." -Category "CONFIG_LOADED" -Data @{ path = $autoDevelopConfigState.path }
-    }
 
     $promptValidation = Get-TaskPromptValidationResult -PromptFile $PromptFile
     if (-not $promptValidation.isValid) {
@@ -3791,6 +3856,19 @@ try {
         $finalFeedback = [string]$promptValidation.message
         Add-TimelineEvent -Phase "VALIDATE" -Message "Prompt file validation failed." -Category "INVALID_PROMPT_FILE" -Data @{ promptFile = $PromptFile; reason = [string]$promptValidation.message }
         throw [System.Exception]::new("TERMINAL_INVALID_PROMPT_FILE")
+    }
+
+    $r = Invoke-NativeCommand git @("status", "--porcelain")
+    if ($r.output) {
+        Write-ResultJson -status "ERROR" -finalCategory "DIRTY_WORKTREE" -summary "The working tree is not clean." -error "The working tree is not clean.`nDirty files:`n$($r.output)" -phase "VALIDATE" -validationIssues $resultValidationIssues
+        exit 1
+    }
+
+    $autoDevelopConfigState = Get-AutoDevelopConfigState -RepoRoot $repoRoot
+    if (@($autoDevelopConfigState.warnings).Count -gt 0) {
+        Add-TimelineEvent -Phase "CONFIG" -Message "AutoDevelop-Konfiguration mit Warnungen geladen. Teilweise werden Defaults verwendet." -Category "CONFIG_WARNING" -Data @{ path = $autoDevelopConfigState.path; warnings = @($autoDevelopConfigState.warnings) }
+    } elseif ($autoDevelopConfigState.file.loaded) {
+        Add-TimelineEvent -Phase "CONFIG" -Message "AutoDevelop-Konfiguration aus dem Repository geladen." -Category "CONFIG_LOADED" -Data @{ path = $autoDevelopConfigState.path }
     }
 
     $taskPrompt = [string]$promptValidation.promptText
@@ -5093,6 +5171,7 @@ $taskPrompt
             $finalSeverity = $verdict.severity
             $reviewFeedback = "REVIEW DENIED ($($verdict.severity)):`n$($verdict.feedback)"
             Add-FeedbackEntry -Attempt ($reviewCycle + 1) -Source "REVIEW" -Category "REVIEW_DENIED_$($verdict.severity)" -Feedback $reviewFeedback
+            $currentAttemptReviewBlockers = Get-CurrentAttemptReviewBlockersText -History $feedbackHistory
             if ($reviewCycle -ge $CONST_REMEDIATION_ATTEMPTS) {
                 if ($verdict.severity -eq "MINOR" -and (Test-HasActionableSignal -Text $verdict.feedback)) {
                     $minorRescuePrompt = @"
@@ -5102,6 +5181,11 @@ FIX ONLY THESE MINOR ISSUES IN THE CURRENT WORKTREE.
 
 FEEDBACK:
 $($verdict.feedback)
+
+EARLIER REVIEW BLOCKERS FROM THIS ATTEMPT:
+$currentAttemptReviewBlockers
+
+Do not reintroduce any earlier denied behavior while fixing the current review blocker.
 
 $retryContextRemediateBlock
 "@
@@ -5128,6 +5212,11 @@ Fix only the following review feedback in the current worktree.
 
 FEEDBACK:
 $($verdict.feedback)
+
+EARLIER REVIEW BLOCKERS FROM THIS ATTEMPT:
+$currentAttemptReviewBlockers
+
+Do not reintroduce any earlier denied behavior while fixing the current review blocker.
 
 $retryContextRemediateBlock
 
@@ -5213,3 +5302,9 @@ SUMMARY:
         Invoke-NativeCommand git @("branch", "-D", $branchName) | Out-Null
     }
 }
+
+if ($finalStatus -eq "ACCEPTED") {
+    exit 0
+}
+
+exit 1

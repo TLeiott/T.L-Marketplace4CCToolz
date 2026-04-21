@@ -1,6 +1,6 @@
 # T.L-AutoDevelop
 
-Interactive queue-aware .NET development orchestration for Claude Code and OpenCode.
+Interactive queue-aware .NET development orchestration for Claude Code, Codex, and OpenCode.
 
 ## Command
 
@@ -17,10 +17,10 @@ Interactive queue-aware .NET development orchestration for Claude Code and OpenC
 - accepts either a direct task text or a file containing multiple tasks
 - uses the config-driven `scheduler` role to plan conservative execution waves
 - reads repo-local execution profile config from `.claude/autodevelop.json`
-- resolves the active session execution profile from `.claude-develop-logs/session.json` or the repo default
+- resolves the active session execution profile from `.claude-develop-logs/session.json`, host-aware editor defaults, or the repo default
 - resolves worker, reviewer, and scheduler runtime settings per role from shipped CLI profiles plus repo execution profiles
 - aggregates usage checks across all active CLI/provider/model-class combinations
-- supports hybrid execution profiles where different roles run through `claude-code` or `opencode`
+- supports hybrid execution profiles where different roles run through `claude-code`, `codex`, or `opencode`
 - starts multiple worker pipes asynchronously when their likely edit scopes are disjoint
 - lets `scheduler.ps1` wait for queue changes after launches instead of relying on external sleep-based polling
 - leaves successful worker changes on normal branches for later merge preparation
@@ -29,7 +29,7 @@ Interactive queue-aware .NET development orchestration for Claude Code and OpenC
 
 ## Included Components
 
-- `skills/develop/SKILL.md` — Main-Claude interactive orchestrator
+- `skills/develop/SKILL.md` — Main AutoDevelop interactive orchestrator
 - `skills/develop-prepare/SKILL.md` — Explicit prepare and hygiene command
 - `skills/pipe-feedback/SKILL.md` — Post-run pipeline feedback and friction analysis
 - `skills/autodev-config/SKILL.md` — Repo-local AutoDevelop config inspector/editor
@@ -60,7 +60,7 @@ Interactive queue-aware .NET development orchestration for Claude Code and OpenC
 - Windows (PowerShell 5.1+)
 - .NET SDK
 - Git
-- Claude CLI and/or OpenCode CLI, depending on the configured role profiles
+- Claude Code CLI and/or Codex CLI and/or OpenCode CLI, depending on the configured role profiles
 
 ## Testing AutoDevelop
 
@@ -122,13 +122,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\T.L-AutoDevelop\sc
 - missing config falls back to built-in defaults
 - plugin updates do not overwrite repo config
 - config version `4` defines repo-local `executionProfiles`
+- config version `4` also supports `hostDefaults` for editor-aware default profile selection
 - shipped `cliProfile` manifests define which CLIs, providers, model classes, options, and usage probes are supported by this plugin build
 - an execution profile selects `cliProfile`, `provider`, `modelClass`, optional explicit `model`, and options per role
-- a session-local selection in `.claude-develop-logs/session.json` can activate a different execution profile for the current Claude conversation
-- if no session profile is active, AutoDevelop uses `defaultExecutionProfile`
+- built-in profiles include `default`, `claude-full`, and `codex-full`
+- a session-local selection in `.claude-develop-logs/session.json` can activate a different execution profile for the current repository session
+- if no session profile is active, AutoDevelop first checks `hostDefaults` for the detected editor host and then falls back to `defaultExecutionProfile`
 - an explicit role `modelClass` pins that role to the configured model class
 - an explicit role `model` pins that role to the configured full model token
-- for `opencode` roles, prefer explicit `model` values like `openai/gpt-5.4` instead of relying on `modelClass`
+- for `opencode` and `codex` roles, prefer explicit `model` values like `openai/gpt-5.4` instead of relying on `modelClass`
 - if a role omits `modelClass`, the built-in default or runtime override can still decide the effective model token
 - invalid config values fall back to built-in defaults with warnings instead of crashing the pipeline
 - unsupported CLI profiles are rejected; only shipped supported profiles may be used

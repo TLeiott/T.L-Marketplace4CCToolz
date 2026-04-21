@@ -16,12 +16,18 @@ function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments, [string]$WorkingDirectory = '')
 
     $resolvedCommand = Resolve-AutoDevelopNativeCommandName -Command $Command
+    $invocationCommand = $resolvedCommand
+    $invocationArguments = @($Arguments)
+    if ($resolvedCommand -and [System.IO.Path]::GetExtension([string]$resolvedCommand).ToLowerInvariant() -eq '.ps1') {
+        $invocationCommand = 'powershell.exe'
+        $invocationArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', [string]$resolvedCommand) + @($Arguments)
+    }
     $output = if ($WorkingDirectory) {
         & {
             $ErrorActionPreference = 'Continue'
             Push-Location $WorkingDirectory
             try {
-                & $resolvedCommand @Arguments 2>&1
+                & $invocationCommand @invocationArguments 2>&1
             } finally {
                 Pop-Location
             }
@@ -29,7 +35,7 @@ function Invoke-NativeCommand {
     } else {
         & {
             $ErrorActionPreference = 'Continue'
-            & $resolvedCommand @Arguments 2>&1
+            & $invocationCommand @invocationArguments 2>&1
         }
     }
 
@@ -175,6 +181,40 @@ function Invoke-ComboUsageProbe {
             $result | Add-Member -NotePropertyName provider -NotePropertyValue $Combo.provider -Force
             $result | Add-Member -NotePropertyName modelClass -NotePropertyValue $Combo.modelClass -Force
             $result | Add-Member -NotePropertyName mode -NotePropertyValue 'claude-oauth' -Force
+            return $result
+        }
+        'codex-session' {
+            $gatePath = Join-Path $PSScriptRoot 'codex-usage-gate.ps1'
+            $arguments = @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-File', $gatePath,
+                '-Mode', $Mode,
+                '-ThresholdPercent', $Threshold.ToString(),
+                '-PollSeconds', $Poll.ToString(),
+                '-FastPollSeconds', $FastPoll.ToString(),
+                '-FastWindowSeconds', $FastWindow.ToString()
+            )
+            $raw = & powershell.exe @arguments
+            $text = ($raw | Out-String).Trim()
+            if (-not $text) {
+                return [pscustomobject]@{
+                    cliProfile = $Combo.cliProfile
+                    provider = $Combo.provider
+                    modelClass = $Combo.modelClass
+                    mode = 'codex-session'
+                    ok = $false
+                    processStatus = 'fatal'
+                    shouldBlock = $false
+                    errors = @('Codex usage gate returned no JSON output.')
+                }
+            }
+
+            $result = $text | ConvertFrom-Json
+            $result | Add-Member -NotePropertyName cliProfile -NotePropertyValue $Combo.cliProfile -Force
+            $result | Add-Member -NotePropertyName provider -NotePropertyValue $Combo.provider -Force
+            $result | Add-Member -NotePropertyName modelClass -NotePropertyValue $Combo.modelClass -Force
+            $result | Add-Member -NotePropertyName mode -NotePropertyValue 'codex-session' -Force
             return $result
         }
         default {

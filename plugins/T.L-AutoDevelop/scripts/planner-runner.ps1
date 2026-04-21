@@ -15,13 +15,19 @@ function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments, [string]$WorkingDirectory = "")
 
     $resolvedCommand = Resolve-AutoDevelopNativeCommandName -Command $Command
+    $invocationCommand = $resolvedCommand
+    $invocationArguments = @($Arguments)
+    if ($resolvedCommand -and [System.IO.Path]::GetExtension([string]$resolvedCommand).ToLowerInvariant() -eq ".ps1") {
+        $invocationCommand = "powershell.exe"
+        $invocationArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", [string]$resolvedCommand) + @($Arguments)
+    }
 
     $output = if ($WorkingDirectory) {
         & {
             $ErrorActionPreference = "Continue"
             Push-Location $WorkingDirectory
             try {
-                & $resolvedCommand @Arguments 2>&1
+                & $invocationCommand @invocationArguments 2>&1
             } finally {
                 Pop-Location
             }
@@ -29,7 +35,7 @@ function Invoke-NativeCommand {
     } else {
         & {
             $ErrorActionPreference = "Continue"
-            & $resolvedCommand @Arguments 2>&1
+            & $invocationCommand @invocationArguments 2>&1
         }
     }
 

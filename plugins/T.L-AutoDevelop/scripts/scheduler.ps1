@@ -2,10 +2,11 @@
 param(
     [Parameter(Mandatory)][ValidateSet("snapshot-queue", "register-tasks", "apply-plan", "run-task", "wait-queue", "prepare-merge", "resolve-merge", "admin-edit-task", "admin-clear-breaker", "prepare-environment")][string]$Mode,
     [string]$SolutionPath = "",
-    [string]$TasksFile = "",
+    [Alias("TasksJson")][string]$TasksFile = "",
     [string]$PlanFile = "",
     [string]$EditFile = "",
     [ValidateSet("Full", "Compact")][string]$View = "Full",
+    [ValidateSet("Json")][string]$Format = "Json",
     [string]$TaskId = "",
     [string]$Decision = "",
     [string]$CommitMessage = "",
@@ -18,6 +19,58 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function ConvertTo-WindowsProcessArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) { $Argument = "" }
+    if ($Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+
+    $quote = [char]34
+    $slash = [char]92
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append($quote)
+    $backslashCount = 0
+
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq $slash) {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq $quote) {
+            if ($backslashCount -gt 0) {
+                [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+                $backslashCount = 0
+            }
+
+            [void]$builder.Append($slash)
+            [void]$builder.Append($quote)
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append(([string]$slash) * $backslashCount)
+            $backslashCount = 0
+        }
+
+        [void]$builder.Append($character)
+    }
+
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+    }
+
+    [void]$builder.Append($quote)
+    return $builder.ToString()
+}
+
+function ConvertTo-WindowsProcessArgumentString {
+    param([AllowEmptyCollection()][string[]]$Arguments)
+
+    return ([string]::Join(' ', @($Arguments | ForEach-Object { ConvertTo-WindowsProcessArgument -Argument $_ })))
+}
+
 function Invoke-NativeCommand {
     param(
         [string]$Command,
@@ -26,13 +79,19 @@ function Invoke-NativeCommand {
     )
 
     $resolvedCommand = Resolve-NativeCommandName -Command $Command
+    $invocationCommand = $resolvedCommand
+    $invocationArguments = @($Arguments)
+    if ($resolvedCommand -and [System.IO.Path]::GetExtension([string]$resolvedCommand).ToLowerInvariant() -eq ".ps1") {
+        $invocationCommand = "powershell.exe"
+        $invocationArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", [string]$resolvedCommand) + @($Arguments)
+    }
 
     $output = if ($WorkingDirectory) {
         & {
             $ErrorActionPreference = "Continue"
             Push-Location $WorkingDirectory
             try {
-                & $resolvedCommand @Arguments 2>&1
+                & $invocationCommand @invocationArguments 2>&1
             } finally {
                 Pop-Location
             }
@@ -40,7 +99,7 @@ function Invoke-NativeCommand {
     } else {
         & {
             $ErrorActionPreference = "Continue"
-            & $resolvedCommand @Arguments 2>&1
+            & $invocationCommand @invocationArguments 2>&1
         }
     }
 
@@ -353,6 +412,7 @@ function Get-PromptFileValidationResult {
         category = "INVALID_PROMPT_FILE"
         message = ""
         taskLine = ""
+        content = ""
     }
 
     if (-not $PromptFile) {
@@ -402,7 +462,37 @@ function Get-PromptFileValidationResult {
     $result.isValid = $true
     $result.message = ""
     $result.taskLine = $taskLine
+    $result.content = $content
     return [pscustomobject]$result
+}
+
+function Test-TaskTextMatchesPromptFileContent {
+    param(
+        [string]$TaskText,
+        [string]$PromptContent,
+        [string]$PromptTaskLine
+    )
+
+    $normalizedTaskText = if ($TaskText) { (($TaskText -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join " ").Trim() } else { "" }
+    if (-not $normalizedTaskText) {
+        return $true
+    }
+
+    if ($PromptContent -and ([string]$PromptContent).Contains($TaskText)) {
+        return $true
+    }
+
+    $normalizedPromptContent = if ($PromptContent) { (($PromptContent -split "\r?\n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join " ").Trim() } else { "" }
+    if ($normalizedPromptContent -and $normalizedPromptContent.Contains($normalizedTaskText)) {
+        return $true
+    }
+
+    $normalizedPromptTaskLine = if ($PromptTaskLine) { [string]$PromptTaskLine.Trim() } else { "" }
+    if ($normalizedPromptTaskLine -and ($normalizedPromptTaskLine -eq $normalizedTaskText)) {
+        return $true
+    }
+
+    return $false
 }
 
 function Read-JsonLinesFile {
@@ -2889,6 +2979,8 @@ function Get-TaskIntegrityWarnings {
         $promptValidation = Get-PromptFileValidationResult -PromptFile ([string]$Task.promptFile)
         if (-not $promptValidation.isValid) {
             [void]$warnings.Add($promptValidation.message)
+        } elseif (-not (Test-TaskTextMatchesPromptFileContent -TaskText ([string]$Task.taskText) -PromptContent ([string]$promptValidation.content) -PromptTaskLine ([string]$promptValidation.taskLine))) {
+            [void]$warnings.Add("taskText does not match promptFile content.")
         }
     }
 
@@ -4959,7 +5051,7 @@ function Run-Task {
 
     try {
         $process = Start-Process -FilePath $workerLauncher.command `
-            -ArgumentList $arguments `
+            -ArgumentList (ConvertTo-WindowsProcessArgumentString -Arguments $arguments) `
             -WorkingDirectory $context.repoRoot `
             -RedirectStandardOutput $workerOutputFile `
             -RedirectStandardError $workerErrorFile `

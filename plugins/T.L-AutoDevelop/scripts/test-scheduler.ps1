@@ -8,6 +8,62 @@ $script:AutoDevelopConfigPath = Join-Path $PSScriptRoot "autodevelop-config.ps1"
 $script:RoleRunnerPath = Join-Path $PSScriptRoot "autodevelop-role-runner.ps1"
 $script:PlannerRunnerPath = Join-Path $PSScriptRoot "planner-runner.ps1"
 
+foreach ($hostEnvVar in @("AUTODEV_EDITOR_HOST", "CLAUDECODE", "CODEX_THREAD_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_SHELL")) {
+    Remove-Item "Env:$hostEnvVar" -ErrorAction SilentlyContinue
+}
+
+function ConvertTo-WindowsProcessArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) { $Argument = "" }
+    if ($Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+
+    $quote = [char]34
+    $slash = [char]92
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append($quote)
+    $backslashCount = 0
+
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq $slash) {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq $quote) {
+            if ($backslashCount -gt 0) {
+                [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+                $backslashCount = 0
+            }
+
+            [void]$builder.Append($slash)
+            [void]$builder.Append($quote)
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append(([string]$slash) * $backslashCount)
+            $backslashCount = 0
+        }
+
+        [void]$builder.Append($character)
+    }
+
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+    }
+
+    [void]$builder.Append($quote)
+    return $builder.ToString()
+}
+
+function ConvertTo-WindowsProcessArgumentString {
+    param([AllowEmptyCollection()][string[]]$Arguments)
+
+    return ([string]::Join(' ', @($Arguments | ForEach-Object { ConvertTo-WindowsProcessArgument -Argument $_ })))
+}
+
 function Assert-True {
     param(
         [bool]$Condition,
@@ -27,6 +83,7 @@ function New-TestRepo {
         git init | Out-Null
         git config user.email "autodev-tests@example.com"
         git config user.name "AutoDevelop Tests"
+        git config core.autocrlf false
         Set-Content -LiteralPath (Join-Path $root "Test.slnx") -Value "{}" -Encoding UTF8
         Set-Content -LiteralPath (Join-Path $root "task-prompt.md") -Value "## Task`nTest prompt" -Encoding UTF8
         Set-Content -LiteralPath (Join-Path $root ".gitignore") -Value ".claude-develop-logs/" -Encoding UTF8
@@ -55,7 +112,13 @@ function Write-TestFile {
     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
-    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.Encoding]::UTF8)
+    $extension = [System.IO.Path]::GetExtension([string]$Path).ToLowerInvariant()
+    $encoding = if ($extension -in @(".cmd", ".bat")) {
+        [System.Text.Encoding]::ASCII
+    } else {
+        [System.Text.Encoding]::UTF8
+    }
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
 function New-TestBlazorRepo {
@@ -70,6 +133,7 @@ function New-TestBlazorRepo {
         git init | Out-Null
         git config user.email "autodev-tests@example.com"
         git config user.name "AutoDevelop Tests"
+        git config core.autocrlf false
 
         $projectPath = Join-Path $root "TestApp.csproj"
         Write-TestFile -Path $projectPath -Content @"
@@ -228,6 +292,137 @@ function Write-UsageGateMockFile {
     return $path
 }
 
+function Invoke-CodexUsageGateJson {
+    param(
+        [string]$CodexHome,
+        [string]$Mode = "probe",
+        [int]$ThresholdPercent = 90,
+        [string]$MockStatusJson = "",
+        [string]$MockErrorKind = "",
+        [string]$MockStatusSequencePath = "",
+        [string]$StateDbPath = "",
+        [string]$SessionPath = "",
+        [string]$ThreadId = "",
+        [int]$PollSeconds = 1,
+        [int]$FastPollSeconds = 1,
+        [int]$FastWindowSeconds = 1
+    )
+
+    $gatePath = Join-Path $PSScriptRoot "codex-usage-gate.ps1"
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $gatePath,
+        "-Mode", $Mode,
+        "-CodexHome", $CodexHome,
+        "-ThresholdPercent", $ThresholdPercent.ToString(),
+        "-PollSeconds", $PollSeconds.ToString(),
+        "-FastPollSeconds", $FastPollSeconds.ToString(),
+        "-FastWindowSeconds", $FastWindowSeconds.ToString()
+    )
+
+    if ($MockStatusJson) {
+        $arguments += @("-MockStatusJson", $MockStatusJson)
+    }
+    if ($MockErrorKind) {
+        $arguments += @("-MockErrorKind", $MockErrorKind)
+    }
+    if ($MockStatusSequencePath) {
+        $arguments += @("-MockStatusSequencePath", $MockStatusSequencePath)
+    }
+    if ($StateDbPath) {
+        $arguments += @("-StateDbPath", $StateDbPath)
+    }
+    if ($SessionPath) {
+        $arguments += @("-SessionPath", $SessionPath)
+    }
+    if ($ThreadId) {
+        $arguments += @("-ThreadId", $ThreadId)
+    }
+
+    $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList $arguments
+    $rawText = ([string]$process.stdout).Trim()
+    if (-not $rawText) {
+        throw "Codex usage gate returned no JSON output. Args: $($arguments -join ' ')`nSTDERR:`n$([string]$process.stderr)"
+    }
+
+    try {
+        return ($rawText | ConvertFrom-Json)
+    } catch {
+        throw "Codex usage gate returned invalid JSON: $($_.Exception.Message)`nRAW:`n$rawText"
+    }
+}
+
+function Write-CodexUsageGateSessionLog {
+    param(
+        [string]$Path,
+        [object[]]$Payloads
+    )
+
+    $parent = Split-Path -Path $Path -Parent
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($payload in @($Payloads)) {
+        $entry = [ordered]@{
+            timestamp = (Get-Date).ToString("o")
+            payload = $payload
+        }
+        [void]$lines.Add(($entry | ConvertTo-Json -Depth 12 -Compress))
+    }
+
+    [System.IO.File]::WriteAllText($Path, (($lines.ToArray()) -join "`n"), [System.Text.Encoding]::UTF8)
+}
+
+function Resolve-TestPythonCommand {
+    foreach ($candidate in @("python", "py")) {
+        $resolved = Get-Command -Name $candidate -ErrorAction SilentlyContinue
+        if ($resolved) {
+            return [string]$resolved.Source
+        }
+    }
+
+    throw "Python is required for the Codex state-db tests."
+}
+
+function Write-CodexUsageGateStateDb {
+    param(
+        [string]$Path,
+        [string]$ThreadId,
+        [string]$RolloutPath
+    )
+
+    $pythonCommand = Resolve-TestPythonCommand
+    $pythonCode = @'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+thread_id = sys.argv[2]
+rollout_path = sys.argv[3]
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)")
+cur.execute("INSERT INTO threads (id, rollout_path) VALUES (?, ?)", (thread_id, rollout_path))
+conn.commit()
+conn.close()
+'@
+
+    $arguments = @("-c", $pythonCode, $Path, $ThreadId, $RolloutPath)
+    $pythonFileName = [System.IO.Path]::GetFileName($pythonCommand).ToLowerInvariant()
+    if ($pythonFileName -eq "py.exe" -or $pythonFileName -eq "py") {
+        $arguments = @("-3") + $arguments
+    }
+
+    $process = Invoke-CapturedProcess -FilePath $pythonCommand -ArgumentList $arguments
+    if ($process.exitCode -ne 0) {
+        throw "Failed to create the Codex usage test state db: $([string]$process.stderr)$([string]$process.stdout)"
+    }
+}
+
 function New-TestLatestRun {
     param(
         [int]$AttemptNumber = 0,
@@ -324,6 +519,7 @@ function Invoke-CapturedProcess {
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (ConvertTo-WindowsProcessArgumentString -Arguments @($ArgumentList))
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
@@ -331,27 +527,24 @@ function Invoke-CapturedProcess {
     if ($WorkingDirectory) {
         $startInfo.WorkingDirectory = $WorkingDirectory
     }
-    $startInfo.Arguments = ((@($ArgumentList) | ForEach-Object {
-        $argumentText = [string]$_
-        if ($argumentText -match '[\s"]') {
-            '"' + ($argumentText -replace '"', '\"') + '"'
-        } else {
-            $argumentText
-        }
-    }) -join ' ')
 
-    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
     try {
+        [void]$process.Start()
         $stdout = $process.StandardOutput.ReadToEnd()
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
+
         return [pscustomobject]@{
             exitCode = [int]$process.ExitCode
             stdout = $stdout
             stderr = $stderr
         }
     } finally {
-        $process.Dispose()
+        if ($process) {
+            $process.Dispose()
+        }
     }
 }
 
@@ -398,25 +591,37 @@ function Get-FunctionDefinitionText {
 function Invoke-AutoDevelopHelperFunctions {
     param(
         [string[]]$FunctionNames,
-        [scriptblock]$ScriptBlock
+        [scriptblock]$ScriptBlock,
+        [object[]]$Arguments = @(),
+        [string]$PowerShellCommand = "powershell.exe"
     )
 
     $autoDevelopPath = Join-Path $PSScriptRoot "auto-develop.ps1"
     $functionDefinitions = @($FunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $autoDevelopPath -FunctionName $_ })
     $bootstrap = ($functionDefinitions -join "`r`n`r`n")
-    $wrapped = @"
-. (Resolve-Path '$script:AutoDevelopConfigPath')
-$bootstrap
+    $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
+    $tempArgsFile = Join-Path $env:TEMP ("autodev-helper-args-" + [guid]::NewGuid().ToString("N") + ".json")
+    [System.IO.File]::WriteAllText($tempArgsFile, $argumentsJson, [System.Text.Encoding]::UTF8)
+    $wrapped = @'
+. (Resolve-Path '__AUTODEV_CONFIG_PATH__')
+__AUTODEV_BOOTSTRAP__
+$__parsedAutoDevelopArgs = Get-Content -LiteralPath '__TEMP_ARGS_FILE__' -Raw | ConvertFrom-Json
+$__autoDevelopArgs = @($(if ($null -eq $__parsedAutoDevelopArgs) { @() } elseif ($__parsedAutoDevelopArgs -is [System.Array]) { $__parsedAutoDevelopArgs } else { $__parsedAutoDevelopArgs }))
 & {
-$($ScriptBlock.ToString())
-}
-"@
+__SCRIPTBLOCK_BODY__
+} @__autoDevelopArgs
+'@
+    $wrapped = $wrapped.Replace('__AUTODEV_CONFIG_PATH__', $script:AutoDevelopConfigPath.Replace("'", "''")).Replace('__AUTODEV_BOOTSTRAP__', $bootstrap).Replace('__TEMP_ARGS_FILE__', $tempArgsFile.Replace("'", "''")).Replace('__SCRIPTBLOCK_BODY__', $ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("autodev-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
-        $raw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tempScript
-        return ($raw | Out-String).Trim()
+        $process = Invoke-CapturedProcess -FilePath $PowerShellCommand -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tempScript)
+        if ($process.exitCode -ne 0) {
+            throw "AutoDevelop helper execution failed with exit code $($process.exitCode). STDERR:`n$([string]$process.stderr)`nSTDOUT:`n$([string]$process.stdout)"
+        }
+        return ([string]$process.stdout).Trim()
     } finally {
+        Remove-Item -LiteralPath $tempArgsFile -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
 }
@@ -430,15 +635,17 @@ function Invoke-AutoDevelopConfigHelperFunctions {
     )
 
     $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
-    $wrapped = @"
-. (Resolve-Path '$script:AutoDevelopConfigPath')
-`$__configArgs = ConvertFrom-Json @'
-$argumentsJson
-'@
+    $tempArgsFile = Join-Path $env:TEMP ("autodev-config-helper-args-" + [guid]::NewGuid().ToString("N") + ".json")
+    [System.IO.File]::WriteAllText($tempArgsFile, $argumentsJson, [System.Text.Encoding]::UTF8)
+    $wrapped = @'
+. (Resolve-Path '__AUTODEV_CONFIG_PATH__')
+$__parsedConfigArgs = Get-Content -LiteralPath '__TEMP_ARGS_FILE__' -Raw | ConvertFrom-Json
+$__configArgs = @($(if ($null -eq $__parsedConfigArgs) { @() } elseif ($__parsedConfigArgs -is [System.Array]) { $__parsedConfigArgs } else { $__parsedConfigArgs }))
 & {
-$($ScriptBlock.ToString())
-} @`$__configArgs
-"@
+__SCRIPTBLOCK_BODY__
+} @__configArgs
+'@
+    $wrapped = $wrapped.Replace('__AUTODEV_CONFIG_PATH__', $script:AutoDevelopConfigPath.Replace("'", "''")).Replace('__TEMP_ARGS_FILE__', $tempArgsFile.Replace("'", "''")).Replace('__SCRIPTBLOCK_BODY__', $ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("autodev-config-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
@@ -448,6 +655,7 @@ $($ScriptBlock.ToString())
         }
         return ([string]$process.stdout).Trim()
     } finally {
+        Remove-Item -LiteralPath $tempArgsFile -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
 }
@@ -460,16 +668,18 @@ function Invoke-RoleRunnerHelperFunctions {
     )
 
     $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
-    $wrapped = @"
-. (Resolve-Path '$script:AutoDevelopConfigPath')
-. (Resolve-Path '$script:RoleRunnerPath')
-`$__roleRunnerArgs = ConvertFrom-Json @'
-$argumentsJson
-'@
+    $tempArgsFile = Join-Path $env:TEMP ("role-runner-helper-args-" + [guid]::NewGuid().ToString("N") + ".json")
+    [System.IO.File]::WriteAllText($tempArgsFile, $argumentsJson, [System.Text.Encoding]::UTF8)
+    $wrapped = @'
+. (Resolve-Path '__AUTODEV_CONFIG_PATH__')
+. (Resolve-Path '__ROLE_RUNNER_PATH__')
+$__parsedRoleRunnerArgs = Get-Content -LiteralPath '__TEMP_ARGS_FILE__' -Raw | ConvertFrom-Json
+$__roleRunnerArgs = @($(if ($null -eq $__parsedRoleRunnerArgs) { @() } elseif ($__parsedRoleRunnerArgs -is [System.Array]) { $__parsedRoleRunnerArgs } else { $__parsedRoleRunnerArgs }))
 & {
-$($ScriptBlock.ToString())
-} @`$__roleRunnerArgs
-"@
+__SCRIPTBLOCK_BODY__
+} @__roleRunnerArgs
+'@
+    $wrapped = $wrapped.Replace('__AUTODEV_CONFIG_PATH__', $script:AutoDevelopConfigPath.Replace("'", "''")).Replace('__ROLE_RUNNER_PATH__', $script:RoleRunnerPath.Replace("'", "''")).Replace('__TEMP_ARGS_FILE__', $tempArgsFile.Replace("'", "''")).Replace('__SCRIPTBLOCK_BODY__', $ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("role-runner-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
@@ -479,6 +689,7 @@ $($ScriptBlock.ToString())
         }
         return ([string]$process.stdout).Trim()
     } finally {
+        Remove-Item -LiteralPath $tempArgsFile -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
 }
@@ -493,16 +704,18 @@ function Invoke-PlannerRunnerHelperFunctions {
     $plannerDefinitions = @($PlannerFunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $script:PlannerRunnerPath -FunctionName $_ })
     $plannerBootstrap = ($plannerDefinitions -join "`r`n`r`n")
     $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
-    $wrapped = @"
-. (Resolve-Path '$script:AutoDevelopConfigPath')
-$plannerBootstrap
-`$__plannerArgs = ConvertFrom-Json @'
-$argumentsJson
-'@
+    $tempArgsFile = Join-Path $env:TEMP ("planner-runner-helper-args-" + [guid]::NewGuid().ToString("N") + ".json")
+    [System.IO.File]::WriteAllText($tempArgsFile, $argumentsJson, [System.Text.Encoding]::UTF8)
+    $wrapped = @'
+. (Resolve-Path '__AUTODEV_CONFIG_PATH__')
+__PLANNER_BOOTSTRAP__
+$__parsedPlannerArgs = Get-Content -LiteralPath '__TEMP_ARGS_FILE__' -Raw | ConvertFrom-Json
+$__plannerArgs = @($(if ($null -eq $__parsedPlannerArgs) { @() } elseif ($__parsedPlannerArgs -is [System.Array]) { $__parsedPlannerArgs } else { $__parsedPlannerArgs }))
 & {
-$($ScriptBlock.ToString())
-} @`$__plannerArgs
-"@
+__SCRIPTBLOCK_BODY__
+} @__plannerArgs
+'@
+    $wrapped = $wrapped.Replace('__AUTODEV_CONFIG_PATH__', $script:AutoDevelopConfigPath.Replace("'", "''")).Replace('__PLANNER_BOOTSTRAP__', $plannerBootstrap).Replace('__TEMP_ARGS_FILE__', $tempArgsFile.Replace("'", "''")).Replace('__SCRIPTBLOCK_BODY__', $ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("planner-runner-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
@@ -512,6 +725,7 @@ $($ScriptBlock.ToString())
         }
         return ([string]$process.stdout).Trim()
     } finally {
+        Remove-Item -LiteralPath $tempArgsFile -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
 }
@@ -526,15 +740,17 @@ function Invoke-SchedulerHelperFunctions {
     $functionDefinitions = @($FunctionNames | ForEach-Object { Get-FunctionDefinitionText -ScriptPath $script:SchedulerPath -FunctionName $_ })
     $bootstrap = ($functionDefinitions -join "`r`n`r`n")
     $argumentsJson = ($Arguments | ConvertTo-Json -Depth 16 -Compress)
-    $wrapped = @"
-$bootstrap
-`$__codexArgs = ConvertFrom-Json @'
-$argumentsJson
-'@
+    $tempArgsFile = Join-Path $env:TEMP ("scheduler-helper-args-" + [guid]::NewGuid().ToString("N") + ".json")
+    [System.IO.File]::WriteAllText($tempArgsFile, $argumentsJson, [System.Text.Encoding]::UTF8)
+    $wrapped = @'
+__SCHEDULER_BOOTSTRAP__
+$__parsedSchedulerArgs = Get-Content -LiteralPath '__TEMP_ARGS_FILE__' -Raw | ConvertFrom-Json
+$__codexArgs = @($(if ($null -eq $__parsedSchedulerArgs) { @() } elseif ($__parsedSchedulerArgs -is [System.Array]) { $__parsedSchedulerArgs } else { $__parsedSchedulerArgs }))
 & {
-$($ScriptBlock.ToString())
-} @`$__codexArgs
-"@
+__SCRIPTBLOCK_BODY__
+} @__codexArgs
+'@
+    $wrapped = $wrapped.Replace('__SCHEDULER_BOOTSTRAP__', $bootstrap).Replace('__TEMP_ARGS_FILE__', $tempArgsFile.Replace("'", "''")).Replace('__SCRIPTBLOCK_BODY__', $ScriptBlock.ToString())
     $tempScript = Join-Path $env:TEMP ("scheduler-helper-test-" + [guid]::NewGuid().ToString("N") + ".ps1")
     try {
         [System.IO.File]::WriteAllText($tempScript, $wrapped, [System.Text.Encoding]::UTF8)
@@ -544,6 +760,7 @@ $($ScriptBlock.ToString())
         }
         return ([string]$process.stdout).Trim()
     } finally {
+        Remove-Item -LiteralPath $tempArgsFile -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tempScript -ErrorAction SilentlyContinue
     }
 }
@@ -2455,7 +2672,7 @@ function Test-AutoDevelopConfigAppliesExplicitRoleOverrides {
         Assert-True ([string]$parsed.implement.model -eq "sonnet") "Resolved implement model token should follow the configured modelClass."
         Assert-True ([string]$parsed.implement.reasoningEffort -eq "low") "Explicit implement reasoning effort should be preserved."
         Assert-True ([int]$parsed.implement.maxTurns -eq 9) "Explicit implement maxTurns should be preserved."
-        Assert-True (@($parsed.implement.allowedTools).Count -eq 4) "Explicit implement capabilities should map to the expected Claude tools."
+        Assert-True (@($parsed.implement.allowedTools).Count -eq 3) "Explicit implement capabilities should map to the expected Claude tools."
         Assert-True ([string]$parsed.scheduler.modelClass -eq "sonnet") "Scheduler role should be independently configurable."
         Assert-True ([string]$parsed.scheduler.reasoningEffort -eq "medium") "Scheduler role should preserve its own reasoning effort override."
     } finally {
@@ -2610,11 +2827,11 @@ function Test-AutoDevelopInvalidTypedValuesFallBackWithWarnings {
         $parsed = $output | ConvertFrom-Json
         $warnings = @($parsed.warnings)
         Assert-True ($warnings -contains "defaultExecutionProfile") "Invalid default execution profile should emit a scoped warning."
-        Assert-True ($warnings -contains "executionProfiles.default.roles.implement.maxTurns") "Invalid maxTurns should emit a scoped warning."
-        Assert-True ($warnings -contains "executionProfiles.default.roles.implement.capabilities") "Invalid capabilities should emit a scoped warning."
-        Assert-True ($warnings -contains "executionProfiles.default.roles.implement.extraArgs") "Invalid extraArgs entries should emit a scoped warning."
-        Assert-True ($warnings -contains "executionProfiles.default.roles.reviewer.promptTemplatePath") "Invalid prompt template paths should emit a scoped warning."
-        Assert-True ($warnings -contains "executionProfiles.default.roles.scheduler.timeoutSeconds") "Invalid timeoutSeconds should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.<active>.roles.implement.maxTurns") "Invalid maxTurns should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.<active>.roles.implement.capabilities") "Invalid capabilities should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.<active>.roles.implement.extraArgs") "Invalid extraArgs entries should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.<active>.roles.reviewer.promptTemplatePath") "Invalid prompt template paths should emit a scoped warning."
+        Assert-True ($warnings -contains "executionProfiles.<active>.roles.scheduler.timeoutSeconds") "Invalid timeoutSeconds should emit a scoped warning."
         Assert-True ([string]$parsed.activeExecutionProfile -eq "default") "Invalid default execution profile should fall back to 'default'."
         Assert-True ([string]$parsed.implementProvider -eq "openrouter") "Explicit provider should be preserved in the normalized config."
         Assert-True ([string]$parsed.implementCliProfile -eq "claude-code-openrouter") "Explicit cliProfile tokens should survive normalization."
@@ -2676,7 +2893,9 @@ exit /b 1
         } -Arguments @($repo.solution, $fakeGitPath)
 
         $parsed = $output | ConvertFrom-Json
-        Assert-True ([string]$parsed.repoRoot -eq $repo.root) "Planner repo discovery must honor AUTODEV_GIT_COMMAND just like the scheduler does."
+        $resolvedPlannerRepoRoot = (Get-Item -LiteralPath ([string]$parsed.repoRoot)).FullName
+        $resolvedExpectedRepoRoot = (Get-Item -LiteralPath $repo.root).FullName
+        Assert-True ([string]$resolvedPlannerRepoRoot -eq $resolvedExpectedRepoRoot) "Planner repo discovery must honor AUTODEV_GIT_COMMAND just like the scheduler does."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -2710,7 +2929,9 @@ exit 1
         } -Arguments @($repo.root, $fakeGitPath)
 
         $parsed = $output | ConvertFrom-Json
-        Assert-True ([string]$parsed.output -eq $repo.root) "Worker git invocations must honor AUTODEV_GIT_COMMAND just like scheduler and planner paths."
+        $resolvedWorkerRepoRoot = (Get-Item -LiteralPath ([string]$parsed.output)).FullName
+        $resolvedExpectedRepoRoot = (Get-Item -LiteralPath $repo.root).FullName
+        Assert-True ([string]$resolvedWorkerRepoRoot -eq $resolvedExpectedRepoRoot) "Worker git invocations must honor AUTODEV_GIT_COMMAND just like scheduler and planner paths."
         Assert-True ([int]$parsed.exitCode -eq 0) "Worker git override should preserve a successful exit code."
     } finally {
         Remove-TestRepo -Root $repo.root
@@ -2763,6 +2984,129 @@ function Test-AutoDevelopSessionProfileSelection {
         Assert-True ([string]$parsed.afterProfile -eq "cheap-implementation") "Session state should switch the active execution profile."
         Assert-True ([string]$parsed.afterSource -eq "session") "Session-based selection should report 'session' as its source."
         Assert-True ([string]$parsed.resolvedModelClass -eq "sonnet") "The active session profile should influence resolved role configuration."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopHostDefaultsSelectEditorSpecificProfiles {
+    $repo = New-TestRepo
+    try {
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+
+            $env:CODEX_THREAD_ID = "codex-host-default-test"
+            try {
+                $codexState = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            } finally {
+                Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue
+            }
+
+            $env:CLAUDECODE = "1"
+            try {
+                $claudeState = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+            } finally {
+                Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
+            }
+
+            [pscustomobject]@{
+                builtInProfiles = @(Get-AutoDevelopExecutionProfileNames -Config $codexState.effective)
+                hostDefaults = Get-AutoDevelopConfigPropertyValue -Object $codexState.effective -Name "hostDefaults"
+                codexActiveProfile = [string]$codexState.activeExecutionProfile
+                codexActiveSource = [string]$codexState.activeExecutionProfileSource
+                codexDetectedHost = [string]$codexState.detectedHost
+                codexDetectedHostSource = [string]$codexState.detectedHostSource
+                codexDiscover = Resolve-AutoDevelopRoleConfig -ConfigState $codexState -RoleName "discover"
+                codexImplement = Resolve-AutoDevelopRoleConfig -ConfigState $codexState -RoleName "implement"
+                claudeActiveProfile = [string]$claudeState.activeExecutionProfile
+                claudeActiveSource = [string]$claudeState.activeExecutionProfileSource
+                claudeDetectedHost = [string]$claudeState.detectedHost
+                claudeDetectedHostSource = [string]$claudeState.detectedHostSource
+            } | ConvertTo-Json -Depth 12
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        $profileNames = @($parsed.builtInProfiles)
+        Assert-True ($profileNames -contains "default") "Built-in execution profiles should keep the backward-compatible default profile."
+        Assert-True ($profileNames -contains "claude-full") "Built-in execution profiles should include claude-full."
+        Assert-True ($profileNames -contains "codex-full") "Built-in execution profiles should include codex-full."
+        Assert-True ([string]$parsed.hostDefaults."claude-code" -eq "claude-full") "Built-in host defaults should route Claude Code to claude-full."
+        Assert-True ([string]$parsed.hostDefaults.codex -eq "codex-full") "Built-in host defaults should route Codex to codex-full."
+        Assert-True ([string]$parsed.codexDetectedHost -eq "codex") "Codex env detection should resolve the codex host."
+        Assert-True ([string]$parsed.codexDetectedHostSource -eq "CODEX_THREAD_ID") "Codex env detection should report the CODEX_THREAD_ID source."
+        Assert-True ([string]$parsed.codexActiveProfile -eq "codex-full") "Codex-started AutoDevelop sessions should default to codex-full."
+        Assert-True ([string]$parsed.codexActiveSource -eq "host-default") "Codex host defaults should report host-default as the profile source."
+        Assert-True ([string]$parsed.codexDiscover.model -eq "gpt-5.4-mini") "Codex discover should use the shipped gpt-5.4-mini model."
+        Assert-True ([string]$parsed.codexDiscover.reasoningEffort -eq "medium") "Codex discover should keep the medium reasoning profile."
+        Assert-True ([string]$parsed.codexImplement.model -eq "gpt-5.4") "Codex implement should use the shipped gpt-5.4 model."
+        Assert-True ([string]$parsed.codexImplement.reasoningEffort -eq "xhigh") "Codex implement should preserve xhigh reasoning."
+        Assert-True ([string]$parsed.claudeDetectedHost -eq "claude-code") "Claude Code env detection should resolve the claude-code host."
+        Assert-True ([string]$parsed.claudeDetectedHostSource -eq "CLAUDECODE") "Claude Code env detection should report the CLAUDECODE source."
+        Assert-True ([string]$parsed.claudeActiveProfile -eq "claude-full") "Claude-started AutoDevelop sessions should default to claude-full."
+        Assert-True ([string]$parsed.claudeActiveSource -eq "host-default") "Claude host defaults should report host-default as the profile source."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopSessionOverrideBeatsHostDefault {
+    $repo = New-TestRepo
+    try {
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $env:CODEX_THREAD_ID = "codex-session-override-test"
+            try {
+                Set-AutoDevelopSessionState -RepoRoot $RepoRoot -ExecutionProfile "claude-full" | Out-Null
+                $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+                [pscustomobject]@{
+                    activeExecutionProfile = [string]$state.activeExecutionProfile
+                    activeExecutionProfileSource = [string]$state.activeExecutionProfileSource
+                } | ConvertTo-Json -Depth 8
+            } finally {
+                Clear-AutoDevelopSessionState -RepoRoot $RepoRoot | Out-Null
+                Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue
+            }
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.activeExecutionProfile -eq "claude-full") "Session overrides should win over the detected host default."
+        Assert-True ([string]$parsed.activeExecutionProfileSource -eq "session") "Session overrides should continue to report session as the source."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopInvalidHostDefaultsWarnAndFallBackCleanly {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "hostDefaults": {
+    "codex": "missing-codex-profile"
+  }
+}
+"@
+
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $env:CODEX_THREAD_ID = "codex-invalid-host-default-test"
+            try {
+                $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+                [pscustomobject]@{
+                    activeExecutionProfile = [string]$state.activeExecutionProfile
+                    activeExecutionProfileSource = [string]$state.activeExecutionProfileSource
+                    warningScopes = @($state.warnings | ForEach-Object { [string]$_.scope })
+                } | ConvertTo-Json -Depth 8
+            } finally {
+                Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue
+            }
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True (@($parsed.warningScopes) -contains "hostDefaults.codex") "Invalid host default entries should emit a scoped warning."
+        Assert-True ([string]$parsed.activeExecutionProfile -eq "codex-full") "Invalid codex host defaults should fall back to the built-in codex-full profile."
+        Assert-True ([string]$parsed.activeExecutionProfileSource -eq "host-default") "Fallback host defaults should still resolve through the host-default path."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -2969,7 +3313,7 @@ function Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary {
 
     $parsed = $output | ConvertFrom-Json
     Assert-True ($parsed.success -eq $true) "Invoke-AutoDevelopRole should preserve native argument execution across the job boundary."
-    Assert-True ([string]$parsed.output -eq '[-NoProfile][-File][run][--model][openai/gpt-5.4][--agent][autodev-role][prompt payload]') "Invoke-AutoDevelopRole should keep each native argument separate and append the prompt as the final positional argument."
+    Assert-True ([string]$parsed.output -eq '[run][--model][openai/gpt-5.4][--agent][autodev-role][prompt payload]') "Invoke-AutoDevelopRole should keep each native argument separate and append the prompt as the final positional argument."
 }
 
 function Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary {
@@ -3128,9 +3472,11 @@ function Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequest
         $parsed = $process.stdout | ConvertFrom-Json
 
         Assert-True ([int]$process.exitCode -eq 0) "snapshot-queue should succeed when -Format Json is requested explicitly."
-        Assert-True ([string]$parsed.repoRoot -eq $repo.root) "snapshot-queue should still emit the expected JSON payload to stdout."
+        $expectedRepoRoot = [System.IO.Path]::GetFullPath($repo.root)
+        $actualRepoRoot = [System.IO.Path]::GetFullPath([string]$parsed.repoRoot)
+        Assert-True ($actualRepoRoot -eq $expectedRepoRoot) "snapshot-queue should still emit the expected JSON payload to stdout."
         Assert-True (-not [string]::IsNullOrWhiteSpace($process.stdout)) "snapshot-queue should produce JSON on stdout."
-        Assert-True ($process.stderr -notmatch "#< CLIXML") "snapshot-queue stderr should stay free of CLIXML decoration in JSON mode."
+        Assert-True (([string]$process.stderr) -notmatch "#< CLIXML") "snapshot-queue stderr should stay free of CLIXML decoration in JSON mode."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -3206,9 +3552,302 @@ function Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass {
 "@
 
         Assert-Throws {
-            $state = Get-AutoDevelopConfigState -RepoRoot $repo.root
-            Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" | Out-Null
+            Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @(
+                "Get-AutoDevelopConfigState",
+                "Resolve-AutoDevelopRoleConfig"
+            ) -ScriptBlock {
+                param($RepoRoot)
+                $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+                Resolve-AutoDevelopRoleConfig -ConfigState $state -RoleName "implement" | Out-Null
+            } -Arguments @($repo.root) | Out-Null
         } "does not support dangerouslySkipPermissions"
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopUsageCombosIncludeCodexProfilesAndUsageMode {
+    $repo = New-TestRepo
+    try {
+        $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+            param($RepoRoot)
+            $env:CODEX_THREAD_ID = "codex-usage-combos-test"
+            try {
+                $state = Get-AutoDevelopConfigState -RepoRoot $RepoRoot
+                $combos = @(Get-AutoDevelopRoleUsageCombos -ConfigState $state -RoleNames @("discover", "implement"))
+                [pscustomobject]@{
+                    comboKeys = @($combos | ForEach-Object { "$($_.cliProfile)|$($_.provider)|$($_.modelClass)" })
+                    codexMiniUsageMode = [string](Get-AutoDevelopConfigPropertyValue -Object (Get-AutoDevelopCliProfileUsageSupport -CliProfileId "codex" -Provider "openai" -ModelClass "gpt-5.4-mini") -Name "mode")
+                    codexMainUsageMode = [string](Get-AutoDevelopConfigPropertyValue -Object (Get-AutoDevelopCliProfileUsageSupport -CliProfileId "codex" -Provider "openai" -ModelClass "gpt-5.4") -Name "mode")
+                } | ConvertTo-Json -Depth 8
+            } finally {
+                Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue
+            }
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        $keys = @($parsed.comboKeys)
+        Assert-True ($keys -contains "codex|openai|gpt-5.4-mini") "Codex role aggregation should include the explicit mini model combo."
+        Assert-True ($keys -contains "codex|openai|gpt-5.4") "Codex role aggregation should include the explicit main model combo."
+        Assert-True ([string]$parsed.codexMiniUsageMode -eq "codex-session") "Codex mini usage should resolve through the codex-session gate."
+        Assert-True ([string]$parsed.codexMainUsageMode -eq "codex-session") "Codex main usage should resolve through the codex-session gate."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-CodexInvocationUsesExpectedFlagsAndSandboxModes {
+    $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+        $readRole = [pscustomobject]@{
+            roleName = "discover"
+            command = "codex"
+            model = "gpt-5.4-mini"
+            reasoningEffort = "medium"
+            capabilities = @("read", "search")
+            extraArgs = @("--skip-git-repo-check")
+            dangerouslySkipPermissions = $false
+        }
+        $writeRole = [pscustomobject]@{
+            roleName = "implement"
+            command = "codex"
+            model = "gpt-5.4"
+            reasoningEffort = "xhigh"
+            capabilities = @("read", "search", "edit", "write", "shell")
+            extraArgs = @()
+            dangerouslySkipPermissions = $true
+        }
+
+        $env:AUTODEV_CODEX_COMMAND = "powershell.exe"
+        try {
+            [pscustomobject]@{
+                readInvocation = Get-CodexInvocationForRole -RoleConfig $readRole -LastMessageFile "C:\temp\codex-last.txt"
+                writeInvocation = Get-CodexInvocationForRole -RoleConfig $writeRole -LastMessageFile "C:\temp\codex-last.txt"
+            } | ConvertTo-Json -Depth 12
+        } finally {
+            Remove-Item Env:AUTODEV_CODEX_COMMAND -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    $readArgs = @($parsed.readInvocation.arguments)
+    $writeArgs = @($parsed.writeInvocation.arguments)
+    Assert-True ($readArgs[0] -eq "exec") "Codex invocation should use 'exec' as the entry command."
+    Assert-True (($readArgs -join " ") -match [regex]::Escape("--model gpt-5.4-mini")) "Codex invocation should forward the explicit model token."
+    Assert-True (($readArgs -join " ") -match [regex]::Escape('-c model_reasoning_effort="medium"')) "Codex invocation should forward the configured reasoning effort."
+    Assert-True (($readArgs -join " ") -match [regex]::Escape("--output-last-message C:\temp\codex-last.txt")) "Codex invocation should request isolated last-message capture."
+    Assert-True (($readArgs -join " ") -match [regex]::Escape("--sandbox read-only")) "Read-only Codex roles should use the read-only sandbox."
+    Assert-True (($readArgs -join " ") -match [regex]::Escape("--skip-git-repo-check")) "Codex invocation should preserve configured extra arguments."
+    Assert-True ([string]$parsed.readInvocation.resultSource -eq "last-message-file") "Codex invocation should mark last-message capture as the preferred result source."
+    Assert-True (($writeArgs -join " ") -match [regex]::Escape("--dangerously-bypass-approvals-and-sandbox")) "Permission-bypassed Codex roles should use the bypass flag."
+    Assert-True (($writeArgs -join " ") -notmatch [regex]::Escape("--sandbox workspace-write")) "Bypassed Codex roles should not also emit a sandbox flag."
+}
+
+function Test-CodexPromptInjectsSoftTurnBudget {
+    $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @() -ScriptBlock {
+        $prompt = Get-CodexPromptForRole -Prompt "Original prompt" -RoleConfig ([pscustomobject]@{
+            maxTurns = 18
+        })
+        $noBudgetPrompt = Get-CodexPromptForRole -Prompt "Original prompt" -RoleConfig ([pscustomobject]@{
+            maxTurns = 0
+        })
+        [pscustomobject]@{
+            prompt = $prompt
+            noBudgetPrompt = $noBudgetPrompt
+        } | ConvertTo-Json -Depth 8
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ([string]$parsed.prompt -match "AUTODEVELOP_TURN_BUDGET") "Codex prompts should include the soft turn-budget block when maxTurns is configured."
+    Assert-True ([string]$parsed.prompt -match "Treat 18 turns as your hard conversation budget") "Codex prompt injection should preserve the configured turn budget value."
+    Assert-True ([string]$parsed.noBudgetPrompt -eq "Original prompt") "Roles without a turn budget should keep the original prompt unchanged."
+}
+
+function Test-InvokeAutoDevelopRolePrefersCodexLastMessageFile {
+    $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
+        $captureScript = Join-Path $env:TEMP ("role-runner-codex-last-message-" + [guid]::NewGuid().ToString("N") + ".ps1")
+        [System.IO.File]::WriteAllText($captureScript, @'
+param([string]$ResultPath)
+[Console]::Out.Write("stream noise")
+[System.IO.File]::WriteAllText($ResultPath, "isolated final message", [System.Text.Encoding]::UTF8)
+'@, [System.Text.Encoding]::UTF8)
+
+        function Get-AutoDevelopResolvedTimeoutSeconds {
+            param($RoleConfig, [int]$FallbackTimeoutSeconds)
+            return $FallbackTimeoutSeconds
+        }
+
+        function Get-AutoDevelopFallbackCliProfiles {
+            param($RoleConfig)
+            return @()
+        }
+
+        function Get-AutoDevelopRolePrompt {
+            param([string]$Prompt, $RoleConfig)
+            return $Prompt
+        }
+
+        function Get-AutoDevelopRoleInvocation {
+            param($RoleConfig, [string]$LastMessageFile = "")
+
+            return [pscustomobject]@{
+                executable = "pwsh.exe"
+                arguments = @("-NoProfile", "-File", $captureScript, $LastMessageFile)
+                promptInput = "stdin"
+                output = "stdout"
+                env = $null
+                resultSource = "last-message-file"
+            }
+        }
+
+        try {
+            $result = Invoke-AutoDevelopRole -Prompt "ignored prompt" -RoleConfig ([pscustomobject]@{ roleName = "implement"; cliProfile = "codex" }) -WorkingDirectory $env:TEMP -TimeoutSeconds 15
+            [pscustomobject]@{
+                success = [bool]$result.success
+                output = [string]$result.output
+            } | ConvertTo-Json -Compress
+        } finally {
+            Remove-Item -LiteralPath $captureScript -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    Assert-True ($parsed.success -eq $true) "Invoke-AutoDevelopRole should succeed when the provider writes an isolated last-message file."
+    Assert-True ([string]$parsed.output -eq "isolated final message") "Invoke-AutoDevelopRole should prefer the isolated last-message file over noisy stdout."
+}
+
+function Test-InvokeAutoDevelopRoleSanitizesNestedEditorEnvironment {
+    $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
+        $captureScript = Join-Path $env:TEMP ("role-runner-sanitized-env-" + [guid]::NewGuid().ToString("N") + ".ps1")
+        [System.IO.File]::WriteAllText($captureScript, @'
+[pscustomobject]@{
+    claude = [string]$env:CLAUDECODE
+    codexThread = [string]$env:CODEX_THREAD_ID
+    codexOriginator = [string]$env:CODEX_INTERNAL_ORIGINATOR_OVERRIDE
+    codexShell = [string]$env:CODEX_SHELL
+} | ConvertTo-Json -Compress
+'@, [System.Text.Encoding]::UTF8)
+
+        function Get-AutoDevelopResolvedTimeoutSeconds {
+            param($RoleConfig, [int]$FallbackTimeoutSeconds)
+            return $FallbackTimeoutSeconds
+        }
+
+        function Get-AutoDevelopFallbackCliProfiles {
+            param($RoleConfig)
+            return @()
+        }
+
+        function Get-AutoDevelopRolePrompt {
+            param([string]$Prompt, $RoleConfig)
+            return $Prompt
+        }
+
+        function Get-AutoDevelopRoleInvocation {
+            param($RoleConfig, [string]$LastMessageFile = "")
+
+            return [pscustomobject]@{
+                executable = "pwsh.exe"
+                arguments = @("-NoProfile", "-File", $captureScript)
+                promptInput = "stdin"
+                output = "stdout"
+                env = $null
+            }
+        }
+
+        $env:CLAUDECODE = "1"
+        $env:CODEX_THREAD_ID = "thread-to-strip"
+        $env:CODEX_INTERNAL_ORIGINATOR_OVERRIDE = "Codex Desktop"
+        $env:CODEX_SHELL = "1"
+        try {
+            $result = Invoke-AutoDevelopRole -Prompt "ignored prompt" -RoleConfig ([pscustomobject]@{ roleName = "discover"; cliProfile = "codex" }) -WorkingDirectory $env:TEMP -TimeoutSeconds 15
+            [pscustomobject]@{
+                success = [bool]$result.success
+                output = [string]$result.output
+            } | ConvertTo-Json -Compress
+        } finally {
+            Remove-Item Env:CLAUDECODE -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_THREAD_ID -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_INTERNAL_ORIGINATOR_OVERRIDE -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_SHELL -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $captureScript -ErrorAction SilentlyContinue
+        }
+    }
+
+    $parsed = $output | ConvertFrom-Json
+    $envState = ([string]$parsed.output | ConvertFrom-Json)
+    Assert-True ($parsed.success -eq $true) "Invoke-AutoDevelopRole should still succeed after sanitizing inherited editor env vars."
+    Assert-True ([string]$envState.claude -eq "") "Nested role launches should strip CLAUDECODE from the child process."
+    Assert-True ([string]$envState.codexThread -eq "") "Nested role launches should strip CODEX_THREAD_ID from the child process."
+    Assert-True ([string]$envState.codexOriginator -eq "") "Nested role launches should strip CODEX_INTERNAL_ORIGINATOR_OVERRIDE from the child process."
+    Assert-True ([string]$envState.codexShell -eq "") "Nested role launches should strip CODEX_SHELL from the child process."
+}
+
+function Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles {
+    $repo = New-TestRepo
+    try {
+        Write-TestFile -Path (Join-Path $repo.root "AGENTS.md") -Content @"
+# Repo Rules
+
+Follow AGENTS first.
+"@
+        Write-TestFile -Path (Join-Path $repo.root "CLAUDE.md") -Content @"
+# Claude Rules
+
+Follow CLAUDE second.
+"@
+
+        $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+            "Clip-Text",
+            "Get-CompactInstructionFileSummary",
+            "Get-CompactWorkspaceInstructionContext",
+            "Build-CompactCodebaseContext"
+        ) -ScriptBlock {
+            param($RepoRoot)
+            $summary = Get-CompactWorkspaceInstructionContext -RepoRoot $RepoRoot
+            $compact = Build-CompactCodebaseContext -Inventory ([pscustomobject]@{
+                workspaceInstructionContext = $summary
+                projects = @()
+                directories = @()
+            })
+            [pscustomobject]@{
+                summary = $summary
+                compact = $compact
+            } | ConvertTo-Json -Depth 8
+        } -Arguments @($repo.root)
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.summary -match "AGENTS_MD_SUMMARY") "Workspace instruction summaries should include AGENTS.md when present."
+        Assert-True ([string]$parsed.summary -match "CLAUDE_MD_SUMMARY") "Workspace instruction summaries should include CLAUDE.md when present."
+        Assert-True ([string]$parsed.compact -match "WORKSPACE_INSTRUCTIONS") "Compact codebase context should surface the workspace instruction block."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopSessionShowReportsDetectedHostAndHostDefaultSource {
+    $repo = New-TestRepo
+    try {
+        $output = Invoke-WithEnvironment -Variables @{
+            "CODEX_THREAD_ID" = "codex-session-show-test"
+        } -ScriptBlock {
+            $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", (Join-Path $PSScriptRoot "autodevelop-session.ps1"),
+                "-Mode", "show",
+                "-RepoRoot", $repo.root
+            )
+            if ($process.exitCode -ne 0) {
+                throw "autodevelop-session show failed: $([string]$process.stderr)$([string]$process.stdout)"
+            }
+            return ([string]$process.stdout).Trim()
+        }
+
+        $parsed = $output | ConvertFrom-Json
+        Assert-True ([string]$parsed.detectedHost -eq "codex") "autodevelop-session show should surface the detected editor host."
+        Assert-True ([string]$parsed.detectedHostSource -eq "CODEX_THREAD_ID") "autodevelop-session show should surface the detected host source."
+        Assert-True ([string]$parsed.activeExecutionProfile -eq "codex-full") "autodevelop-session show should reflect the host-default Codex profile."
+        Assert-True ([string]$parsed.activeExecutionProfileSource -eq "host-default") "autodevelop-session show should surface host-default as the active profile source."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -3972,6 +4611,66 @@ function Test-RetryContextPromptBlockIncludesValidationIssues {
     Assert-True ([string]$output -match "LATEST FAILURE VALIDATION ISSUES") "Retry prompt blocks should expose structured validation issues."
     Assert-True ([string]$output -match "read-only phase") "Retry prompt blocks should carry the concrete validation issue text."
     Assert-True ([string]$output -match "LATEST FAILURE READ-ONLY PHASE CONFUSION: YES") "Retry prompt blocks should preserve phase-confusion markers."
+}
+
+function Test-CurrentAttemptReviewBlockersTextAccumulatesDistinctReviewDenials {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-RetryLessonComparisonText",
+        "Clip-Text",
+        "Get-CurrentAttemptReviewBlockersText"
+    ) -ScriptBlock {
+        $history = [System.Collections.ArrayList]::new()
+        [void]$history.Add([ordered]@{
+            attempt = 1
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Reviewer found missing navigation reset."
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 2
+            source = "IMPLEMENT"
+            category = "NO_CHANGE_TOOL_FAILURE"
+            feedback = "tool failed"
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 2
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Reviewer found eager loading regression."
+        })
+        [void]$history.Add([ordered]@{
+            attempt = 3
+            source = "REVIEW"
+            category = "REVIEW_DENIED_MAJOR"
+            feedback = "Reviewer found eager loading regression."
+        })
+
+        Get-CurrentAttemptReviewBlockersText -History $history -MaxEntries 6 -MaxChars 1200
+    }
+
+    Assert-True ([string]$output -match "Review 1 \[REVIEW_DENIED_MAJOR\].*navigation reset") "Current-attempt review blockers should include the first distinct review denial."
+    Assert-True ([string]$output -match "Review 2 \[REVIEW_DENIED_MAJOR\].*eager loading regression") "Current-attempt review blockers should include later distinct review denials."
+    Assert-True ([string]$output -notmatch "tool failed") "Current-attempt review blockers should exclude non-review failures."
+}
+
+function Test-CurrentAttemptReviewBlockersTextReturnsEmptyWhenNoReviewDenialsExist {
+    $output = Invoke-AutoDevelopHelperFunctions -FunctionNames @(
+        "Get-RetryLessonComparisonText",
+        "Clip-Text",
+        "Get-CurrentAttemptReviewBlockersText"
+    ) -ScriptBlock {
+        $history = [System.Collections.ArrayList]::new()
+        [void]$history.Add([ordered]@{
+            attempt = 1
+            source = "IMPLEMENT"
+            category = "NO_CHANGE_TOOL_FAILURE"
+            feedback = "tool failed"
+        })
+
+        Get-CurrentAttemptReviewBlockersText -History $history -MaxEntries 6 -MaxChars 1200
+    }
+
+    Assert-True ([string]::IsNullOrWhiteSpace([string]$output)) "Current-attempt review blockers should be empty without prior review denials."
 }
 
 function Test-WriteRetryContextFilePersistsRelevantPriorFailures {
@@ -5503,6 +6202,108 @@ function Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedSta
         Assert-True ($waitResult.ok -eq $false) "Wait mode should not mask a failed refresh after a blocked state."
         Assert-True ([string]$waitResult.processStatus -eq "unavailable_timeout") "A failed refresh after waiting should surface as unavailable_timeout."
         Assert-True (@($waitResult.history).Count -ge 1) "Wait mode should record the failed refresh attempt in history."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-CodexUsageGateReadsSessionStateDbAndSessionLog {
+    $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $threadId = "codex-db-test-thread"
+        $stateDbPath = Join-Path $root "state_5.sqlite"
+        $sessionPath = Join-Path $root "sessions\2026\04\21\rollout-2026-04-21T10-00-00-$threadId.jsonl"
+        Write-CodexUsageGateStateDb -Path $stateDbPath -ThreadId $threadId -RolloutPath $sessionPath
+        Write-CodexUsageGateSessionLog -Path $sessionPath -Payloads @(
+            [ordered]@{
+                type = "token_count"
+                rate_limits = [ordered]@{
+                    primary = [ordered]@{
+                        used_percent = 42.5
+                        resets_at = "2026-04-21T17:00:00Z"
+                    }
+                    secondary = [ordered]@{
+                        used_percent = 12.0
+                        resets_at = "2026-04-28T17:00:00Z"
+                    }
+                    plan_type = "plus"
+                    rate_limit_reached_type = ""
+                }
+            }
+        )
+
+        $result = Invoke-CodexUsageGateJson -CodexHome $root -ThreadId $threadId
+        Assert-True ($result.ok -eq $true) "State-db-backed Codex usage probes should resolve successfully."
+        Assert-True ([string]$result.processStatus -eq "ok") "Fresh Codex usage below threshold should return ok."
+        Assert-True ([string]$result.source -eq "session-log") "Fresh Codex usage should report session-log as the source."
+        Assert-True ([double]$result.fiveHourUtilization -eq 42.5) "The Codex gate should map primary.used_percent to the five-hour utilization field."
+        Assert-True ([double]$result.sevenDayUtilization -eq 12.0) "The Codex gate should map secondary.used_percent to the seven-day utilization field."
+        $expectedSessionPath = [System.IO.Path]::GetFullPath($sessionPath)
+        $actualSessionPath = [System.IO.Path]::GetFullPath([string]$result.sessionPath)
+        Assert-True ($actualSessionPath -eq $expectedSessionPath) "The Codex gate should resolve the session log path through state_5.sqlite."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-CodexUsageGateBlocksWhenRateLimitReachedTypeIsSet {
+    $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $sessionPath = Join-Path $root "sessions\2026\04\21\rollout-codex-blocked.jsonl"
+        Write-CodexUsageGateSessionLog -Path $sessionPath -Payloads @(
+            [ordered]@{
+                type = "token_count"
+                rate_limits = [ordered]@{
+                    primary = [ordered]@{
+                        used_percent = 12.0
+                        resets_at = "2026-04-21T17:00:00Z"
+                    }
+                    secondary = [ordered]@{
+                        used_percent = 4.0
+                        resets_at = "2026-04-28T17:00:00Z"
+                    }
+                    plan_type = "plus"
+                    rate_limit_reached_type = "primary"
+                }
+            }
+        )
+
+        $result = Invoke-CodexUsageGateJson -CodexHome $root -SessionPath $sessionPath -ThreadId "codex-blocked-thread"
+        Assert-True ($result.ok -eq $true) "Rate-limit-reached results should still count as fresh verified state."
+        Assert-True ([string]$result.processStatus -eq "blocked") "rate_limit_reached_type should force a blocked status."
+        Assert-True ($result.shouldBlock -eq $true) "rate_limit_reached_type should set shouldBlock."
+        Assert-True ([string]$result.rateLimitReachedType -eq "primary") "The reached limit type should be surfaced in the result."
+    } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-CodexUsageGateNeverTrustsStaleCacheForLaunchDecisions {
+    $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    try {
+        $cachePath = Join-Path $root "tl-autodev-codex-usage-cache.json"
+        Write-TestFile -Path $cachePath -Content @"
+{
+  "fetchedAt": "2026-04-21T14:00:00Z",
+  "source": "session-log",
+  "fiveHourUtilization": 15.0,
+  "fiveHourResetAt": "2026-04-21T17:00:00Z",
+  "sevenDayUtilization": 7.0,
+  "thresholdPercent": 90,
+  "shouldBlock": false,
+  "lastError": ""
+}
+"@
+
+        $result = Invoke-CodexUsageGateJson -CodexHome $root -MockErrorKind "timeout"
+        Assert-True ($result.ok -eq $false) "Codex timeouts must not authorize launches from stale cache."
+        Assert-True ([string]$result.processStatus -eq "unavailable_timeout") "Codex timeouts should classify as unavailable_timeout."
+        Assert-True ([string]$result.source -eq "none") "Stale Codex cache should not become the active source."
+        Assert-True ([double]$result.fiveHourUtilization -eq 15.0) "Stale Codex cache may still be returned as informational context."
+        Assert-True ([string]$result.lastSuccessfulFetchAt -eq "2026-04-21T14:00:00.0000000+00:00") "Codex timeouts should surface the last successful fetch time from cache."
     } finally {
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -9041,6 +9842,8 @@ Test-EmptyRetryContextPayloadFallsBackGracefully
 Test-MissingRetryContextFallsBackGracefully
 Test-RetryContextPromptBlockIncludesPriorDenialText
 Test-RetryContextPromptBlockIncludesValidationIssues
+Test-CurrentAttemptReviewBlockersTextAccumulatesDistinctReviewDenials
+Test-CurrentAttemptReviewBlockersTextReturnsEmptyWhenNoReviewDenialsExist
 Test-WriteRetryContextFilePersistsRelevantPriorFailures
 Test-WriteRetryContextFileSkipsInfraOnlyHistory
 Test-ReconcilePersistsRetryLessonsAndRetryContextArtifacts
@@ -9813,16 +10616,29 @@ Test-AutoDevelopResolvedTimeoutPrefersRoleConfig
 Test-PlannerRunnerRespectsGitCommandOverride
 Test-AutoDevelopWorkerRespectsGitCommandOverride
 Test-AutoDevelopSessionProfileSelection
+Test-AutoDevelopHostDefaultsSelectEditorSpecificProfiles
+Test-AutoDevelopSessionOverrideBeatsHostDefault
+Test-AutoDevelopInvalidHostDefaultsWarnAndFallBackCleanly
 Test-AutoDevelopUsageCombosAggregateAcrossRoles
 Test-RegisterTasksWarnsWhenTaskTextDiffersFromPromptFile
 Test-OpenCodeInvocationIncludesModelAgentAndConfigEnv
+Test-CodexInvocationUsesExpectedFlagsAndSandboxModes
+Test-CodexPromptInjectsSoftTurnBudget
 Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary
 Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary
 Test-InvokeAutoDevelopRoleHandlesEmptyEnvironmentOverrides
+Test-InvokeAutoDevelopRolePrefersCodexLastMessageFile
+Test-InvokeAutoDevelopRoleSanitizesNestedEditorEnvironment
 Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh
 Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel
 Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass
+Test-AutoDevelopUsageCombosIncludeCodexProfilesAndUsageMode
 Test-RegisterTasksAcceptsTasksJsonAlias
 Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequested
+Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles
+Test-AutoDevelopSessionShowReportsDetectedHostAndHostDefaultSource
+Test-CodexUsageGateReadsSessionStateDbAndSessionLog
+Test-CodexUsageGateBlocksWhenRateLimitReachedTypeIsSet
+Test-CodexUsageGateNeverTrustsStaleCacheForLaunchDecisions
 
 Write-Host "Scheduler regression checks passed."

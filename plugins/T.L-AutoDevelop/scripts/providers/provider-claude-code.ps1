@@ -65,5 +65,6 @@ function Get-ClaudeCodeInvocationForRole {
         arguments = @($arguments.ToArray())
         promptInput = "stdin"
         output = "stdout"
+        env = [ordered]@{}
     }
 }

@@ -31,4 +31,4 @@ Autonomous queue-aware orchestration built on top of [T.L-AutoDevelop](../T.L-Au
 - Windows (PowerShell 5.1+)
 - .NET SDK
 - Git
-- Claude CLI
+- Claude Code CLI and/or Codex CLI and/or OpenCode CLI, depending on the configured role profiles in `T.L-AutoDevelop`

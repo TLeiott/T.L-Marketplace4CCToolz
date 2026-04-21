@@ -1,0 +1,52 @@
+{
+  "id": "opencode",
+  "family": "opencode",
+  "command": "opencode",
+  "interaction": {
+    "promptInput": "stdin",
+    "output": "stdout",
+    "nonInteractive": true
+  },
+  "supportedProviders": [],
+  "supportedModelClasses": [],
+  "supportedOptions": {
+    "reasoningEffort": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "maxTurns": true,
+    "dangerouslySkipPermissions": false,
+    "extraArgs": true,
+    "explicitModel": true
+  },
+  "supportedCapabilities": [
+    "read",
+    "search",
+    "edit",
+    "write",
+    "shell"
+  ],
+  "capabilityToolMap": {
+    "read": [
+      "read",
+      "list"
+    ],
+    "search": [
+      "glob",
+      "grep"
+    ],
+    "edit": [
+      "edit"
+    ],
+    "write": [
+      "edit"
+    ],
+    "shell": [
+      "bash"
+    ]
+  },
+  "modelResolution": {},
+  "usageSupport": {},
+  "fallbackCliProfiles": []
+}

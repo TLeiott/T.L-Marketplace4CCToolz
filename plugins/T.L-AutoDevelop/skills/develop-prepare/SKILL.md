@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # /develop-prepare
 
-CRITICAL: You are the Main-Claude orchestrator. You do not implement repository code changes yourself.
+CRITICAL: You are the main AutoDevelop orchestrator. You do not implement repository code changes yourself.
 
 Your job is to:
 - resolve the repository and solution context

@@ -3,19 +3,19 @@
   "owner": {
     "name": "TLeiott"
   },
-  "description": "Autonomous .NET development pipeline tools for Claude Code and OpenCode",
+  "description": "Autonomous .NET development pipeline tools for Claude Code, Codex, and OpenCode",
   "plugins": [
     {
       "name": "T.L-AutoDevelop",
       "source": "./plugins/T.L-AutoDevelop",
-      "description": "Interactive queue-aware .NET dev orchestration with hybrid Claude Code/OpenCode role profiles. Skills: /develop, /develop-prepare, /pipe-feedback, and /autodev-config. Task text and task files share one scheduler-driven queue.",
-      "version": "4.4.5"
+      "description": "Interactive queue-aware .NET dev orchestration with hybrid Claude Code/Codex/OpenCode role profiles, host-aware defaults, and one scheduler-driven queue shared by task text and task files.",
+      "version": "4.4.7"
     },
     {
       "name": "T.L-AutoDevelop-Pro",
       "source": "./plugins/T.L-AutoDevelop-Pro",
-      "description": "Autonomous addon for T.L-AutoDevelop. Skill: /TLA-develop. Uses the same prepare-aware queue scheduler and auto-commits prepared merges. Requires T.L-AutoDevelop.",
-      "version": "4.2.13"
+      "description": "Autonomous addon for T.L-AutoDevelop. Skill: /TLA-develop. Uses the same host-aware multi-CLI queue scheduler and auto-commits prepared merges. Requires T.L-AutoDevelop.",
+      "version": "4.2.14"
     },
     {
       "name": "T.L-Claude-Code-Custom",
