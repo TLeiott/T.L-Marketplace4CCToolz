@@ -125,7 +125,7 @@ function Test-AutoDevelopConfigObject {
     if ($Value -is [System.Collections.IDictionary]) { return $true }
     if ($Value -is [string] -or $Value -is [ValueType] -or $Value -is [System.Array]) { return $false }
     if ($Value -is [System.Management.Automation.PSObject]) {
-        return @($Value.PSObject.Properties).Count -gt 0
+        return $true
     }
     return $false
 }
