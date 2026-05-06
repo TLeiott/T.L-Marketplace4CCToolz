@@ -384,7 +384,7 @@ function Resolve-TestPythonCommand {
         }
     }
 
-    throw "Python is required for the Codex state-db tests."
+    return $null
 }
 
 function Write-CodexUsageGateStateDb {
@@ -395,6 +395,9 @@ function Write-CodexUsageGateStateDb {
     )
 
     $pythonCommand = Resolve-TestPythonCommand
+    if (-not $pythonCommand) {
+        throw "TEST_PREREQUISITE_MISSING: Python (python or py) is required for the Codex state-db helper."
+    }
     $pythonCode = @'
 import sqlite3
 import sys
@@ -6208,6 +6211,10 @@ function Test-UsageGateWaitModeReturnsUnavailableWhenRefreshFailsAfterBlockedSta
 }
 
 function Test-CodexUsageGateReadsSessionStateDbAndSessionLog {
+    if (-not (Resolve-TestPythonCommand)) {
+        Write-Host "[SKIP] Test-CodexUsageGateReadsSessionStateDbAndSessionLog: Python (python or py) is not available; skipping the Codex state-db scenario."
+        return
+    }
     $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     try {
