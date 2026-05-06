@@ -41,8 +41,8 @@ AutoDevelop V4 is a layered system:
 ### Main-Claude
 
 Main-Claude is the top-level orchestrator defined by the skill files:
-- [develop SKILL.md](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/skills/develop/SKILL.md)
-- [TLA-develop SKILL.md](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop-Pro/skills/TLA-develop/SKILL.md)
+- [develop SKILL.md](plugins/T.L-AutoDevelop/skills/develop/SKILL.md)
+- [TLA-develop SKILL.md](plugins/T.L-AutoDevelop-Pro/skills/TLA-develop/SKILL.md)
 
 Main-Claude is responsible for:
 - validating repo state
@@ -59,7 +59,7 @@ Main-Claude is responsible for:
 ### Scheduler
 
 The durable queue engine is:
-- [scheduler.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/scheduler.ps1)
+- [scheduler.ps1](plugins/T.L-AutoDevelop/scripts/scheduler.ps1)
 
 It is the source of truth for:
 - task records
@@ -72,10 +72,10 @@ It is the source of truth for:
 ### Scheduler Planning
 
 The scheduler prompt template is:
-- [scheduler-agent.md](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/agents/scheduler-agent.md)
+- [scheduler-agent.md](plugins/T.L-AutoDevelop/agents/scheduler-agent.md)
 
 Current `/develop` orchestration uses:
-- [planner-runner.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/planner-runner.ps1)
+- [planner-runner.ps1](plugins/T.L-AutoDevelop/scripts/planner-runner.ps1)
 
 `planner-runner.ps1` resolves the repo-local `scheduler` role from `.claude/autodevelop.json`, loads the scheduler prompt template, reads the queue snapshot and nearby markdown context, and asks the configured scheduler role to assign conservative waves.
 
@@ -84,7 +84,7 @@ Both `/develop` and `/TLA-develop` now invoke planning through the same config-d
 ### Worker Pipe
 
 The actual implementation engine is:
-- [auto-develop.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/auto-develop.ps1)
+- [auto-develop.ps1](plugins/T.L-AutoDevelop/scripts/auto-develop.ps1)
 
 It runs inside a dedicated git worktree and does the actual:
 - discovery
@@ -98,12 +98,12 @@ It runs inside a dedicated git worktree and does the actual:
 ### Supporting Scripts
 
 - usage gate:
-  - [autodevelop-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/autodevelop-usage-gate.ps1)
-  - [claude-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1), used as the Claude-specific provider gate
+  - [autodevelop-usage-gate.ps1](plugins/T.L-AutoDevelop/scripts/autodevelop-usage-gate.ps1)
+  - [claude-usage-gate.ps1](plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1), used as the Claude-specific provider gate
 - deterministic validation:
-  - [preflight.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/preflight.ps1)
+  - [preflight.ps1](plugins/T.L-AutoDevelop/scripts/preflight.ps1)
 - code review agent:
-  - [reviewer.md](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/agents/reviewer.md)
+  - [reviewer.md](plugins/T.L-AutoDevelop/agents/reviewer.md)
 
 ## 3. End-to-End Flow
 
@@ -168,12 +168,12 @@ Then Main-Claude resolves the active solution:
 ## 6. Usage Gate
 
 Main-Claude calls:
-- [autodevelop-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/autodevelop-usage-gate.ps1)
+- [autodevelop-usage-gate.ps1](plugins/T.L-AutoDevelop/scripts/autodevelop-usage-gate.ps1)
 
 The aggregate gate resolves the active execution profile for the repository session and probes every distinct CLI/provider/model-class combination used by that profile.
 
 For Claude-backed combinations, the aggregate gate delegates to:
-- [claude-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1)
+- [claude-usage-gate.ps1](plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1)
 
 The Claude-specific gate reads Claude OAuth credentials directly, calls the usage endpoint, and writes an AutoDevelop-owned usage cache. Stale cache data is informational only and is not a fresh launch decision.
 
@@ -390,7 +390,7 @@ Each started task gets:
 - a result file path
 
 The scheduler then launches:
-- [auto-develop.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/auto-develop.ps1)
+- [auto-develop.ps1](plugins/T.L-AutoDevelop/scripts/auto-develop.ps1)
 
 ## 12. Worker Pipe Phases
 
@@ -495,7 +495,7 @@ If they still fail:
 ### 12.9 Preflight
 
 The worker runs deterministic validation via:
-- [preflight.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/preflight.ps1)
+- [preflight.ps1](plugins/T.L-AutoDevelop/scripts/preflight.ps1)
 
 Preflight can check:
 - build
@@ -514,7 +514,7 @@ If preflight fails:
 ### 12.10 Review
 
 The worker loads:
-- [reviewer.md](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/agents/reviewer.md)
+- [reviewer.md](plugins/T.L-AutoDevelop/agents/reviewer.md)
 
 The reviewer agent evaluates judgment-based quality that deterministic checks do not cover.
 
