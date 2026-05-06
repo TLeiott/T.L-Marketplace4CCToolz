@@ -4818,6 +4818,10 @@ function Apply-Plan {
                 $task.state = "queued"
                 $task.retryScheduled = $false
             }
+            if ([string]$task.state -eq "environment_retry_scheduled" -and [int]$task.waveNumber -gt 0 -and -not $assignment.plannedState) {
+                $task.state = "retry_scheduled"
+                $task.retryScheduled = $true
+            }
             Update-TaskUsageEstimate -State $state -Task $task
             Write-TaskResultFile -Task $task
         }

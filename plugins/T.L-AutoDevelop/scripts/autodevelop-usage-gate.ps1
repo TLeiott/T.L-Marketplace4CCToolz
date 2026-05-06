@@ -232,6 +232,80 @@ function Invoke-ComboUsageProbe {
     }
 }
 
+function Get-NumericValueOrNull {
+    param($Value)
+
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    try {
+        return [double]$Value
+    } catch {
+        return $null
+    }
+}
+
+function Get-DateTimeOffsetOrNull {
+    param($Value)
+
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    try {
+        return [DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $null
+    }
+}
+
+function Get-AggregatedUsageMetrics {
+    param([object[]]$Combos)
+
+    $fiveHourMax = $null
+    $bindingResetAt = $null
+    foreach ($combo in $Combos) {
+        $current = Get-NumericValueOrNull -Value $combo.fiveHourUtilization
+        if ($null -eq $current) { continue }
+        if ($null -eq $fiveHourMax -or $current -gt $fiveHourMax) {
+            $fiveHourMax = $current
+            $bindingResetAt = if ($combo.fiveHourResetAt) { [string]$combo.fiveHourResetAt } else { $null }
+        }
+    }
+
+    $sevenDayMax = $null
+    foreach ($combo in $Combos) {
+        $current = Get-NumericValueOrNull -Value $combo.sevenDayUtilization
+        if ($null -eq $current) { continue }
+        if ($null -eq $sevenDayMax -or $current -gt $sevenDayMax) {
+            $sevenDayMax = $current
+        }
+    }
+
+    $latestBlockedReset = $null
+    foreach ($combo in $Combos) {
+        if (-not $combo.shouldBlock) { continue }
+        $candidate = Get-DateTimeOffsetOrNull -Value $combo.fiveHourResetAt
+        if ($null -eq $candidate) { continue }
+        if ($null -eq $latestBlockedReset -or $candidate -gt $latestBlockedReset) {
+            $latestBlockedReset = $candidate
+        }
+    }
+
+    $resetAt = if ($latestBlockedReset) { $latestBlockedReset.ToString('o') } else { $bindingResetAt }
+
+    $latestFetch = $null
+    foreach ($combo in $Combos) {
+        $candidate = Get-DateTimeOffsetOrNull -Value $combo.lastSuccessfulFetchAt
+        if ($null -eq $candidate) { continue }
+        if ($null -eq $latestFetch -or $candidate -gt $latestFetch) {
+            $latestFetch = $candidate
+        }
+    }
+
+    return [pscustomobject]@{
+        fiveHourUtilization = if ($null -eq $fiveHourMax) { $null } else { [Math]::Round($fiveHourMax, 2) }
+        fiveHourResetAt = $resetAt
+        sevenDayUtilization = if ($null -eq $sevenDayMax) { $null } else { [Math]::Round($sevenDayMax, 2) }
+        lastSuccessfulFetchAt = if ($latestFetch) { $latestFetch.ToString('o') } else { $null }
+    }
+}
+
 $resolvedRepoRoot = Resolve-RepoRoot -ExplicitRepoRoot $RepoRoot -ExplicitSolutionPath $SolutionPath
 $configState = Get-AutoDevelopConfigState -RepoRoot $resolvedRepoRoot
 $combos = @(Get-AutoDevelopRoleUsageCombos -ConfigState $configState)
@@ -252,6 +326,8 @@ $processStatus = if ($fatalCount -gt 0) {
     'ok'
 }
 
+$aggregatedMetrics = Get-AggregatedUsageMetrics -Combos $probeResults
+
 [pscustomobject]@{
     ok = ($fatalCount -eq 0 -and $unavailableCount -eq 0)
     processStatus = $processStatus
@@ -260,6 +336,10 @@ $processStatus = if ($fatalCount -gt 0) {
     repoRoot = $resolvedRepoRoot
     activeExecutionProfile = $configState.activeExecutionProfile
     activeExecutionProfileSource = $configState.activeExecutionProfileSource
+    fiveHourUtilization = $aggregatedMetrics.fiveHourUtilization
+    fiveHourResetAt = $aggregatedMetrics.fiveHourResetAt
+    sevenDayUtilization = $aggregatedMetrics.sevenDayUtilization
+    lastSuccessfulFetchAt = $aggregatedMetrics.lastSuccessfulFetchAt
     combos = $probeResults
     usageUnsupportedCount = $usageUnsupportedCount
     blockingCount = $blockedCount

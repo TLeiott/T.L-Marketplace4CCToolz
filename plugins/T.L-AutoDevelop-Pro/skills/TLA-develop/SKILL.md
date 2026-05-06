@@ -36,7 +36,8 @@ Use the absolute solution path for all later script calls.
 
 Find `scheduler.ps1` from the installed plugin and derive:
 - `scheduler.ps1`
-- `claude-usage-gate.ps1`
+- `planner-runner.ps1`
+- `autodevelop-usage-gate.ps1`
 
 If `scheduler.ps1` cannot be found, stop.
 
@@ -165,11 +166,31 @@ Use the same queue procedure as `/develop`:
 1. `snapshot-queue`
 2. `register-tasks`
 3. `snapshot-queue` again
-4. invoke the read-only `scheduler-agent`
+4. invoke the config-driven planner via `planner-runner.ps1`
 5. `apply-plan`
 6. `snapshot-queue` again
 
-The planner input must include:
+Do not rely on the static `scheduler-agent` frontmatter for runtime model selection. Use the config-driven planner script from the installed plugin so this skill follows the same execution profile that `/develop` uses.
+
+Prepare these planner inputs first:
+- the full queue snapshot after registration
+- the ids of the new tasks added in this invocation
+
+Write the queue snapshot to a UTF-8 JSON file.
+Write the new task ids to a UTF-8 JSON file as a string array.
+
+Then invoke:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<planner-runner.ps1>" -SolutionPath "<solution>" -SnapshotFile "<snapshot.json>" -NewTaskIdsFile "<new-task-ids.json>" -OutputFile "<plan.json>"
+```
+
+The planner script reads `.claude/autodevelop.json` from the target repository, resolves the `scheduler` role, and is responsible for reading:
+- the scheduler prompt template
+- the queue snapshot context
+- relevant markdown context
+
+The planner sees:
 - all running tasks
 - all queued tasks
 - all retry-scheduled tasks
@@ -180,12 +201,24 @@ The planner input must include:
 - recent planner feedback from the queue snapshot
 - nearby documentation markdown files relevant to the affected modules
 
+The resulting JSON must contain:
+- `summary`
+- `tasks[]` containing `taskId`, `waveNumber`, `blockedBy`, `plannerMetadata`
+- `startableTaskIds`
+- optional wave rationale
+
+Save that JSON to a plan file and apply it through the scheduler:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode apply-plan -SolutionPath "<solution>" -PlanFile "<plan.json>"
+```
+
 Use `completedTaskBriefs` only as advisory planning context for recently touched files, shared modules, and conflict risk. Do not treat them as hard dependency evidence when they are vague or failure-only.
 
 ## 8. Gate And Start Ready Pipes
 
 Before any launch attempt, if the latest queue snapshot reports `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
-1. call the `scheduler-agent` again on the latest snapshot
+1. call the scheduler role runner again on the latest snapshot via `planner-runner.ps1`
 2. `apply-plan`
 3. `snapshot-queue` again
 4. only continue if the new snapshot is no longer stalled
@@ -277,7 +310,7 @@ Do not reduce this to only "started" / "queued" lines when richer progress data 
 Whenever `wait-queue` wakes or you re-enter while tasks may have progressed:
 1. Snapshot the queue.
 2. If `queueStall.status == "stalled"`, do one automatic stall-recovery cycle:
-   - call the `scheduler-agent` on the latest snapshot
+   - call the scheduler role runner on the latest snapshot via `planner-runner.ps1`
    - `apply-plan`
    - `snapshot-queue` again
    - if the same `queueStall.signature` is still stalled, report that the queue remains stalled and stop instead of looping
@@ -326,7 +359,7 @@ If a task reaches terminal failure, report that clearly.
 
 ## 11. Replanning Rule
 
-Run the scheduler-agent planning pass whenever the queue materially changes:
+Run the scheduler role planning pass via `planner-runner.ps1` whenever the queue materially changes:
 - new submission
 - task-file expansion
 - task completion

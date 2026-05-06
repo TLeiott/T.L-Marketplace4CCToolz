@@ -5260,9 +5260,32 @@ SUMMARY:
         if (-not $finalizeValidation.isValid) {
             Fail-WorktreeEnvironment -Validation $finalizeValidation -Phase "FINALIZE" -Summary "The worktree became invalid before the final commit."
         }
-        Invoke-NativeCommand git @("-C", $worktreePath, "add", "-A") | Out-Null
-        Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName") | Out-Null
-        Invoke-NativeCommand git @("worktree", "remove", $worktreePath) | Out-Null
+        $addResult = Invoke-NativeCommand git @("-C", $worktreePath, "add", "-A")
+        if ($addResult.exitCode -ne 0) {
+            Add-TimelineEvent -Phase "FINALIZE" -Message "git add -A failed in worktree." -Category "FINALIZE_GIT_ERROR" -Data @{ exitCode = $addResult.exitCode; output = $addResult.output }
+            $finalStatus = "FAILED"
+            $finalCategory = "FINALIZE_GIT_ERROR"
+            $finalSummary = "Final git add failed; the accepted change could not be staged."
+            $finalFeedback = "git add -A exited with $($addResult.exitCode):`n$($addResult.output)"
+            throw [System.Exception]::new("TERMINAL_FINALIZE_GIT_ERROR")
+        }
+        $commitResult = Invoke-NativeCommand git @("-C", $worktreePath, "commit", "-m", "auto: $TaskName")
+        if ($commitResult.exitCode -ne 0) {
+            Add-TimelineEvent -Phase "FINALIZE" -Message "git commit failed in worktree." -Category "FINALIZE_GIT_ERROR" -Data @{ exitCode = $commitResult.exitCode; output = $commitResult.output }
+            $finalStatus = "FAILED"
+            $finalCategory = "FINALIZE_GIT_ERROR"
+            $finalSummary = "Final git commit failed; the accepted change could not be committed."
+            $finalFeedback = "git commit exited with $($commitResult.exitCode):`n$($commitResult.output)"
+            throw [System.Exception]::new("TERMINAL_FINALIZE_GIT_ERROR")
+        }
+        $removeResult = Invoke-NativeCommand git @("worktree", "remove", $worktreePath)
+        if ($removeResult.exitCode -ne 0) {
+            Add-TimelineEvent -Phase "FINALIZE" -Message "git worktree remove returned non-zero; attempting --force fallback." -Category "FINALIZE_WORKTREE_CLEANUP" -Data @{ exitCode = $removeResult.exitCode; output = $removeResult.output }
+            $forcedRemove = Invoke-NativeCommand git @("worktree", "remove", $worktreePath, "--force")
+            if ($forcedRemove.exitCode -ne 0) {
+                Add-TimelineEvent -Phase "FINALIZE" -Message "Forced git worktree remove also failed; commit is preserved on branch and cleanup will be handled by prepare-environment." -Category "FINALIZE_WORKTREE_CLEANUP" -Data @{ exitCode = $forcedRemove.exitCode; output = $forcedRemove.output }
+            }
+        }
         $worktreePath = $null
         Write-ResultJson -status $finalStatus -finalCategory $finalCategory -summary $finalSummary -branch $branchName -files $changedFiles -verdict $finalVerdict -feedback $finalFeedback -severity $finalSeverity -phase "FINALIZE" -investigationConclusion $investigationConclusion -discoverConclusion $discoverConclusion -route $routeDecision -testability $testability -testProjects $testProjects -reproductionAttempted $reproductionAttempted -reproductionConfirmed $reproductionConfirmed -reproductionTests $reproductionTests -targetedVerificationPassed $targetedVerificationPassed -plannerEffortClass $plannerEffortClass -pipelineProfile $pipelineProfile -directionCheck $directionCheckVerdict -validationIssues $resultValidationIssues
     } else {

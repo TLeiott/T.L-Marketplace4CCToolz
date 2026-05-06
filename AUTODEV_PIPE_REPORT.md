@@ -79,11 +79,7 @@ Current `/develop` orchestration uses:
 
 `planner-runner.ps1` resolves the repo-local `scheduler` role from `.claude/autodevelop.json`, loads the scheduler prompt template, reads the queue snapshot and nearby markdown context, and asks the configured scheduler role to assign conservative waves.
 
-Important current drift:
-- `/develop` is documented to use `planner-runner.ps1`
-- `/TLA-develop` still instructs direct `scheduler-agent` invocation in its skill file
-
-That Pro skill drift should be fixed if autonomous and interactive planning are expected to use the same config-driven runtime path.
+Both `/develop` and `/TLA-develop` now invoke planning through the same config-driven `planner-runner.ps1` path, so autonomous and interactive runs share one runtime planner contract.
 
 ### Worker Pipe
 
@@ -193,12 +189,13 @@ Important behavior:
 - `/TLA-develop` may wait automatically only when the gate returns confirmed blocked usage data with a usable reset time
 - usage combinations that report `usage_not_supported` are surfaced but are not fatal by themselves
 
-Current contract gap:
-- `autodevelop-usage-gate.ps1` aggregates per-combination results under `combos[]`
-- the `/develop` and `/TLA-develop` skills currently ask Main-Claude to read top-level `fiveHourUtilization` and `fiveHourResetAt`
-- the aggregate gate does not currently publish those top-level launch-decision fields
+Aggregate gate output now publishes the top-level launch-decision fields the skills consume:
+- `fiveHourUtilization` is the worst-case (maximum) utilization across the active execution profile's combos
+- `fiveHourResetAt` is the latest reset time among combos that report `shouldBlock`, falling back to the binding combo's reset time when no combo is currently blocked
+- `sevenDayUtilization` and `lastSuccessfulFetchAt` are aggregated alongside the five-hour fields
+- per-combination detail remains available under `combos[]` for diagnostics
 
-Until that is fixed, orchestration has to inspect `combos[]` or the aggregate gate contract has to be extended.
+Orchestration can now make launch decisions directly from the top-level fields without inspecting `combos[]`.
 
 ## 7. Queue State and Persistence
 
@@ -279,7 +276,7 @@ Applies the scheduler planning role's execution plan:
 - dependency blocking
 - planner metadata
 
-It also supports an internal `plannedState` field, although the documented scheduler-agent prompt schema does not currently include that field.
+It also supports an internal `plannedState` field for explicit state overrides, although the documented scheduler-agent prompt schema does not include that field. As a default convenience, `apply-plan` auto-transitions `manual_debug_needed` to `queued` and `environment_retry_scheduled` to `retry_scheduled` whenever the planner assigns a positive wave without an explicit `plannedState`, so the public schema does not need to model recovery transitions.
 
 ### 8.5 `run-task`
 
@@ -365,10 +362,8 @@ Planning rule:
 - if independence is uncertain, serialize
 
 Current implementation detail:
-- `/develop` invokes the planner through `planner-runner.ps1`, which resolves the repo-local scheduler role
-- `/TLA-develop` still describes direct `scheduler-agent` invocation in the Pro skill file
-
-That inconsistency is a known documentation/skill contract drift, not intended product behavior.
+- both `/develop` and `/TLA-develop` invoke the planner through `planner-runner.ps1`, which resolves the repo-local scheduler role from `.claude/autodevelop.json`
+- the Pro skill text instructs Main-Claude to use the same config-driven invocation as `/develop`, so the two skills follow the same runtime planner contract
 
 ## 10. Wave Execution Rules
 
@@ -546,12 +541,10 @@ Common final statuses:
 
 The scheduler translates these into queue state transitions.
 
-Current accepted-finalization gap:
-- when the worker reaches `ACCEPTED`, `auto-develop.ps1` stages, commits, and removes the worktree before writing the final accepted result
-- the current finalization path ignores the return values from `git add`, `git commit`, and `git worktree remove`
-- as a result, the worker can write `ACCEPTED` even if the commit or cleanup failed
-
-That should be treated as a live implementation risk, not as intended behavior.
+Accepted finalization now validates the commit-side git operations:
+- `git add -A` and `git commit` exit codes are checked; a non-zero exit converts the run to `FAILED` with `finalCategory = FINALIZE_GIT_ERROR` and throws the standard `TERMINAL_*` failure path so the result is not published as `ACCEPTED`
+- `git worktree remove` is best-effort; a non-zero exit triggers a `--force` fallback and only logs `FINALIZE_WORKTREE_CLEANUP` when both attempts fail, because the commit itself is already preserved on the branch
+- `worktreePath` is cleared after a successful commit so the outer `finally` block does not delete the just-committed branch even when worktree cleanup leaves leftover files for `prepare-environment` to reconcile
 
 ## 14. Queue State Transitions
 
@@ -591,17 +584,15 @@ queued -> running -> retry_scheduled
 ### Environment retry
 
 ```text
-queued -> running -> environment_retry_scheduled
+queued -> running -> environment_retry_scheduled -> retry_scheduled -> running
 ```
 
-Current limitation:
+Current behavior:
 - `environment_retry_scheduled` is queue-relevant and appears in snapshots and usage projection
-- `run-task` startability currently accepts only `queued` and `retry_scheduled`
-- a normal planner-shaped positive-wave replan does not make an `environment_retry_scheduled` task startable unless the applied plan also changes its state through the internal `plannedState` field
-- the public scheduler-agent JSON schema does not include `plannedState`
-
-Observed effect:
-- an `environment_retry_scheduled` task assigned to wave 1 by a normal plan can still leave `startableTaskIds` empty and `queueStall.status = stalled`
+- `run-task` startability still accepts only `queued` and `retry_scheduled`
+- `apply-plan` now auto-transitions an `environment_retry_scheduled` task to `retry_scheduled` whenever the planner assigns a positive wave and does not provide an explicit `plannedState`, mirroring the existing `manual_debug_needed` recovery path
+- this means a normal scheduler-agent JSON plan (which does not include `plannedState`) can now make an environment-retry task startable just by giving it a positive wave
+- the environment-repair budget (`environmentRepairAttemptsUsed` / `environmentRepairAttemptsRemaining`) is preserved across the transition
 
 ### Exhausted failure
 
@@ -1032,12 +1023,13 @@ This improves both correctness and observability:
 - scheduler bookkeeping is less likely to drift under repeated recovery checks
 - environment repair budget is more trustworthy
 
-Known limitation:
-- environment retry tasks are tracked as queue-relevant work, but they are not directly startable through the normal `queued` / `retry_scheduled` startability predicate
-- a positive-wave scheduler-agent plan that does not include the internal `plannedState` field leaves the task in `environment_retry_scheduled`
-- because the public planner schema does not include `plannedState`, this can still produce a stalled queue
+Relaunch contract:
+- environment retry tasks are tracked as queue-relevant work and remain not directly startable through the normal `queued` / `retry_scheduled` startability predicate
+- `apply-plan` now performs an automatic state transition: when the planner assigns a positive wave to an `environment_retry_scheduled` task without an explicit `plannedState`, the scheduler converts it to `retry_scheduled` so it becomes startable in the wave
+- the public scheduler-agent schema does not need to expose `plannedState` for this case because the auto-transition handles it
+- the environment-repair budget (`environmentRepairAttemptsUsed` / `environmentRepairAttemptsRemaining`) is preserved across the transition
 
-That means the environment retry accounting is more accurate than older builds, but the relaunch contract still needs a scheduler or planner-schema fix.
+This closes the previous stall scenario where a positive-wave plan would leave an environment-retry task stuck and `queueStall.status = stalled`.
 
 ### 25.8 Snapshot and Diagnostics Surface More Runtime Truth
 
@@ -1077,11 +1069,11 @@ The delta from the report body to the current implementation therefore includes:
 - hybrid Claude Code/Codex/OpenCode execution-profile support
 - stricter prompt-file registration validation
 
-Remaining current gaps:
-- `/TLA-develop` skill text still refers to direct `scheduler-agent` planning instead of the config-driven `planner-runner.ps1` path
-- the aggregate usage gate does not yet expose top-level `fiveHourUtilization` or `fiveHourResetAt` fields required by the skill launch-gate prose
-- `environment_retry_scheduled` relaunch can still stall unless state is converted through an internal planned-state transition
-- accepted worker finalization currently ignores final `git add`, `git commit`, and `git worktree remove` command results before writing `ACCEPTED`
+Recently closed gaps:
+- `/TLA-develop` skill text now invokes the config-driven `planner-runner.ps1` like `/develop`, so both skills share the same scheduler role contract
+- the aggregate usage gate now exposes top-level `fiveHourUtilization`, `fiveHourResetAt`, `sevenDayUtilization`, and `lastSuccessfulFetchAt` fields required by the skill launch-gate prose
+- `environment_retry_scheduled` relaunch now auto-transitions to `retry_scheduled` during `apply-plan` when the planner assigns a positive wave and provides no explicit `plannedState`, so the public planner schema does not need a contract change to recover env-retry tasks
+- accepted worker finalization now validates `git add` and `git commit` exit codes (failing the run with `FINALIZE_GIT_ERROR` if either fails) and falls back to `--force` when `git worktree remove` returns non-zero
 
 ### 25.10 Additional Changes Since The Earlier Documentation Commits
 
@@ -1190,11 +1182,11 @@ It is also now explicitly about:
 - grounding reuse-heavy work in existing reference patterns
 - refusing worker launches when the usage state cannot be verified safely
 
-It still has known contract gaps that should be fixed before treating the whole pipe as fully self-consistent:
-- aggregate usage gate output vs skill launch-gate fields
-- `/develop` planner-runner path vs `/TLA-develop` scheduler-agent path
-- environment retry relaunch state transition
-- accepted worker finalization result validation
+The previously documented contract gaps are now closed:
+- the aggregate usage gate publishes the top-level launch-decision fields the skills consume
+- both `/develop` and `/TLA-develop` plan through the same config-driven `planner-runner.ps1` path
+- environment retry relaunch is recovered by an automatic `apply-plan` state transition on positive-wave assignment
+- accepted worker finalization validates `git add`, `git commit`, and `git worktree remove` results before writing `ACCEPTED`
 
 ## 27. Current Short Operational Summary
 
@@ -1211,4 +1203,4 @@ If you want the updated shortest possible summary of the current system:
 9. Successful branches wait for ordered merge preparation.
 10. `/develop` waits for user testing before merge commit; `/TLA-develop` auto-commits after successful merge preparation.
 11. Environment failures, retries, and interrupted-session leftovers are now reconciled more explicitly than in the earlier V4 releases.
-12. Known contract gaps remain around aggregate usage-gate fields, Pro planner invocation, environment-retry relaunch, and accepted-finalization git error handling.
+12. The earlier contract gaps around aggregate usage-gate fields, Pro planner invocation, environment-retry relaunch, and accepted-finalization git error handling are closed; behavior is now consistent across `/develop` and `/TLA-develop` and across the worker-to-scheduler result handoff.
