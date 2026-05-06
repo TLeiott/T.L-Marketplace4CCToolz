@@ -16,12 +16,18 @@ function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments, [string]$WorkingDirectory = '')
 
     $resolvedCommand = Resolve-AutoDevelopNativeCommandName -Command $Command
+    $invocationCommand = $resolvedCommand
+    $invocationArguments = @($Arguments)
+    if ($resolvedCommand -and [System.IO.Path]::GetExtension([string]$resolvedCommand).ToLowerInvariant() -eq '.ps1') {
+        $invocationCommand = 'powershell.exe'
+        $invocationArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', [string]$resolvedCommand) + @($Arguments)
+    }
     $output = if ($WorkingDirectory) {
         & {
             $ErrorActionPreference = 'Continue'
             Push-Location $WorkingDirectory
             try {
-                & $resolvedCommand @Arguments 2>&1
+                & $invocationCommand @invocationArguments 2>&1
             } finally {
                 Pop-Location
             }
@@ -29,7 +35,7 @@ function Invoke-NativeCommand {
     } else {
         & {
             $ErrorActionPreference = 'Continue'
-            & $resolvedCommand @Arguments 2>&1
+            & $invocationCommand @invocationArguments 2>&1
         }
     }
 
@@ -107,6 +113,91 @@ function Invoke-CommandUsageProbe {
     }
 }
 
+function Invoke-DelegatedUsageGate {
+    param(
+        [string]$GateScriptName,
+        [string]$ModeLabel,
+        [string]$GateLabel,
+        $Combo,
+        [string]$Mode,
+        [int]$Threshold,
+        [int]$Poll,
+        [int]$FastPoll,
+        [int]$FastWindow
+    )
+
+    $gatePath = Join-Path $PSScriptRoot $GateScriptName
+    $arguments = @(
+        '-Mode', $Mode,
+        '-ThresholdPercent', $Threshold.ToString(),
+        '-PollSeconds', $Poll.ToString(),
+        '-FastPollSeconds', $FastPoll.ToString(),
+        '-FastWindowSeconds', $FastWindow.ToString()
+    )
+
+    $invocation = Invoke-NativeCommand -Command $gatePath -Arguments $arguments
+    $text = ([string]$invocation.output).Trim()
+
+    if ($invocation.exitCode -ne 0 -and -not $text) {
+        return [pscustomobject]@{
+            cliProfile = $Combo.cliProfile
+            provider = $Combo.provider
+            modelClass = $Combo.modelClass
+            mode = $ModeLabel
+            ok = $false
+            processStatus = 'fatal'
+            shouldBlock = $false
+            errors = @("$GateLabel exited with code $($invocation.exitCode) and produced no output.")
+        }
+    }
+
+    if (-not $text) {
+        return [pscustomobject]@{
+            cliProfile = $Combo.cliProfile
+            provider = $Combo.provider
+            modelClass = $Combo.modelClass
+            mode = $ModeLabel
+            ok = $false
+            processStatus = 'fatal'
+            shouldBlock = $false
+            errors = @("$GateLabel returned no JSON output.")
+        }
+    }
+
+    try {
+        $result = $text | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{
+            cliProfile = $Combo.cliProfile
+            provider = $Combo.provider
+            modelClass = $Combo.modelClass
+            mode = $ModeLabel
+            ok = $false
+            processStatus = 'unavailable_parse'
+            shouldBlock = $false
+            errors = @(
+                "$GateLabel returned invalid JSON: $($_.Exception.Message)",
+                "$GateLabel exit code: $($invocation.exitCode)",
+                "$GateLabel raw output: $text"
+            )
+        }
+    }
+
+    if ($invocation.exitCode -ne 0) {
+        $existingErrors = @()
+        if ($result.PSObject.Properties.Name -contains 'errors') {
+            $existingErrors = @($result.errors)
+        }
+        $result | Add-Member -NotePropertyName errors -NotePropertyValue (@($existingErrors) + @("$GateLabel exited with code $($invocation.exitCode).")) -Force
+    }
+
+    $result | Add-Member -NotePropertyName cliProfile -NotePropertyValue $Combo.cliProfile -Force
+    $result | Add-Member -NotePropertyName provider -NotePropertyValue $Combo.provider -Force
+    $result | Add-Member -NotePropertyName modelClass -NotePropertyValue $Combo.modelClass -Force
+    $result | Add-Member -NotePropertyName mode -NotePropertyValue $ModeLabel -Force
+    return $result
+}
+
 function Invoke-ComboUsageProbe {
     param(
         $Combo,
@@ -144,38 +235,10 @@ function Invoke-ComboUsageProbe {
             return $result
         }
         'claude-oauth' {
-            $gatePath = Join-Path $PSScriptRoot 'claude-usage-gate.ps1'
-            $arguments = @(
-                '-NoProfile',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', $gatePath,
-                '-Mode', $Mode,
-                '-ThresholdPercent', $Threshold.ToString(),
-                '-PollSeconds', $Poll.ToString(),
-                '-FastPollSeconds', $FastPoll.ToString(),
-                '-FastWindowSeconds', $FastWindow.ToString()
-            )
-            $raw = & powershell.exe @arguments
-            $text = ($raw | Out-String).Trim()
-            if (-not $text) {
-                return [pscustomobject]@{
-                    cliProfile = $Combo.cliProfile
-                    provider = $Combo.provider
-                    modelClass = $Combo.modelClass
-                    mode = 'claude-oauth'
-                    ok = $false
-                    processStatus = 'fatal'
-                    shouldBlock = $false
-                    errors = @('Claude usage gate returned no JSON output.')
-                }
-            }
-
-            $result = $text | ConvertFrom-Json
-            $result | Add-Member -NotePropertyName cliProfile -NotePropertyValue $Combo.cliProfile -Force
-            $result | Add-Member -NotePropertyName provider -NotePropertyValue $Combo.provider -Force
-            $result | Add-Member -NotePropertyName modelClass -NotePropertyValue $Combo.modelClass -Force
-            $result | Add-Member -NotePropertyName mode -NotePropertyValue 'claude-oauth' -Force
-            return $result
+            return (Invoke-DelegatedUsageGate -GateScriptName 'claude-usage-gate.ps1' -ModeLabel 'claude-oauth' -GateLabel 'Claude usage gate' -Combo $Combo -Mode $Mode -Threshold $Threshold -Poll $Poll -FastPoll $FastPoll -FastWindow $FastWindow)
+        }
+        'codex-session' {
+            return (Invoke-DelegatedUsageGate -GateScriptName 'codex-usage-gate.ps1' -ModeLabel 'codex-session' -GateLabel 'Codex usage gate' -Combo $Combo -Mode $Mode -Threshold $Threshold -Poll $Poll -FastPoll $FastPoll -FastWindow $FastWindow)
         }
         default {
             return [pscustomobject]@{
@@ -189,6 +252,80 @@ function Invoke-ComboUsageProbe {
                 errors = @("Unsupported usage mode '$modeName'.")
             }
         }
+    }
+}
+
+function Get-NumericValueOrNull {
+    param($Value)
+
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    try {
+        return [double]$Value
+    } catch {
+        return $null
+    }
+}
+
+function Get-DateTimeOffsetOrNull {
+    param($Value)
+
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    try {
+        return [DateTimeOffset]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $null
+    }
+}
+
+function Get-AggregatedUsageMetrics {
+    param([object[]]$Combos)
+
+    $fiveHourMax = $null
+    $bindingResetAt = $null
+    foreach ($combo in $Combos) {
+        $current = Get-NumericValueOrNull -Value $combo.fiveHourUtilization
+        if ($null -eq $current) { continue }
+        if ($null -eq $fiveHourMax -or $current -gt $fiveHourMax) {
+            $fiveHourMax = $current
+            $bindingResetAt = if ($combo.fiveHourResetAt) { [string]$combo.fiveHourResetAt } else { $null }
+        }
+    }
+
+    $sevenDayMax = $null
+    foreach ($combo in $Combos) {
+        $current = Get-NumericValueOrNull -Value $combo.sevenDayUtilization
+        if ($null -eq $current) { continue }
+        if ($null -eq $sevenDayMax -or $current -gt $sevenDayMax) {
+            $sevenDayMax = $current
+        }
+    }
+
+    $latestBlockedReset = $null
+    foreach ($combo in $Combos) {
+        if (-not $combo.shouldBlock) { continue }
+        $candidate = Get-DateTimeOffsetOrNull -Value $combo.fiveHourResetAt
+        if ($null -eq $candidate) { continue }
+        if ($null -eq $latestBlockedReset -or $candidate -gt $latestBlockedReset) {
+            $latestBlockedReset = $candidate
+        }
+    }
+
+    $resetAt = if ($latestBlockedReset) { $latestBlockedReset.ToString('o') } else { $bindingResetAt }
+
+    $latestFetch = $null
+    foreach ($combo in $Combos) {
+        $candidate = Get-DateTimeOffsetOrNull -Value $combo.lastSuccessfulFetchAt
+        if ($null -eq $candidate) { continue }
+        if ($null -eq $latestFetch -or $candidate -gt $latestFetch) {
+            $latestFetch = $candidate
+        }
+    }
+
+    return [pscustomobject]@{
+        fiveHourUtilization = if ($null -eq $fiveHourMax) { $null } else { [Math]::Round($fiveHourMax, 2) }
+        fiveHourResetAt = $resetAt
+        sevenDayUtilization = if ($null -eq $sevenDayMax) { $null } else { [Math]::Round($sevenDayMax, 2) }
+        lastSuccessfulFetchAt = if ($latestFetch) { $latestFetch.ToString('o') } else { $null }
     }
 }
 
@@ -212,6 +349,8 @@ $processStatus = if ($fatalCount -gt 0) {
     'ok'
 }
 
+$aggregatedMetrics = Get-AggregatedUsageMetrics -Combos $probeResults
+
 [pscustomobject]@{
     ok = ($fatalCount -eq 0 -and $unavailableCount -eq 0)
     processStatus = $processStatus
@@ -220,6 +359,10 @@ $processStatus = if ($fatalCount -gt 0) {
     repoRoot = $resolvedRepoRoot
     activeExecutionProfile = $configState.activeExecutionProfile
     activeExecutionProfileSource = $configState.activeExecutionProfileSource
+    fiveHourUtilization = $aggregatedMetrics.fiveHourUtilization
+    fiveHourResetAt = $aggregatedMetrics.fiveHourResetAt
+    sevenDayUtilization = $aggregatedMetrics.sevenDayUtilization
+    lastSuccessfulFetchAt = $aggregatedMetrics.lastSuccessfulFetchAt
     combos = $probeResults
     usageUnsupportedCount = $usageUnsupportedCount
     blockingCount = $blockedCount

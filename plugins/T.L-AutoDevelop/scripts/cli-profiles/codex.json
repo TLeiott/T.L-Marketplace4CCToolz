@@ -1,0 +1,58 @@
+{
+  "id": "codex",
+  "family": "codex",
+  "command": "codex",
+  "interaction": {
+    "promptInput": "stdin",
+    "output": "stdout",
+    "nonInteractive": true
+  },
+  "supportedProviders": [
+    "openai"
+  ],
+  "supportedModelClasses": [],
+  "supportedOptions": {
+    "reasoningEffort": [
+      "low",
+      "medium",
+      "high",
+      "xhigh"
+    ],
+    "maxTurns": true,
+    "dangerouslySkipPermissions": true,
+    "extraArgs": true,
+    "explicitModel": true
+  },
+  "supportedCapabilities": [
+    "read",
+    "search",
+    "edit",
+    "write",
+    "shell"
+  ],
+  "capabilityToolMap": {
+    "read": [
+      "Read"
+    ],
+    "search": [
+      "Glob",
+      "Grep"
+    ],
+    "edit": [
+      "Edit"
+    ],
+    "write": [
+      "Write"
+    ],
+    "shell": [
+      "Bash"
+    ]
+  },
+  "modelResolution": {},
+  "usageSupport": {
+    "openai:*": {
+      "mode": "codex-session"
+    }
+  },
+  "fallbackCliProfiles": []
+}

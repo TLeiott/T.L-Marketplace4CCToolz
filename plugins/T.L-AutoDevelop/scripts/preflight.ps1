@@ -3,12 +3,66 @@ param(
     [Parameter(Mandatory)][string]$SolutionPath,
     [string[]]$ChangedFiles,
     [switch]$SkipRun,
+    [switch]$SkipBuild,
+    [switch]$SkipTests,
     [switch]$AllowNuget,
     [string]$ProjectPath,
     [string]$DebugDir
 )
 
 $ErrorActionPreference = 'Stop'
+
+function ConvertTo-WindowsProcessArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) { $Argument = '' }
+    if ($Argument.Length -eq 0) { return '""' }
+    if ($Argument -notmatch '[\s"]') { return $Argument }
+
+    $quote = [char]34
+    $slash = [char]92
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append($quote)
+    $backslashCount = 0
+
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq $slash) {
+            $backslashCount++
+            continue
+        }
+
+        if ($character -eq $quote) {
+            if ($backslashCount -gt 0) {
+                [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+                $backslashCount = 0
+            }
+
+            [void]$builder.Append($slash)
+            [void]$builder.Append($quote)
+            continue
+        }
+
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append(([string]$slash) * $backslashCount)
+            $backslashCount = 0
+        }
+
+        [void]$builder.Append($character)
+    }
+
+    if ($backslashCount -gt 0) {
+        [void]$builder.Append(([string]$slash) * ($backslashCount * 2))
+    }
+
+    [void]$builder.Append($quote)
+    return $builder.ToString()
+}
+
+function ConvertTo-WindowsProcessArgumentString {
+    param([AllowEmptyCollection()][string[]]$Arguments)
+
+    return ([string]::Join(' ', @($Arguments | ForEach-Object { ConvertTo-WindowsProcessArgument -Argument $_ })))
+}
 
 function Ensure-DebugDir {
     if (-not $DebugDir) { return $null }
@@ -33,9 +87,15 @@ function Save-DebugJson {
 
 function Invoke-NativeCommand {
     param([string]$Command, [string[]]$Arguments)
+    $invocationCommand = $Command
+    $invocationArguments = @($Arguments)
+    if ($Command -and [System.IO.Path]::GetExtension([string]$Command).ToLowerInvariant() -eq '.ps1') {
+        $invocationCommand = 'powershell.exe'
+        $invocationArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', [string]$Command) + @($Arguments)
+    }
     $output = & {
         $ErrorActionPreference = 'Continue'
-        & $Command @Arguments 2>&1
+        & $invocationCommand @invocationArguments 2>&1
     }
     return @{ output = ($output | Out-String).Trim(); exitCode = $LASTEXITCODE }
 }
@@ -52,6 +112,8 @@ $runSummary = [ordered]@{
     projectPath = $ProjectPath
     debugDir = (Ensure-DebugDir)
     skipRun = [bool]$SkipRun
+    skipBuild = [bool]$SkipBuild
+    skipTests = [bool]$SkipTests
     allowNuget = [bool]$AllowNuget
     startedAt = (Get-Date).ToString('o')
 }
@@ -595,17 +657,23 @@ function Invoke-WiringAnalysis {
 }
 
 # --- BLOCKER 1: Build ---
-$buildStarted = Get-Date
-$buildOutput = dotnet build $SolutionPath --no-restore 2>&1
-$buildExitCode = $LASTEXITCODE
-$runSummary.build = [ordered]@{
-    exitCode = $buildExitCode
-    elapsedSeconds = [math]::Round(((Get-Date) - $buildStarted).TotalSeconds, 2)
-}
-Save-DebugText -Name 'build-output.txt' -Content (($buildOutput | Out-String).Trim()) | Out-Null
-if ($buildExitCode -ne 0) {
-    $errLines = ($buildOutput | Select-String "error " | Select-Object -First 5) -join "`n"
-    Add-Blocker "build" $SolutionPath "Build failed: $errLines"
+if ($SkipBuild) {
+    $runSummary.build = [ordered]@{
+        skipped = $true
+    }
+} else {
+    $buildStarted = Get-Date
+    $buildOutput = dotnet build $SolutionPath --no-restore 2>&1
+    $buildExitCode = $LASTEXITCODE
+    $runSummary.build = [ordered]@{
+        exitCode = $buildExitCode
+        elapsedSeconds = [math]::Round(((Get-Date) - $buildStarted).TotalSeconds, 2)
+    }
+    Save-DebugText -Name 'build-output.txt' -Content (($buildOutput | Out-String).Trim()) | Out-Null
+    if ($buildExitCode -ne 0) {
+        $errLines = ($buildOutput | Select-String "error " | Select-Object -First 5) -join "`n"
+        Add-Blocker "build" $SolutionPath "Build failed: $errLines"
+    }
 }
 
 # Stop early after a build failure and skip the remaining checks
@@ -629,7 +697,8 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
     $runStarted = Get-Date
     $runErrPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stderr.txt' } else { "$env:TEMP\preflight-runerr.txt" }
     $runOutPath = if ($DebugDir) { Join-Path (Ensure-DebugDir) 'run-stdout.txt' } else { "$env:TEMP\preflight-runout.txt" }
-    $runProc = Start-Process dotnet -ArgumentList "run","--project",$ProjectPath,"--no-build" `
+    $runArguments = @("run", "--project", $ProjectPath, "--no-build")
+    $runProc = Start-Process dotnet -ArgumentList (ConvertTo-WindowsProcessArgumentString -Arguments $runArguments) `
         -PassThru -NoNewWindow -RedirectStandardError $runErrPath -RedirectStandardOutput $runOutPath 2>$null
     Start-Sleep -Seconds 5
     $runErrText = (Get-Content $runErrPath -ErrorAction SilentlyContinue | Out-String).Trim()
@@ -661,30 +730,37 @@ if (-not $SkipRun -and $ProjectPath -and (Test-Path $ProjectPath)) {
 
 # Run dotnet test only when test projects are present
 $slnDir = Split-Path $SolutionPath -Parent
-$testProjects = @(Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue |
-    Where-Object {
-        $csprojContent = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
-        $csprojContent -match 'Microsoft\.NET\.Test\.Sdk|xunit|NUnit|MSTest'
-    })
-
-if ($testProjects.Count -gt 0) {
-    $testStarted = Get-Date
-    $testResult = Invoke-NativeCommand dotnet @("test",$SolutionPath,"--no-build","--verbosity","quiet")
-    $runSummary.tests = [ordered]@{
-        exitCode = $testResult.exitCode
-        elapsedSeconds = [math]::Round(((Get-Date) - $testStarted).TotalSeconds, 2)
-        discoveredProjects = $testProjects.Count
-    }
-    Save-DebugText -Name 'test-output.txt' -Content $testResult.output | Out-Null
-    if ($testResult.exitCode -ne 0) {
-        $failedTests = ($testResult.output -split "`n" | Select-String "Failed\s+" | Select-Object -First 5) -join "`n"
-        if (-not $failedTests) { $failedTests = ($testResult.output -split "`n" | Select-Object -Last 5) -join "`n" }
-        Add-Blocker "tests" $SolutionPath "Tests failed: $failedTests"
-    }
-} else {
+if ($SkipTests) {
     $runSummary.tests = [ordered]@{
         skipped = $true
         discoveredProjects = 0
+    }
+} else {
+    $testProjects = @(Get-ChildItem -Path $slnDir -Recurse -Filter "*.csproj" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $csprojContent = [System.IO.File]::ReadAllText($_.FullName, [System.Text.Encoding]::UTF8)
+            $csprojContent -match 'Microsoft\.NET\.Test\.Sdk|xunit|NUnit|MSTest'
+        })
+
+    if ($testProjects.Count -gt 0) {
+        $testStarted = Get-Date
+        $testResult = Invoke-NativeCommand dotnet @("test",$SolutionPath,"--no-build","--verbosity","quiet")
+        $runSummary.tests = [ordered]@{
+            exitCode = $testResult.exitCode
+            elapsedSeconds = [math]::Round(((Get-Date) - $testStarted).TotalSeconds, 2)
+            discoveredProjects = $testProjects.Count
+        }
+        Save-DebugText -Name 'test-output.txt' -Content $testResult.output | Out-Null
+        if ($testResult.exitCode -ne 0) {
+            $failedTests = ($testResult.output -split "`n" | Select-String "Failed\s+" | Select-Object -First 5) -join "`n"
+            if (-not $failedTests) { $failedTests = ($testResult.output -split "`n" | Select-Object -Last 5) -join "`n" }
+            Add-Blocker "tests" $SolutionPath "Tests failed: $failedTests"
+        }
+    } else {
+        $runSummary.tests = [ordered]@{
+            skipped = $true
+            discoveredProjects = 0
+        }
     }
 }
 

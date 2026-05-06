@@ -1,6 +1,6 @@
 # T.L-AutoDevelop
 
-Interactive queue-aware .NET development orchestration for Claude Code.
+Interactive queue-aware .NET development orchestration for Claude Code, Codex, and OpenCode.
 
 ## Command
 
@@ -17,9 +17,10 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - accepts either a direct task text or a file containing multiple tasks
 - uses the config-driven `scheduler` role to plan conservative execution waves
 - reads repo-local execution profile config from `.claude/autodevelop.json`
-- resolves the active session execution profile from `.claude-develop-logs/session.json` or the repo default
+- resolves the active session execution profile from `.claude-develop-logs/session.json`, host-aware editor defaults, or the repo default
 - resolves worker, reviewer, and scheduler runtime settings per role from shipped CLI profiles plus repo execution profiles
 - aggregates usage checks across all active CLI/provider/model-class combinations
+- supports hybrid execution profiles where different roles run through `claude-code`, `codex`, or `opencode`
 - starts multiple worker pipes asynchronously when their likely edit scopes are disjoint
 - lets `scheduler.ps1` wait for queue changes after launches instead of relying on external sleep-based polling
 - leaves successful worker changes on normal branches for later merge preparation
@@ -28,7 +29,7 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 
 ## Included Components
 
-- `skills/develop/SKILL.md` — Main-Claude interactive orchestrator
+- `skills/develop/SKILL.md` — Main AutoDevelop interactive orchestrator
 - `skills/develop-prepare/SKILL.md` — Explicit prepare and hygiene command
 - `skills/pipe-feedback/SKILL.md` — Post-run pipeline feedback and friction analysis
 - `skills/autodev-config/SKILL.md` — Repo-local AutoDevelop config inspector/editor
@@ -59,7 +60,70 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - Windows (PowerShell 5.1+)
 - .NET SDK
 - Git
-- Claude CLI
+- Claude Code CLI and/or Codex CLI and/or OpenCode CLI, depending on the configured role profiles
+
+## Testing AutoDevelop
+
+- AutoDevelop tests should now be run in layers, not only as one expensive full pass.
+- Goal: keep the same confidence, but pay real `dotnet restore` / `dotnet build` / `dotnet test` cost only where it proves something.
+
+### Recommended Order
+
+1. Run fast preflight-analysis tests during normal development.
+2. Run targeted smoke tests when changing `preflight.ps1` behavior that depends on real SDK/build behavior.
+3. Run the full scheduler regression script before release or after larger pipeline changes.
+
+### Fast Analysis Mode
+
+- `scripts/preflight.ps1` supports:
+- `-SkipRun`
+- `-SkipBuild`
+- `-SkipTests`
+- Use this for deterministic logic checks such as wiring analysis, JS interop validation, changed-file rules, and other static validation paths.
+- This is the default choice for most `preflight` test cases in `scripts/test-scheduler.ps1`.
+
+Example:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\T.L-AutoDevelop\scripts\preflight.ps1 `
+  -SolutionPath <path-to-sln-or-csproj> `
+  -SkipRun -SkipBuild -SkipTests
+```
+
+### Smoke Tests
+
+- Keep a small number of real end-to-end `preflight` smoke tests.
+- These should still exercise actual restore/build behavior so that fast-mode tests do not hide SDK or tooling regressions.
+- In the test harness, this means at least one `New-TestBlazorRepo` path should still run without `-SkipRestore` and without `-SkipBuild` / `-SkipTests`.
+
+### Full Regression Run
+
+- Full harness:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\T.L-AutoDevelop\scripts\test-scheduler.ps1
+```
+
+- Use this before shipping changes to:
+- `scripts/scheduler.ps1`
+- `scripts/auto-develop.ps1`
+- `scripts/preflight.ps1`
+- config resolution / provider / role-runner code
+
+### Test-Only Prerequisites
+
+These prerequisites only apply to running the full regression harness, not to running the plugin itself:
+
+- **PowerShell 7 (`pwsh.exe`)** is needed for the cross-job-boundary tests that exercise `Start-Job` argument and environment serialization (the runtime itself works on PowerShell 5.1+). Tests that need `pwsh.exe` print `[SKIP]` and continue when it is not on PATH.
+- **Python (`python` or `py`)** is needed only for the Codex state-db helper used by `Test-CodexUsageGateReadsSessionStateDbAndSessionLog`. That single test prints `[SKIP]` when no Python interpreter is available; the rest of the Codex usage-gate suite runs without Python.
+
+Other Codex usage-gate tests, the OpenCode invocation tests, and the entire scheduler/auto-develop/preflight regression coverage run on PowerShell 5.1 alone.
+
+### Practical Rule
+
+- If you are validating static preflight logic: use fast mode.
+- If you are validating real CLI, PowerShell job boundaries, Git interaction, or SDK behavior: keep a real smoke/integration test.
+- If you change distributed plugin content, bump the plugin version in both manifest locations.
 
 ## Repo Config
 
@@ -67,11 +131,15 @@ Interactive queue-aware .NET development orchestration for Claude Code.
 - missing config falls back to built-in defaults
 - plugin updates do not overwrite repo config
 - config version `4` defines repo-local `executionProfiles`
+- config version `4` also supports `hostDefaults` for editor-aware default profile selection
 - shipped `cliProfile` manifests define which CLIs, providers, model classes, options, and usage probes are supported by this plugin build
-- an execution profile selects `cliProfile`, `provider`, `modelClass`, and options per role
-- a session-local selection in `.claude-develop-logs/session.json` can activate a different execution profile for the current Claude conversation
-- if no session profile is active, AutoDevelop uses `defaultExecutionProfile`
+- an execution profile selects `cliProfile`, `provider`, `modelClass`, optional explicit `model`, and options per role
+- built-in profiles include `default`, `claude-full`, and `codex-full`
+- a session-local selection in `.claude-develop-logs/session.json` can activate a different execution profile for the current repository session
+- if no session profile is active, AutoDevelop first checks `hostDefaults` for the detected editor host and then falls back to `defaultExecutionProfile`
 - an explicit role `modelClass` pins that role to the configured model class
+- an explicit role `model` pins that role to the configured full model token
+- for `opencode` and `codex` roles, prefer explicit `model` values like `openai/gpt-5.4` instead of relying on `modelClass`
 - if a role omits `modelClass`, the built-in default or runtime override can still decide the effective model token
 - invalid config values fall back to built-in defaults with warnings instead of crashing the pipeline
 - unsupported CLI profiles are rejected; only shipped supported profiles may be used

@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # /develop
 
-CRITICAL: You are the Main-Claude orchestrator. You do not implement the requested code changes yourself.
+CRITICAL: You are the main AutoDevelop orchestrator. You do not implement the requested code changes yourself.
 
 Your job is to:
 - validate the repository and solution context
@@ -144,6 +144,7 @@ Use this initial probe only to:
 
 The usage gate must resolve the active execution profile for this repository session first:
 - if `.claude-develop-logs/session.json` selects a valid execution profile, use that
+- otherwise use `hostDefaults[detectedHost]` when the detected editor host resolves to a valid profile
 - otherwise use `defaultExecutionProfile` from `.claude/autodevelop.json`
 
 It must then aggregate all distinct CLI/provider/modelClass combinations used by that active execution profile.
