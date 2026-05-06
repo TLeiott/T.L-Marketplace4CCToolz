@@ -3475,8 +3475,7 @@ function Test-RegisterTasksAcceptsTasksJsonAlias {
             "-File", $script:SchedulerPath,
             "-Mode", "register-tasks",
             "-SolutionPath", $repo.solution,
-            "-TasksJson", $tasksFile,
-            "-Format", "Json"
+            "-TasksJson", $tasksFile
         )
         $parsed = $process.stdout | ConvertFrom-Json
 
@@ -3488,7 +3487,7 @@ function Test-RegisterTasksAcceptsTasksJsonAlias {
     }
 }
 
-function Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequested {
+function Test-SchedulerSnapshotQueueWritesCleanJsonToStdout {
     $repo = New-TestRepo
     try {
         $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList @(
@@ -3496,17 +3495,16 @@ function Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequest
             "-ExecutionPolicy", "Bypass",
             "-File", $script:SchedulerPath,
             "-Mode", "snapshot-queue",
-            "-SolutionPath", $repo.solution,
-            "-Format", "Json"
+            "-SolutionPath", $repo.solution
         )
         $parsed = $process.stdout | ConvertFrom-Json
 
-        Assert-True ([int]$process.exitCode -eq 0) "snapshot-queue should succeed when -Format Json is requested explicitly."
+        Assert-True ([int]$process.exitCode -eq 0) "snapshot-queue should exit cleanly."
         $expectedRepoRoot = [System.IO.Path]::GetFullPath($repo.root)
         $actualRepoRoot = [System.IO.Path]::GetFullPath([string]$parsed.repoRoot)
-        Assert-True ($actualRepoRoot -eq $expectedRepoRoot) "snapshot-queue should still emit the expected JSON payload to stdout."
+        Assert-True ($actualRepoRoot -eq $expectedRepoRoot) "snapshot-queue should emit the expected JSON payload to stdout."
         Assert-True (-not [string]::IsNullOrWhiteSpace($process.stdout)) "snapshot-queue should produce JSON on stdout."
-        Assert-True (([string]$process.stderr) -notmatch "#< CLIXML") "snapshot-queue stderr should stay free of CLIXML decoration in JSON mode."
+        Assert-True (([string]$process.stderr) -notmatch "#< CLIXML") "snapshot-queue stderr should stay free of CLIXML decoration."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -10676,7 +10674,7 @@ Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel
 Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass
 Test-AutoDevelopUsageCombosIncludeCodexProfilesAndUsageMode
 Test-RegisterTasksAcceptsTasksJsonAlias
-Test-SchedulerSnapshotQueueWritesCleanJsonToStdoutWhenFormatJsonRequested
+Test-SchedulerSnapshotQueueWritesCleanJsonToStdout
 Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles
 Test-AutoDevelopSessionShowReportsDetectedHostAndHostDefaultSource
 Test-CodexUsageGateReadsSessionStateDbAndSessionLog

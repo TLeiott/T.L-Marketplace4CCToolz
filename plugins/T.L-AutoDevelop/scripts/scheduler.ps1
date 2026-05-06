@@ -6,7 +6,6 @@ param(
     [string]$PlanFile = "",
     [string]$EditFile = "",
     [ValidateSet("Full", "Compact")][string]$View = "Full",
-    [ValidateSet("Json")][string]$Format = "Json",
     [string]$TaskId = "",
     [string]$Decision = "",
     [string]$CommitMessage = "",
