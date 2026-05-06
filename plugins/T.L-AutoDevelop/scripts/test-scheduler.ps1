@@ -387,6 +387,17 @@ function Resolve-TestPythonCommand {
     return $null
 }
 
+function Resolve-TestPwshCommand {
+    foreach ($candidate in @("pwsh.exe", "pwsh")) {
+        $resolved = Get-Command -Name $candidate -ErrorAction SilentlyContinue
+        if ($resolved) {
+            return [string]$resolved.Source
+        }
+    }
+
+    return $null
+}
+
 function Write-CodexUsageGateStateDb {
     param(
         [string]$Path,
@@ -3277,6 +3288,10 @@ function Test-OpenCodeInvocationIncludesModelAgentAndConfigEnv {
 }
 
 function Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary {
+    if (-not (Resolve-TestPwshCommand)) {
+        Write-Host "[SKIP] Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary: pwsh.exe is not available; skipping the cross-job serialization scenario."
+        return
+    }
     $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
         $captureScript = Join-Path $env:TEMP ("role-runner-args-" + [guid]::NewGuid().ToString("N") + ".ps1")
         [System.IO.File]::WriteAllText($captureScript, '[Console]::Out.Write(($args | ForEach-Object { "[" + $_ + "]" }) -join "")', [System.Text.Encoding]::UTF8)
@@ -3320,6 +3335,10 @@ function Test-InvokeAutoDevelopRolePreservesArgumentArrayAcrossPwshJobBoundary {
 }
 
 function Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary {
+    if (-not (Resolve-TestPwshCommand)) {
+        Write-Host "[SKIP] Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary: pwsh.exe is not available; skipping the cross-job environment scenario."
+        return
+    }
     $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
         $captureScript = Join-Path $env:TEMP ("role-runner-env-" + [guid]::NewGuid().ToString("N") + ".ps1")
         [System.IO.File]::WriteAllText($captureScript, '[Console]::Out.Write($env:OPENCODE_CONFIG_CONTENT)', [System.Text.Encoding]::UTF8)
@@ -3367,6 +3386,10 @@ function Test-InvokeAutoDevelopRolePassesEnvOverridesAcrossPwshJobBoundary {
 }
 
 function Test-InvokeAutoDevelopRoleHandlesEmptyEnvironmentOverrides {
+    if (-not (Resolve-TestPwshCommand)) {
+        Write-Host "[SKIP] Test-InvokeAutoDevelopRoleHandlesEmptyEnvironmentOverrides: pwsh.exe is not available; skipping the empty-env serialization scenario."
+        return
+    }
     $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
         $captureScript = Join-Path $env:TEMP ("role-runner-ok-" + [guid]::NewGuid().ToString("N") + ".ps1")
         [System.IO.File]::WriteAllText($captureScript, '[Console]::Out.Write("ok")', [System.Text.Encoding]::UTF8)
@@ -3410,6 +3433,10 @@ function Test-InvokeAutoDevelopRoleHandlesEmptyEnvironmentOverrides {
 }
 
 function Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh {
+    if (-not (Resolve-TestPwshCommand)) {
+        Write-Host "[SKIP] Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh: pwsh.exe is not available; skipping the PowerShell 7 ConvertFrom-Json scenario."
+        return
+    }
     $output = Invoke-AutoDevelopConfigHelperFunctions -FunctionNames @("Test-AutoDevelopConfigObject") -PowerShellCommand "pwsh.exe" -ScriptBlock {
         $parsed = '{"executionProfiles":{"default":{"roles":{"discover":{"model":"openai/gpt-5.4-mini"}}}}}' | ConvertFrom-Json
         [pscustomobject]@{
@@ -3666,6 +3693,10 @@ function Test-CodexPromptInjectsSoftTurnBudget {
 }
 
 function Test-InvokeAutoDevelopRolePrefersCodexLastMessageFile {
+    if (-not (Resolve-TestPwshCommand)) {
+        Write-Host "[SKIP] Test-InvokeAutoDevelopRolePrefersCodexLastMessageFile: pwsh.exe is not available; skipping the Codex last-message-file scenario."
+        return
+    }
     $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
         $captureScript = Join-Path $env:TEMP ("role-runner-codex-last-message-" + [guid]::NewGuid().ToString("N") + ".ps1")
         [System.IO.File]::WriteAllText($captureScript, @'
@@ -3719,6 +3750,10 @@ param([string]$ResultPath)
 }
 
 function Test-InvokeAutoDevelopRoleSanitizesNestedEditorEnvironment {
+    if (-not (Resolve-TestPwshCommand)) {
+        Write-Host "[SKIP] Test-InvokeAutoDevelopRoleSanitizesNestedEditorEnvironment: pwsh.exe is not available; skipping the nested-editor sanitization scenario."
+        return
+    }
     $output = Invoke-RoleRunnerHelperFunctions -PowerShellCommand "pwsh.exe" -ScriptBlock {
         $captureScript = Join-Path $env:TEMP ("role-runner-sanitized-env-" + [guid]::NewGuid().ToString("N") + ".ps1")
         [System.IO.File]::WriteAllText($captureScript, @'
