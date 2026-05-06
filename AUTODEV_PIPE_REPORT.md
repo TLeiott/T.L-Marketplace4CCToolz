@@ -7,7 +7,7 @@ It covers:
 - `/TLA-develop`
 - the Main-Claude orchestration flow
 - the queue scheduler
-- the Scheduler-Agent planning pass
+- the scheduler planning pass
 - the worker pipe
 - merge handling
 - retries
@@ -20,7 +20,7 @@ AutoDevelop V4 is a layered system:
 1. The user submits work with `/develop` or `/TLA-develop`.
 2. Main-Claude does not implement code directly. It orchestrates.
 3. Main-Claude registers tasks in a durable repo-local queue.
-4. A read-only Scheduler-Agent plans safe execution waves.
+4. A read-only scheduler planning role plans safe execution waves.
 5. The scheduler starts worker pipes in separate worktrees.
 6. Each worker pipe runs the actual implementation pipeline.
 7. Finished worker branches are merged back one by one.
@@ -51,7 +51,7 @@ Main-Claude is responsible for:
 - probing usage limits
 - snapshotting the queue
 - registering tasks
-- invoking the Scheduler-Agent
+- invoking the scheduler planning role
 - applying plans
 - starting pipes
 - driving merge resolution
@@ -69,16 +69,21 @@ It is the source of truth for:
 - retry scheduling
 - merge preparation and merge resolution
 
-### Scheduler-Agent
+### Scheduler Planning
 
-The read-only wave planner is:
+The scheduler prompt template is:
 - [scheduler-agent.md](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/agents/scheduler-agent.md)
 
-It does not change code. It only:
-- reads the queue snapshot
-- reads relevant markdown docs
-- predicts likely touched files/areas
-- assigns tasks into conservative waves
+Current `/develop` orchestration uses:
+- [planner-runner.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/planner-runner.ps1)
+
+`planner-runner.ps1` resolves the repo-local `scheduler` role from `.claude/autodevelop.json`, loads the scheduler prompt template, reads the queue snapshot and nearby markdown context, and asks the configured scheduler role to assign conservative waves.
+
+Important current drift:
+- `/develop` is documented to use `planner-runner.ps1`
+- `/TLA-develop` still instructs direct `scheduler-agent` invocation in its skill file
+
+That Pro skill drift should be fixed if autonomous and interactive planning are expected to use the same config-driven runtime path.
 
 ### Worker Pipe
 
@@ -97,7 +102,8 @@ It runs inside a dedicated git worktree and does the actual:
 ### Supporting Scripts
 
 - usage gate:
-  - [claude-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1)
+  - [autodevelop-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/autodevelop-usage-gate.ps1)
+  - [claude-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1), used as the Claude-specific provider gate
 - deterministic validation:
   - [preflight.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/preflight.ps1)
 - code review agent:
@@ -112,7 +118,7 @@ flowchart TD
     M2 --> M3[Probe 5h usage gate]
     M3 --> M4[Snapshot queue]
     M4 --> M5[Register new tasks]
-    M5 --> M6[Invoke Scheduler-Agent]
+    M5 --> M6[Invoke scheduler planning role]
     M6 --> M7[Apply queue plan]
     M7 --> M8[Start ready worker pipes]
     M8 --> W[Worker pipe runs in worktree]
@@ -166,19 +172,33 @@ Then Main-Claude resolves the active solution:
 ## 6. Usage Gate
 
 Main-Claude calls:
+- [autodevelop-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/autodevelop-usage-gate.ps1)
+
+The aggregate gate resolves the active execution profile for the repository session and probes every distinct CLI/provider/model-class combination used by that profile.
+
+For Claude-backed combinations, the aggregate gate delegates to:
 - [claude-usage-gate.ps1](D:/Repos/T.L-Marketplace/plugins/T.L-AutoDevelop/scripts/claude-usage-gate.ps1)
 
-The gate checks the 5-hour Claude usage state.
+The Claude-specific gate reads Claude OAuth credentials directly, calls the usage endpoint, and writes an AutoDevelop-owned usage cache. Stale cache data is informational only and is not a fresh launch decision.
 
 Policy:
-- below 90% utilization -> continue
-- at or above 90% -> ask for explicit overrun approval
-- unavailable statusline/cache -> ask whether to ignore the limit
+- below projected 90% utilization -> continue
+- at or above projected 90% -> `/develop` asks for explicit launch-set approval
+- at or above projected 90% -> `/TLA-develop` waits or conservatively retries according to its autonomous gate policy
+- unavailable fresh usage data -> do not treat the launch set as verified
 - fatal gate error -> stop
 
 Important behavior:
-- V4 does not silently wait for usage to drop
-- the user explicitly approves or declines each scheduling cycle above the threshold
+- `/develop` asks the user to approve or decline each launch set that would exceed the projected threshold
+- `/TLA-develop` may wait automatically only when the gate returns confirmed blocked usage data with a usable reset time
+- usage combinations that report `usage_not_supported` are surfaced but are not fatal by themselves
+
+Current contract gap:
+- `autodevelop-usage-gate.ps1` aggregates per-combination results under `combos[]`
+- the `/develop` and `/TLA-develop` skills currently ask Main-Claude to read top-level `fiveHourUtilization` and `fiveHourResetAt`
+- the aggregate gate does not currently publish those top-level launch-decision fields
+
+Until that is fixed, orchestration has to inspect `combos[]` or the aggregate gate contract has to be extended.
 
 ## 7. Queue State and Persistence
 
@@ -210,14 +230,30 @@ Each queue task stores things like:
 ## 8. Scheduler Modes
 
 The scheduler exposes these modes:
+- `prepare-environment`
 - `snapshot-queue`
 - `register-tasks`
 - `apply-plan`
 - `run-task`
+- `wait-queue`
 - `prepare-merge`
 - `resolve-merge`
+- `admin-edit-task`
+- `admin-clear-breaker`
 
-### 8.1 `snapshot-queue`
+The two `admin-*` modes are operational recovery tools rather than normal user-command flow.
+
+### 8.1 `prepare-environment`
+
+Reconciles scheduler state with the live repository and cleans safe AutoDevelop-owned leftovers before queue orchestration starts.
+
+It can:
+- block on dirty repo state or unresolved git operations
+- preserve live or recoverable AutoDevelop activity
+- clean stale AutoDevelop-owned worktrees, branches, and run artifacts
+- return a compact post-prepare queue snapshot
+
+### 8.2 `snapshot-queue`
 
 Returns:
 - the full task list
@@ -225,35 +261,48 @@ Returns:
 - queued task ids
 - retry task ids
 - pending merge task ids
+- environment retry task ids
+- manual debug task ids
 - `startableTaskIds`
 - `nextMergeTaskId`
 - `mergePreparedTaskId`
 - unknown `auto/*` branches
 
-### 8.2 `register-tasks`
+### 8.3 `register-tasks`
 
 Adds newly submitted tasks to the queue in submission order.
 
-### 8.3 `apply-plan`
+### 8.4 `apply-plan`
 
-Applies the Scheduler-Agent's execution plan:
+Applies the scheduler planning role's execution plan:
 - wave numbers
 - dependency blocking
 - planner metadata
 
-### 8.4 `run-task`
+It also supports an internal `plannedState` field, although the documented scheduler-agent prompt schema does not currently include that field.
+
+### 8.5 `run-task`
 
 Starts one worker pipe for one task attempt.
 
-### 8.5 `prepare-merge`
+### 8.6 `wait-queue`
+
+Waits for queue-relevant state changes and wakes on:
+- task completion
+- merge readiness
+- breaker open
+- timeout
+
+### 8.7 `prepare-merge`
 
 Attempts to merge a completed branch into the main repo using:
 - `git merge --no-commit --no-ff <branch>`
 
 Then validates with:
+- `dotnet restore <solution>`
 - `dotnet build <solution> --no-restore`
 
-### 8.6 `resolve-merge`
+### 8.8 `resolve-merge`
 
 Finalizes a prepared merge with one of:
 - `commit`
@@ -261,13 +310,23 @@ Finalizes a prepared merge with one of:
 - `discard`
 - `requeue`
 
-## 9. Scheduler-Agent Planning
+### 8.9 `admin-edit-task`
 
-The Scheduler-Agent receives:
+Edits scheduler task state for manual recovery.
+
+### 8.10 `admin-clear-breaker`
+
+Clears or temporarily overrides scheduler circuit-breaker state.
+
+## 9. Scheduler Planning
+
+The scheduler planning role receives:
 - the full active queue snapshot
 - newly added tasks
 - currently running tasks
 - pending merge tasks
+- recent completed task briefs
+- recent planner feedback
 - nearby docs like `CLAUDE.md`, `AGENTS.md`, `README.md`
 - up to 3 additional nearby markdown files
 
@@ -304,6 +363,12 @@ It returns JSON only:
 
 Planning rule:
 - if independence is uncertain, serialize
+
+Current implementation detail:
+- `/develop` invokes the planner through `planner-runner.ps1`, which resolves the repo-local scheduler role
+- `/TLA-develop` still describes direct `scheduler-agent` invocation in the Pro skill file
+
+That inconsistency is a known documentation/skill contract drift, not intended product behavior.
 
 ## 10. Wave Execution Rules
 
@@ -481,6 +546,13 @@ Common final statuses:
 
 The scheduler translates these into queue state transitions.
 
+Current accepted-finalization gap:
+- when the worker reaches `ACCEPTED`, `auto-develop.ps1` stages, commits, and removes the worktree before writing the final accepted result
+- the current finalization path ignores the return values from `git add`, `git commit`, and `git worktree remove`
+- as a result, the worker can write `ACCEPTED` even if the commit or cleanup failed
+
+That should be treated as a live implementation risk, not as intended behavior.
+
 ## 14. Queue State Transitions
 
 Typical states are:
@@ -490,6 +562,9 @@ Typical states are:
 - `merge_prepared`
 - `waiting_user_test`
 - `retry_scheduled`
+- `environment_retry_scheduled`
+- `merge_retry_scheduled`
+- `manual_debug_needed`
 - `merged`
 - `completed_no_change`
 - `completed_failed_terminal`
@@ -512,6 +587,21 @@ queued -> running -> completed_no_change
 ```text
 queued -> running -> retry_scheduled
 ```
+
+### Environment retry
+
+```text
+queued -> running -> environment_retry_scheduled
+```
+
+Current limitation:
+- `environment_retry_scheduled` is queue-relevant and appears in snapshots and usage projection
+- `run-task` startability currently accepts only `queued` and `retry_scheduled`
+- a normal planner-shaped positive-wave replan does not make an `environment_retry_scheduled` task startable unless the applied plan also changes its state through the internal `plannedState` field
+- the public scheduler-agent JSON schema does not include `plannedState`
+
+Observed effect:
+- an `environment_retry_scheduled` task assigned to wave 1 by a normal plan can still leave `startableTaskIds` empty and `queueStall.status = stalled`
 
 ### Exhausted failure
 
@@ -617,7 +707,7 @@ flowchart LR
     C1 --> MC[Main-Claude]
     MC --> UG[Usage Gate]
     MC --> SQ[Scheduler snapshot/register/apply]
-    MC --> SA[Scheduler-Agent]
+    MC --> SA[Scheduler planning role]
     SA --> SQ
     SQ --> WP1[Worker Pipe 1]
     SQ --> WP2[Worker Pipe 2]
@@ -733,7 +823,7 @@ If you want the shortest possible summary of the current system:
 1. User submits one or more tasks.
 2. Main-Claude validates the repo and checks usage budget.
 3. Tasks are registered in a durable queue.
-4. Scheduler-Agent assigns conservative waves.
+4. The scheduler planning role assigns conservative waves.
 5. Scheduler starts safe parallel worker pipes.
 6. Each worker runs: discover, investigate, reproduce if needed, plan, implement, validate, review.
 7. Successful branches wait for ordered merge.
@@ -743,9 +833,15 @@ If you want the shortest possible summary of the current system:
 
 ## 25. Changes Since This Report Was Last Updated
 
-This report file was last updated on `2026-03-18 16:36`.
+This report was reverified on `2026-05-06`.
 
-Since then, the AutoDevelop codebase continued to change materially. The current code now reflects the `4.2.5` line for `T.L-AutoDevelop`, not just the `4.2.1`-era behavior described above.
+The original report body described the earlier `4.2.1`-era system, and later edits added partial updates. Git history shows this file was updated after `a543b6e`, so commit `a543b6e` is no longer a reliable "last updated" boundary for the whole document.
+
+The current manifest versions are:
+- `T.L-AutoDevelop v4.4.7`
+- `T.L-AutoDevelop-Pro v4.2.14`
+
+The current code therefore reflects a later line than both the `4.2.1` and `4.2.5` references in the older report text.
 
 The most important changes since that report update fall into four groups:
 - scheduler control-flow additions
@@ -757,11 +853,13 @@ The sections below describe those additions in practical rather than purely comm
 
 ### 25.1 New Scheduler Modes Now in the Product
 
-The current scheduler parameter validation includes two modes that are not documented in the earlier sections of this report:
+The current scheduler parameter validation includes modes that were not documented in the original body of this report:
 - `wait-queue`
 - `prepare-environment`
+- `admin-edit-task`
+- `admin-clear-breaker`
 
-That means the mode list in section 8 is now incomplete.
+Section 8 now lists these current modes explicitly.
 
 #### `wait-queue`
 
@@ -800,6 +898,15 @@ This matters because AutoDevelop startup is now stronger against:
 - stale run artifacts
 - stale scheduler bookkeeping
 - repo-local drift between git state and persisted queue state
+
+#### `admin-edit-task` and `admin-clear-breaker`
+
+These are manual recovery modes rather than normal queue orchestration modes.
+
+They are useful for:
+- correcting stuck or invalid task state after investigation
+- clearing or temporarily suppressing the circuit breaker
+- preserving scheduler invariants while making targeted recovery edits
 
 ### 25.2 Main-Claude Runtime Behavior Is More Scheduler-Driven
 
@@ -925,6 +1032,13 @@ This improves both correctness and observability:
 - scheduler bookkeeping is less likely to drift under repeated recovery checks
 - environment repair budget is more trustworthy
 
+Known limitation:
+- environment retry tasks are tracked as queue-relevant work, but they are not directly startable through the normal `queued` / `retry_scheduled` startability predicate
+- a positive-wave scheduler-agent plan that does not include the internal `plannedState` field leaves the task in `environment_retry_scheduled`
+- because the public planner schema does not include `plannedState`, this can still produce a stalled queue
+
+That means the environment retry accounting is more accurate than older builds, but the relaunch contract still needs a scheduler or planner-schema fix.
+
 ### 25.8 Snapshot and Diagnostics Surface More Runtime Truth
 
 The current snapshots and task progress views carry richer artifact pointers and state context than the older report emphasizes.
@@ -947,9 +1061,9 @@ The earlier report positions the documented system around the `4.2.1` line.
 
 That is now outdated.
 
-The current shipped plugin lines are:
-- `T.L-AutoDevelop v4.2.17`
-- `T.L-AutoDevelop-Pro v4.2.10`
+The current shipped plugin lines in the manifests are:
+- `T.L-AutoDevelop v4.4.7`
+- `T.L-AutoDevelop-Pro v4.2.14`
 
 The delta from the report body to the current implementation therefore includes:
 - queue wait mode
@@ -959,18 +1073,27 @@ The delta from the report body to the current implementation therefore includes:
 - stronger result publication and result read behavior
 - tighter environment retry accounting
 - late success/no-change recovery logic
+- config-driven scheduler role execution for `/develop`
+- hybrid Claude Code/Codex/OpenCode execution-profile support
+- stricter prompt-file registration validation
 
-### 25.10 Additional Changes Since The Documentation Commit `a543b6e`
+Remaining current gaps:
+- `/TLA-develop` skill text still refers to direct `scheduler-agent` planning instead of the config-driven `planner-runner.ps1` path
+- the aggregate usage gate does not yet expose top-level `fiveHourUtilization` or `fiveHourResetAt` fields required by the skill launch-gate prose
+- `environment_retry_scheduled` relaunch can still stall unless state is converted through an internal planned-state transition
+- accepted worker finalization currently ignores final `git add`, `git commit`, and `git worktree remove` command results before writing `ACCEPTED`
 
-`AUTODEV_PIPE_REPORT.md` was last updated in commit `a543b6e` on `2026-03-19`.
+### 25.10 Additional Changes Since The Earlier Documentation Commits
 
-The implementation moved again after that point. The important additions since that documentation commit are:
+`AUTODEV_PIPE_REPORT.md` was introduced in commit `a543b6e` on `2026-03-19` and updated again later. Treat the older commit boundary as historical context, not as the current report boundary.
+
+The implementation moved again after those earlier documentation commits. The important additions include:
 
 #### Planning and implementation guardrails became stricter
 
 The worker pipe now contains more explicit protection against "plausible but wrong" implementation plans.
 
-Since `a543b6e`, the current system added:
+Since the early documentation baseline, the current system added:
 - planner effort wiring and discovery briefs
 - implementation-scope validation against the actual changed files
 - repaired fix-plan direction checks
@@ -1037,7 +1160,7 @@ It is also substantially more specified by regression tests than the older repor
 
 ## 26. What the Current System Should Now Be Understood As
 
-If sections 22 to 24 gave the right mental model for the earlier `4.2.1`-era system, the current `4.2.17` / `4.2.10` system is best understood as:
+If sections 22 to 24 gave the right mental model for the earlier `4.2.1`-era system, the current `4.4.7` / `4.2.14` system is best understood as:
 
 `mature worker pipe`
 `+ durable queue scheduler`
@@ -1048,6 +1171,7 @@ If sections 22 to 24 gave the right mental model for the earlier `4.2.1`-era sys
 `+ planning-direction and implementation-scope guardrails`
 `+ prior-art-aware task grounding`
 `+ autodev-owned usage-gate safety`
+`+ hybrid CLI/provider execution profiles`
 
 That is a meaningful maturity increase.
 
@@ -1066,6 +1190,12 @@ It is also now explicitly about:
 - grounding reuse-heavy work in existing reference patterns
 - refusing worker launches when the usage state cannot be verified safely
 
+It still has known contract gaps that should be fixed before treating the whole pipe as fully self-consistent:
+- aggregate usage gate output vs skill launch-gate fields
+- `/develop` planner-runner path vs `/TLA-develop` scheduler-agent path
+- environment retry relaunch state transition
+- accepted worker finalization result validation
+
 ## 27. Current Short Operational Summary
 
 If you want the updated shortest possible summary of the current system:
@@ -1074,10 +1204,11 @@ If you want the updated shortest possible summary of the current system:
 2. Main-Claude can first run environment preparation to reconcile stale AutoDevelop-owned leftovers.
 3. Main-Claude validates repo state, resolves the solution, and checks the usage gate.
 4. Tasks are registered in a durable repo-local scheduler queue.
-5. Scheduler-Agent assigns conservative waves.
+5. The scheduler planning role assigns conservative waves.
 6. Scheduler starts safe worker pipes and can then wait for queue-relevant changes itself.
 7. Each worker runs the deterministic pipeline: discover, investigate, reproduce if needed, fix-plan, implement, preflight, review, finalize.
 8. Worker results are now published more safely and read more defensively by the scheduler.
 9. Successful branches wait for ordered merge preparation.
 10. `/develop` waits for user testing before merge commit; `/TLA-develop` auto-commits after successful merge preparation.
 11. Environment failures, retries, and interrupted-session leftovers are now reconciled more explicitly than in the earlier V4 releases.
+12. Known contract gaps remain around aggregate usage-gate fields, Pro planner invocation, environment-retry relaunch, and accepted-finalization git error handling.
