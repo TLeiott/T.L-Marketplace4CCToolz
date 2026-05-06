@@ -110,6 +110,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\plugins\T.L-AutoDevelop\sc
 - `scripts/preflight.ps1`
 - config resolution / provider / role-runner code
 
+### Test-Only Prerequisites
+
+These prerequisites only apply to running the full regression harness, not to running the plugin itself:
+
+- **PowerShell 7 (`pwsh.exe`)** is needed for the cross-job-boundary tests that exercise `Start-Job` argument and environment serialization (the runtime itself works on PowerShell 5.1+). Tests that need `pwsh.exe` print `[SKIP]` and continue when it is not on PATH.
+- **Python (`python` or `py`)** is needed only for the Codex state-db helper used by `Test-CodexUsageGateReadsSessionStateDbAndSessionLog`. That single test prints `[SKIP]` when no Python interpreter is available; the rest of the Codex usage-gate suite runs without Python.
+
+Other Codex usage-gate tests, the OpenCode invocation tests, and the entire scheduler/auto-develop/preflight regression coverage run on PowerShell 5.1 alone.
+
 ### Practical Rule
 
 - If you are validating static preflight logic: use fast mode.
