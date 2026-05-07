@@ -151,6 +151,7 @@ It must then aggregate all distinct CLI/provider/modelClass combinations used by
 
 Interpret the initial probe strictly:
 - `processStatus == "fatal"`: stop and show the error.
+- `processStatus == "usage_unsupported"` or `launchDecisionBasis == "all-unsupported"`: continue to queue planning and report that this execution profile has no supported usage probe, so later launches are usage-ungated by design.
 - `ok == true`: continue to queue planning.
 - `ok == false` or the script is unavailable: continue to queue planning, but do not treat the gate as launchable until a later fresh probe succeeds.
 
@@ -265,16 +266,17 @@ Launch-gate procedure:
 2. Let `pipeCount = count(candidate launch set)`.
 3. If `pipeCount == 0`, do not run the gate and do not start anything.
 3. Run the usage gate again in `probe` mode with `-ThresholdPercent 90`.
-4. Compute:
+4. If the fresh gate result has `processStatus == "usage_unsupported"` or `launchDecisionBasis == "all-unsupported"`, launch the candidate set without 5h projection and report that usage is unsupported for this profile, not verified as available.
+5. Compute:
    - `currentUsage = fiveHourUtilization`
    - `estimatedWaveCost = pipeCount * PIPE_USAGE_PERCENT`
    - `projectedUsage = currentUsage + estimatedWaveCost`
-5. Interpret the result:
+6. Interpret the result:
    - fatal gate error -> stop
    - unavailable gate -> stop and report that the 5h budget could not be verified for this launch set
    - available gate and `projectedUsage < 90` -> launch
    - available gate and `projectedUsage >= 90` -> ask the user whether this launch set may overrun the 5h budget
-6. If the user declines, leave the tasks queued and do not start them.
+7. If the user declines, leave the tasks queued and do not start them.
 
 The question must be about the current launch set only, not about the whole session.
 Always mention:

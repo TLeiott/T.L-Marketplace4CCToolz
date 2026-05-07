@@ -130,6 +130,7 @@ Use this initial probe only to:
 
 Interpret the initial probe strictly:
 - fatal gate error -> stop
+- all-unsupported usage result (`processStatus == "usage_unsupported"` or `launchDecisionBasis == "all-unsupported"`) -> continue to queue planning and report that this execution profile has no supported usage probe, so later launches are usage-ungated by design
 - available or unavailable non-fatal result -> continue to queue planning
 
 Important:
@@ -232,26 +233,27 @@ Launch-gate procedure:
 2. If `candidateTaskIds` is empty, do not run the gate and do not start anything.
 3. Run the usage gate again in `probe` mode with `-ThresholdPercent 90`.
 4. If the gate result is fatal, stop.
-5. If the gate result is unavailable:
+5. If the gate result has `processStatus == "usage_unsupported"` or `launchDecisionBasis == "all-unsupported"`, launch the full candidate set without 5h prefix fitting and report that usage is unsupported for this profile, not verified as available.
+6. If the gate result is unavailable:
    - do not ask the user
    - sleep for 1 hour
    - then re-run `probe`
    - repeat for at most 10 attempts
    - if the probe is still unavailable, stop and report that the autonomous gate state could not be determined
-6. Let `currentUsage = fiveHourUtilization` from the fresh available probe result.
-7. Compute the largest ordered prefix of `candidateTaskIds` that fits under the projected threshold using:
+7. Let `currentUsage = fiveHourUtilization` from the fresh available probe result.
+8. Compute the largest ordered prefix of `candidateTaskIds` that fits under the projected threshold using:
    - `estimatedWaveCost = pipeCount * PIPE_USAGE_PERCENT`
    - `projectedUsage = currentUsage + estimatedWaveCost`
    - only prefixes with `projectedUsage < 90` fit
-8. Interpret the fitting result:
+9. Interpret the fitting result:
    - if the full candidate set fits, launch it
    - if only a non-empty prefix fits, launch that fitting prefix and leave the remaining startable tasks queued
    - if no prefix fits, do not ask the user; wait, then re-probe, then recompute the fitting prefix
-9. If `fiveHourResetAt` is available, use gate `wait` for the no-fit case. If it is not available, stop and report that blocked usage did not include a usable reset time.
-10. If gate `wait` returns unavailable instead of a fresh open result, switch to the normal 1-hour unavailable retry policy.
-11. After a successful wait completes, recompute the fitting prefix from the fresh probe result.
-12. If no prefix fits even after the wait/re-probe cycle, stop and report that no task in the current launch set fits the projected 5h budget right now.
-13. Never launch a queued wave based only on an old probe.
+10. If `fiveHourResetAt` is available, use gate `wait` for the no-fit case. If it is not available, stop and report that blocked usage did not include a usable reset time.
+11. If gate `wait` returns unavailable instead of a fresh open result, switch to the normal 1-hour unavailable retry policy.
+12. After a successful wait completes, recompute the fitting prefix from the fresh probe result.
+13. If no prefix fits even after the wait/re-probe cycle, stop and report that no task in the current launch set fits the projected 5h budget right now.
+14. Never launch a queued wave based only on an old probe.
 
 For each task in the allowed fitting launch set, launch:
 

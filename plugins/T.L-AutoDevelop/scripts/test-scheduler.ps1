@@ -353,6 +353,47 @@ function Invoke-CodexUsageGateJson {
     }
 }
 
+function Invoke-AutoDevelopUsageGateJson {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath = "",
+        [int]$ThresholdPercent = 90,
+        [int]$PollSeconds = 1,
+        [int]$FastPollSeconds = 1,
+        [int]$FastWindowSeconds = 1
+    )
+
+    $gatePath = Join-Path $PSScriptRoot "autodevelop-usage-gate.ps1"
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $gatePath,
+        "-ThresholdPercent", $ThresholdPercent.ToString(),
+        "-PollSeconds", $PollSeconds.ToString(),
+        "-FastPollSeconds", $FastPollSeconds.ToString(),
+        "-FastWindowSeconds", $FastWindowSeconds.ToString()
+    )
+
+    if ($RepoRoot) {
+        $arguments += @("-RepoRoot", $RepoRoot)
+    }
+    if ($SolutionPath) {
+        $arguments += @("-SolutionPath", $SolutionPath)
+    }
+
+    $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList $arguments
+    $rawText = ([string]$process.stdout).Trim()
+    if (-not $rawText) {
+        throw "AutoDevelop usage gate returned no JSON output. Args: $($arguments -join ' ')`nSTDERR:`n$([string]$process.stderr)"
+    }
+
+    try {
+        return ($rawText | ConvertFrom-Json)
+    } catch {
+        throw "AutoDevelop usage gate returned invalid JSON: $($_.Exception.Message)`nRAW:`n$rawText"
+    }
+}
+
 function Write-CodexUsageGateSessionLog {
     param(
         [string]$Path,
@@ -3167,6 +3208,43 @@ function Test-AutoDevelopUsageCombosAggregateAcrossRoles {
         Assert-True ($keys -contains "claude-code-vanilla|anthropic|opus") "Usage aggregation should include the scheduler combo."
         Assert-True ($keys -contains "claude-code-openrouter|openrouter|sonnet") "Usage aggregation should include the implementation combo."
         Assert-True ([string]$parsed.openrouterUsageMode -eq "none") "Profiles without usage support should be marked with mode 'none'."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopUsageGateMarksAllUnsupportedProfiles {
+    $repo = New-TestRepo
+    try {
+        $roleNames = @("discover", "plan", "fixPlan", "directionCheck", "investigate", "reproduce", "implement", "reviewer", "scheduler")
+        $roleJson = [string]::Join(",`n", @($roleNames | ForEach-Object {
+            "        `"$($_)`": { `"cliProfile`": `"claude-code-openrouter`", `"provider`": `"openrouter`", `"modelClass`": `"sonnet`", `"usageModelClasses`": [`"sonnet`"] }"
+        }))
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "defaultExecutionProfile": "openrouter-only",
+  "hostDefaults": {
+    "codex": "openrouter-only",
+    "claude-code": "openrouter-only"
+  },
+  "executionProfiles": {
+    "openrouter-only": {
+      "roles": {
+$roleJson
+      }
+    }
+  }
+}
+"@
+
+        $result = Invoke-AutoDevelopUsageGateJson -RepoRoot $repo.root
+        Assert-True ($result.ok -eq $true) "All-unsupported usage profiles should remain non-fatal."
+        Assert-True ([string]$result.processStatus -eq "usage_unsupported") "All-unsupported usage profiles should not be reported as verified ok usage."
+        Assert-True ([string]$result.launchDecisionBasis -eq "all-unsupported") "All-unsupported usage profiles should expose the launch decision basis explicitly."
+        Assert-True ($null -eq $result.fiveHourUtilization) "All-unsupported usage profiles should not synthesize a utilization value."
+        Assert-True ([int]$result.usageUnsupportedCount -eq 1) "The unsupported combo count should be surfaced."
+        Assert-True ([int]$result.usageSupportedCount -eq 0) "The supported combo count should be zero for all-unsupported profiles."
     } finally {
         Remove-TestRepo -Root $repo.root
     }
@@ -10716,6 +10794,7 @@ Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh
 Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel
 Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass
 Test-AutoDevelopUsageCombosIncludeCodexProfilesAndUsageMode
+Test-AutoDevelopUsageGateMarksAllUnsupportedProfiles
 Test-RegisterTasksAcceptsTasksJsonAlias
 Test-SchedulerSnapshotQueueWritesCleanJsonToStdout
 Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles
