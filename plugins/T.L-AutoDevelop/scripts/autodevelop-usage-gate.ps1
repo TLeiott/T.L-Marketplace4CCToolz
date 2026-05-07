@@ -338,6 +338,7 @@ $fatalCount = @($probeResults | Where-Object { [string]$_.processStatus -eq 'fat
 $blockedCount = @($probeResults | Where-Object { $_.shouldBlock -eq $true }).Count
 $unavailableCount = @($probeResults | Where-Object { $_.ok -ne $true -and [string]$_.processStatus -ne 'fatal' }).Count
 $usageUnsupportedCount = @($probeResults | Where-Object { [string]$_.processStatus -eq 'usage_not_supported' }).Count
+$usageSupportedCount = @($probeResults | Where-Object { [string]$_.processStatus -ne 'usage_not_supported' }).Count
 
 $processStatus = if ($fatalCount -gt 0) {
     'fatal'
@@ -345,15 +346,29 @@ $processStatus = if ($fatalCount -gt 0) {
     'blocked'
 } elseif ($unavailableCount -gt 0) {
     'unavailable'
+} elseif (@($probeResults).Count -gt 0 -and $usageSupportedCount -eq 0) {
+    'usage_unsupported'
 } else {
     'ok'
 }
 
 $aggregatedMetrics = Get-AggregatedUsageMetrics -Combos $probeResults
+$launchDecisionBasis = if ($processStatus -eq 'usage_unsupported') {
+    'all-unsupported'
+} elseif ($fatalCount -gt 0) {
+    'fatal'
+} elseif ($blockedCount -gt 0) {
+    'blocked'
+} elseif ($unavailableCount -gt 0) {
+    'unavailable'
+} else {
+    'verified-usage'
+}
 
 [pscustomobject]@{
     ok = ($fatalCount -eq 0 -and $unavailableCount -eq 0)
     processStatus = $processStatus
+    launchDecisionBasis = $launchDecisionBasis
     checkedAt = (Get-Date).ToString('o')
     thresholdPercent = $ThresholdPercent
     repoRoot = $resolvedRepoRoot
@@ -365,6 +380,7 @@ $aggregatedMetrics = Get-AggregatedUsageMetrics -Combos $probeResults
     lastSuccessfulFetchAt = $aggregatedMetrics.lastSuccessfulFetchAt
     combos = $probeResults
     usageUnsupportedCount = $usageUnsupportedCount
+    usageSupportedCount = $usageSupportedCount
     blockingCount = $blockedCount
     unavailableCount = $unavailableCount
     fatalCount = $fatalCount

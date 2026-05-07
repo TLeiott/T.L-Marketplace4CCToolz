@@ -1,6 +1,6 @@
 {
   "name": "T.L-AutoDevelop",
-  "version": "4.4.7",
+  "version": "4.4.10",
   "description": "Interactive queue-aware .NET dev orchestration with repo-local hybrid Claude Code/Codex/OpenCode role config, host-aware default profiles, scheduler-planned waves, prepare hygiene checks, task-file intake, retries, and normal merge checkpoints.",
   "author": {
     "name": "TLeiott",

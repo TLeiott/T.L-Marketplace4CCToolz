@@ -1,6 +1,6 @@
 {
   "name": "T.L-AutoDevelop-Pro",
-  "version": "4.2.14",
+  "version": "4.2.16",
   "description": "Autonomous addon for T.L-AutoDevelop with host-aware multi-CLI queue scheduling, task-file intake, retries, and automatic normal merges.",
   "author": {
     "name": "TLeiott",

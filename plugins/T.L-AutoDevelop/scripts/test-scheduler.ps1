@@ -353,6 +353,47 @@ function Invoke-CodexUsageGateJson {
     }
 }
 
+function Invoke-AutoDevelopUsageGateJson {
+    param(
+        [string]$RepoRoot,
+        [string]$SolutionPath = "",
+        [int]$ThresholdPercent = 90,
+        [int]$PollSeconds = 1,
+        [int]$FastPollSeconds = 1,
+        [int]$FastWindowSeconds = 1
+    )
+
+    $gatePath = Join-Path $PSScriptRoot "autodevelop-usage-gate.ps1"
+    $arguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $gatePath,
+        "-ThresholdPercent", $ThresholdPercent.ToString(),
+        "-PollSeconds", $PollSeconds.ToString(),
+        "-FastPollSeconds", $FastPollSeconds.ToString(),
+        "-FastWindowSeconds", $FastWindowSeconds.ToString()
+    )
+
+    if ($RepoRoot) {
+        $arguments += @("-RepoRoot", $RepoRoot)
+    }
+    if ($SolutionPath) {
+        $arguments += @("-SolutionPath", $SolutionPath)
+    }
+
+    $process = Invoke-CapturedProcess -FilePath "powershell.exe" -ArgumentList $arguments
+    $rawText = ([string]$process.stdout).Trim()
+    if (-not $rawText) {
+        throw "AutoDevelop usage gate returned no JSON output. Args: $($arguments -join ' ')`nSTDERR:`n$([string]$process.stderr)"
+    }
+
+    try {
+        return ($rawText | ConvertFrom-Json)
+    } catch {
+        throw "AutoDevelop usage gate returned invalid JSON: $($_.Exception.Message)`nRAW:`n$rawText"
+    }
+}
+
 function Write-CodexUsageGateSessionLog {
     param(
         [string]$Path,
@@ -3169,6 +3210,57 @@ function Test-AutoDevelopUsageCombosAggregateAcrossRoles {
         Assert-True ([string]$parsed.openrouterUsageMode -eq "none") "Profiles without usage support should be marked with mode 'none'."
     } finally {
         Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-AutoDevelopUsageGateMarksAllUnsupportedProfiles {
+    $repo = New-TestRepo
+    try {
+        $roleNames = @("discover", "plan", "fixPlan", "directionCheck", "investigate", "reproduce", "implement", "reviewer", "scheduler")
+        $roleJson = [string]::Join(",`n", @($roleNames | ForEach-Object {
+            "        `"$($_)`": { `"cliProfile`": `"claude-code-openrouter`", `"provider`": `"openrouter`", `"modelClass`": `"sonnet`", `"usageModelClasses`": [`"sonnet`"] }"
+        }))
+        Write-TestFile -Path (Join-Path $repo.root ".claude\autodevelop.json") -Content @"
+{
+  "version": 4,
+  "defaultExecutionProfile": "openrouter-only",
+  "hostDefaults": {
+    "codex": "openrouter-only",
+    "claude-code": "openrouter-only"
+  },
+  "executionProfiles": {
+    "openrouter-only": {
+      "roles": {
+$roleJson
+      }
+    }
+  }
+}
+"@
+
+        $result = Invoke-AutoDevelopUsageGateJson -RepoRoot $repo.root
+        Assert-True ($result.ok -eq $true) "All-unsupported usage profiles should remain non-fatal."
+        Assert-True ([string]$result.processStatus -eq "usage_unsupported") "All-unsupported usage profiles should not be reported as verified ok usage."
+        Assert-True ([string]$result.launchDecisionBasis -eq "all-unsupported") "All-unsupported usage profiles should expose the launch decision basis explicitly."
+        Assert-True ($null -eq $result.fiveHourUtilization) "All-unsupported usage profiles should not synthesize a utilization value."
+        Assert-True ([int]$result.usageUnsupportedCount -eq 1) "The unsupported combo count should be surfaced."
+        Assert-True ([int]$result.usageSupportedCount -eq 0) "The supported combo count should be zero for all-unsupported profiles."
+    } finally {
+        Remove-TestRepo -Root $repo.root
+    }
+}
+
+function Test-SkillDocsSpecifyBackgroundRunTaskLaunches {
+    $skillPaths = @(
+        (Join-Path $PSScriptRoot "..\skills\develop\SKILL.md"),
+        (Join-Path $PSScriptRoot "..\..\T.L-AutoDevelop-Pro\skills\TLA-develop\SKILL.md")
+    )
+
+    foreach ($skillPath in $skillPaths) {
+        $resolvedPath = [System.IO.Path]::GetFullPath($skillPath)
+        $text = [System.IO.File]::ReadAllText($resolvedPath)
+        Assert-True ($text.Contains('Start-Process -FilePath "powershell.exe"')) "Skill '$resolvedPath' should document background run-task scheduler launches."
+        Assert-True ($text.Contains('run-task` starts the worker, records its PID, and then remains attached until that worker exits')) "Skill '$resolvedPath' should explain that foreground run-task calls serialize a wave."
     }
 }
 
@@ -6283,6 +6375,49 @@ function Test-CodexUsageGateReadsSessionStateDbAndSessionLog {
         $actualSessionPath = [System.IO.Path]::GetFullPath([string]$result.sessionPath)
         Assert-True ($actualSessionPath -eq $expectedSessionPath) "The Codex gate should resolve the session log path through state_5.sqlite."
     } finally {
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-CodexUsageGateReadsOpenSessionLog {
+    $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $stream = $null
+    try {
+        $sessionPath = Join-Path $root "sessions\2026\04\21\rollout-codex-open-session.jsonl"
+        Write-CodexUsageGateSessionLog -Path $sessionPath -Payloads @(
+            [ordered]@{
+                type = "token_count"
+                rate_limits = [ordered]@{
+                    primary = [ordered]@{
+                        used_percent = 37.0
+                        resets_at = "2026-04-21T17:00:00Z"
+                    }
+                    secondary = [ordered]@{
+                        used_percent = 9.0
+                        resets_at = "2026-04-28T17:00:00Z"
+                    }
+                    plan_type = "plus"
+                    rate_limit_reached_type = ""
+                }
+            }
+        )
+
+        $stream = [System.IO.FileStream]::new(
+            $sessionPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+        )
+
+        $result = Invoke-CodexUsageGateJson -CodexHome $root -SessionPath $sessionPath -ThreadId "codex-open-session-thread"
+        Assert-True ($result.ok -eq $true) "Codex usage probes should read a session log held open by the active host process."
+        Assert-True ([string]$result.processStatus -eq "ok") "Fresh Codex usage from an open session log should return ok."
+        Assert-True ([double]$result.fiveHourUtilization -eq 37.0) "The Codex gate should read token_count payloads while the session file is open."
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
@@ -10673,11 +10808,14 @@ Test-AutoDevelopConfigObjectAcceptsConvertFromJsonObjectsInPwsh
 Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel
 Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass
 Test-AutoDevelopUsageCombosIncludeCodexProfilesAndUsageMode
+Test-AutoDevelopUsageGateMarksAllUnsupportedProfiles
+Test-SkillDocsSpecifyBackgroundRunTaskLaunches
 Test-RegisterTasksAcceptsTasksJsonAlias
 Test-SchedulerSnapshotQueueWritesCleanJsonToStdout
 Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles
 Test-AutoDevelopSessionShowReportsDetectedHostAndHostDefaultSource
 Test-CodexUsageGateReadsSessionStateDbAndSessionLog
+Test-CodexUsageGateReadsOpenSessionLog
 Test-CodexUsageGateBlocksWhenRateLimitReachedTypeIsSet
 Test-CodexUsageGateNeverTrustsStaleCacheForLaunchDecisions
 
