@@ -285,10 +285,18 @@ Always mention:
 - estimated wave cost (`PIPE_USAGE_PERCENT% * pipeCount`, currently `8% * pipeCount`)
 - projected usage after this launch set
 
-For every task id in the candidate launch set, launch a background worker:
+For every task id in the candidate launch set, launch the `run-task` scheduler process in the background. `run-task` starts the worker, records its PID, and then remains attached until that worker exits; a direct foreground call serializes the wave.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode run-task -SolutionPath "<solution>" -TaskId "<task id>"
+$runTaskArgs = @(
+  "-NoProfile",
+  "-ExecutionPolicy", "Bypass",
+  "-File", "<scheduler.ps1>",
+  "-Mode", "run-task",
+  "-SolutionPath", "<solution>",
+  "-TaskId", "<task id>"
+)
+Start-Process -FilePath "powershell.exe" -ArgumentList $runTaskArgs -WindowStyle Hidden
 ```
 
 The scheduler resolves worker PowerShell in this order:

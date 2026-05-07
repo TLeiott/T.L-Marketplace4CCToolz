@@ -255,10 +255,18 @@ Launch-gate procedure:
 13. If no prefix fits even after the wait/re-probe cycle, stop and report that no task in the current launch set fits the projected 5h budget right now.
 14. Never launch a queued wave based only on an old probe.
 
-For each task in the allowed fitting launch set, launch:
+For each task in the allowed fitting launch set, launch the `run-task` scheduler process in the background. `run-task` starts the worker, records its PID, and then remains attached until that worker exits; a direct foreground call serializes the wave.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<scheduler.ps1>" -Mode run-task -SolutionPath "<solution>" -TaskId "<task id>"
+$runTaskArgs = @(
+  "-NoProfile",
+  "-ExecutionPolicy", "Bypass",
+  "-File", "<scheduler.ps1>",
+  "-Mode", "run-task",
+  "-SolutionPath", "<solution>",
+  "-TaskId", "<task id>"
+)
+Start-Process -FilePath "powershell.exe" -ArgumentList $runTaskArgs -WindowStyle Hidden
 ```
 
 The scheduler resolves worker PowerShell in this order:

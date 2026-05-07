@@ -3250,6 +3250,20 @@ $roleJson
     }
 }
 
+function Test-SkillDocsSpecifyBackgroundRunTaskLaunches {
+    $skillPaths = @(
+        (Join-Path $PSScriptRoot "..\skills\develop\SKILL.md"),
+        (Join-Path $PSScriptRoot "..\..\T.L-AutoDevelop-Pro\skills\TLA-develop\SKILL.md")
+    )
+
+    foreach ($skillPath in $skillPaths) {
+        $resolvedPath = [System.IO.Path]::GetFullPath($skillPath)
+        $text = [System.IO.File]::ReadAllText($resolvedPath)
+        Assert-True ($text.Contains('Start-Process -FilePath "powershell.exe"')) "Skill '$resolvedPath' should document background run-task scheduler launches."
+        Assert-True ($text.Contains('run-task` starts the worker, records its PID, and then remains attached until that worker exits')) "Skill '$resolvedPath' should explain that foreground run-task calls serialize a wave."
+    }
+}
+
 function Test-RegisterTasksWarnsWhenTaskTextDiffersFromPromptFile {
     $repo = New-TestRepo
     try {
@@ -10795,6 +10809,7 @@ Test-AutoDevelopUsageCombosIncludeExplicitOpenCodeModel
 Test-OpenCodeProfileRejectsClaudeOnlyPermissionBypass
 Test-AutoDevelopUsageCombosIncludeCodexProfilesAndUsageMode
 Test-AutoDevelopUsageGateMarksAllUnsupportedProfiles
+Test-SkillDocsSpecifyBackgroundRunTaskLaunches
 Test-RegisterTasksAcceptsTasksJsonAlias
 Test-SchedulerSnapshotQueueWritesCleanJsonToStdout
 Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles
