@@ -371,20 +371,36 @@ function Get-LatestTokenCountPayload {
     }
 
     $latest = $null
-    foreach ($line in [System.IO.File]::ReadLines($Path, [System.Text.Encoding]::UTF8)) {
-        if ($line.IndexOf('"type":"token_count"') -lt 0 -and $line.IndexOf('"type": "token_count"') -lt 0) {
-            continue
-        }
-
+    $stream = [System.IO.FileStream]::new(
+        $Path,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    )
+    try {
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
         try {
-            $parsed = $line | ConvertFrom-Json
-        } catch {
-            continue
-        }
+            while (-not $reader.EndOfStream) {
+                $line = $reader.ReadLine()
+                if ($line.IndexOf('"type":"token_count"') -lt 0 -and $line.IndexOf('"type": "token_count"') -lt 0) {
+                    continue
+                }
 
-        if ($null -ne $parsed.payload -and [string]$parsed.payload.type -eq 'token_count') {
-            $latest = $parsed.payload
+                try {
+                    $parsed = $line | ConvertFrom-Json
+                } catch {
+                    continue
+                }
+
+                if ($null -ne $parsed.payload -and [string]$parsed.payload.type -eq 'token_count') {
+                    $latest = $parsed.payload
+                }
+            }
+        } finally {
+            $reader.Dispose()
         }
+    } finally {
+        $stream.Dispose()
     }
 
     if ($null -eq $latest) {

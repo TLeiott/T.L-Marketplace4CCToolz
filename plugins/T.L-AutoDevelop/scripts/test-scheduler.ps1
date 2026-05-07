@@ -6287,6 +6287,49 @@ function Test-CodexUsageGateReadsSessionStateDbAndSessionLog {
     }
 }
 
+function Test-CodexUsageGateReadsOpenSessionLog {
+    $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $stream = $null
+    try {
+        $sessionPath = Join-Path $root "sessions\2026\04\21\rollout-codex-open-session.jsonl"
+        Write-CodexUsageGateSessionLog -Path $sessionPath -Payloads @(
+            [ordered]@{
+                type = "token_count"
+                rate_limits = [ordered]@{
+                    primary = [ordered]@{
+                        used_percent = 37.0
+                        resets_at = "2026-04-21T17:00:00Z"
+                    }
+                    secondary = [ordered]@{
+                        used_percent = 9.0
+                        resets_at = "2026-04-28T17:00:00Z"
+                    }
+                    plan_type = "plus"
+                    rate_limit_reached_type = ""
+                }
+            }
+        )
+
+        $stream = [System.IO.FileStream]::new(
+            $sessionPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+        )
+
+        $result = Invoke-CodexUsageGateJson -CodexHome $root -SessionPath $sessionPath -ThreadId "codex-open-session-thread"
+        Assert-True ($result.ok -eq $true) "Codex usage probes should read a session log held open by the active host process."
+        Assert-True ([string]$result.processStatus -eq "ok") "Fresh Codex usage from an open session log should return ok."
+        Assert-True ([double]$result.fiveHourUtilization -eq 37.0) "The Codex gate should read token_count payloads while the session file is open."
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-CodexUsageGateBlocksWhenRateLimitReachedTypeIsSet {
     $root = Join-Path $env:TEMP ("autodev-codex-usage-gate-test-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -10678,6 +10721,7 @@ Test-SchedulerSnapshotQueueWritesCleanJsonToStdout
 Test-WorkspaceInstructionContextIncludesAgentsAndClaudeFiles
 Test-AutoDevelopSessionShowReportsDetectedHostAndHostDefaultSource
 Test-CodexUsageGateReadsSessionStateDbAndSessionLog
+Test-CodexUsageGateReadsOpenSessionLog
 Test-CodexUsageGateBlocksWhenRateLimitReachedTypeIsSet
 Test-CodexUsageGateNeverTrustsStaleCacheForLaunchDecisions
 
